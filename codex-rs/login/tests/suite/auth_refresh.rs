@@ -324,6 +324,99 @@ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
 
 #[serial_test::serial(auth_env)]
 #[tokio::test]
+async fn shared_auth_home_serializes_refresh_across_auth_managers() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(StdDuration::from_millis(100))
+                .set_body_json(json!({
+                    "access_token": "shared-new-access-token",
+                    "refresh_token": "shared-new-refresh-token"
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let auth_home = TempDir::new()?;
+    let endpoint = format!("{}/oauth/token", server.uri());
+    let _endpoint_guard = EnvGuard::set(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR, endpoint);
+    let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
+    let initial_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(initial_tokens.clone()),
+        last_refresh: Some(Utc::now() - Duration::days(1)),
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+    };
+    save_auth(
+        auth_home.path(),
+        &initial_auth,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?;
+
+    let first = AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let second = AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+
+    let (first_result, second_result) = tokio::join!(
+        first.refresh_token_from_authority(),
+        second.refresh_token_from_authority(),
+    );
+    first_result.context("first shared refresh should succeed")?;
+    second_result.context("second shared refresh should observe the first result")?;
+
+    let expected_tokens = TokenData {
+        access_token: "shared-new-access-token".to_string(),
+        refresh_token: "shared-new-refresh-token".to_string(),
+        ..initial_tokens
+    };
+    for manager in [first, second] {
+        let cached = manager
+            .auth_cached()
+            .context("shared auth should remain cached")?
+            .get_token_data()
+            .context("shared token data should exist")?;
+        assert_eq!(cached, expected_tokens);
+    }
+    let stored = load_auth_dot_json(
+        auth_home.path(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?
+    .context("shared auth should remain stored")?;
+    assert_eq!(stored.tokens, Some(expected_tokens));
+
+    server.verify().await;
+    Ok(())
+}
+
+#[serial_test::serial(auth_env)]
+#[tokio::test]
 async fn auth_refreshes_when_access_token_is_near_expiry() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
