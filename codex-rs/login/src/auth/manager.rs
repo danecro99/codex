@@ -6,6 +6,8 @@ use serde::Serialize;
 use serial_test::serial;
 use std::env;
 use std::fmt::Debug;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -20,6 +22,9 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 use tracing::instrument;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use codex_agent_identity::ChatGptEnvironment;
 use codex_protocol::auth::AuthMode;
@@ -93,6 +98,7 @@ pub enum AgentIdentityAuthPolicy {
 }
 
 const AGENT_IDENTITY_BOOTSTRAP_FAILURE_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+const AUTH_REFRESH_LOCK_FILENAME: &str = ".refresh.lock";
 
 #[derive(Debug)]
 struct CachedAgentIdentityBootstrapFailure {
@@ -2722,10 +2728,56 @@ impl AuthManager {
         {
             return Ok(());
         }
+        let requires_profile_refresh_lock = self.requires_profile_refresh_lock(&auth_before_reload);
+        let _profile_refresh_guard = if requires_profile_refresh_lock {
+            Some(acquire_profile_refresh_lock(self.auth_home.clone()).await?)
+        } else {
+            None
+        };
+        if requires_profile_refresh_lock {
+            self.refresh_token_after_guarded_reload(auth_before_reload)
+                .await
+        } else {
+            self.refresh_token_from_authority_impl().await
+        }
+    }
+
+    /// Attempt to refresh the current auth token from the authority that issued
+    /// it and update the shared cache. If the token refresh fails, returns the
+    /// error to the caller.
+    pub async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError> {
+        let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
+            RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Other,
+                REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
+            ))
+        })?;
+        let auth_before_reload = self.auth_cached();
+        let requires_profile_refresh_lock = self.requires_profile_refresh_lock(&auth_before_reload);
+        let _profile_refresh_guard = if requires_profile_refresh_lock {
+            Some(acquire_profile_refresh_lock(self.auth_home.clone()).await?)
+        } else {
+            None
+        };
+        if requires_profile_refresh_lock {
+            self.refresh_token_after_guarded_reload(auth_before_reload)
+                .await
+        } else {
+            self.refresh_token_from_authority_impl().await
+        }
+    }
+
+    fn requires_profile_refresh_lock(&self, auth: &Option<CodexAuth>) -> bool {
+        !self.has_external_auth() && matches!(auth, Some(CodexAuth::Chatgpt(_)))
+    }
+
+    async fn refresh_token_after_guarded_reload(
+        &self,
+        auth_before_reload: Option<CodexAuth>,
+    ) -> Result<(), RefreshTokenError> {
         let expected_account_id = auth_before_reload
             .as_ref()
             .and_then(CodexAuth::get_account_id);
-
         match self
             .reload_if_account_id_matches(expected_account_id.as_deref())
             .await
@@ -2742,19 +2794,6 @@ impl AuthManager {
                 )))
             }
         }
-    }
-
-    /// Attempt to refresh the current auth token from the authority that issued
-    /// it and update the shared cache. If the token refresh fails, returns the
-    /// error to the caller.
-    pub async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError> {
-        let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
-            RefreshTokenError::Permanent(RefreshTokenFailedError::new(
-                RefreshTokenFailedReason::Other,
-                REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
-            ))
-        })?;
-        self.refresh_token_from_authority_impl().await
     }
 
     async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError> {
@@ -2970,6 +3009,7 @@ impl AuthManager {
 fn auth_config_from(config: &impl AuthManagerConfig) -> AuthConfig {
     AuthConfig {
         codex_home: config.codex_home(),
+        auth_home: config.auth_home(),
         auth_credentials_store_mode: config.cli_auth_credentials_store_mode(),
         keyring_backend_kind: config.auth_keyring_backend_kind(),
         forced_login_method: config.forced_login_method(),
@@ -2978,6 +3018,42 @@ fn auth_config_from(config: &impl AuthManagerConfig) -> AuthConfig {
         managed_auth_policy: config.managed_auth_policy(),
         auth_route_config: config.auth_route_config(),
     }
+}
+
+async fn acquire_profile_refresh_lock(auth_home: PathBuf) -> Result<File, RefreshTokenError> {
+    tokio::task::spawn_blocking(move || {
+        let lock_path = auth_home.join(AUTH_REFRESH_LOCK_FILENAME);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let lock_file = options.open(&lock_path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to open shared authentication refresh lock {}: {error}",
+                    lock_path.display(),
+                ),
+            )
+        })?;
+        lock_file.lock().map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to acquire shared authentication refresh lock {}: {error}",
+                    lock_path.display(),
+                ),
+            )
+        })?;
+        Ok::<File, std::io::Error>(lock_file)
+    })
+    .await
+    .map_err(|error| {
+        RefreshTokenError::Transient(std::io::Error::other(format!(
+            "shared authentication refresh lock task failed: {error}"
+        )))
+    })?
+    .map_err(RefreshTokenError::Transient)
 }
 
 #[cfg(test)]
