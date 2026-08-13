@@ -1177,7 +1177,7 @@ fn config_toml_details(config: &Config, details: &mut Vec<String>) {
 
 fn auth_check(config: &Config) -> DoctorCheck {
     let mut details = Vec::new();
-    let auth_path = config.codex_home.join("auth.json");
+    let auth_path = config.auth_home.join("auth.json");
     details.push(format!(
         "auth storage mode: {:?}",
         config.cli_auth_credentials_store_mode
@@ -1209,7 +1209,7 @@ fn auth_check(config: &Config) -> DoctorCheck {
     }
 
     match load_auth_dot_json(
-        &config.codex_home,
+        &config.auth_home,
         config.cli_auth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
     ) {
@@ -2578,7 +2578,7 @@ impl ProviderAuthReachabilityMode {
 
 fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
     let stored_auth = load_auth_dot_json(
-        &config.codex_home,
+        &config.auth_home,
         config.cli_auth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
     )

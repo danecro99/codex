@@ -60,6 +60,7 @@ pub async fn cloud_config_bundle_loader_for_storage(
     auth_config: AuthConfig,
     enable_codex_api_key_env: bool,
 ) -> CloudConfigBundleLoader {
+    // Cloud config cache is ordinary CODEX_HOME state, not shared auth state.
     let codex_home = auth_config.codex_home.clone();
     let chatgpt_base_url = auth_config
         .chatgpt_base_url
@@ -75,3 +76,7 @@ pub async fn cloud_config_bundle_loader_for_storage(
         http_client_factory,
     )
 }
+
+#[cfg(test)]
+#[path = "bundle_loader_tests.rs"]
+mod tests;

@@ -198,6 +198,7 @@ mod reload {
             merged_config,
             overrides,
             config.codex_home.clone(),
+            config.auth_home.clone(),
             config_layer_stack,
         )
         .await?;

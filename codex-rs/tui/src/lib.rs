@@ -62,6 +62,7 @@ use codex_rollout::state_db;
 use codex_state::log_db;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
+use codex_utils_home_dir::find_codex_auth_home;
 use codex_utils_home_dir::find_codex_home;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
@@ -925,12 +926,22 @@ pub async fn run_main(
 
     // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
-    let codex_home = match find_codex_home() {
-        Ok(codex_home) => codex_home.to_path_buf(),
-        Err(err) => {
-            eprintln!("Error finding codex home: {err}");
-            std::process::exit(1);
-        }
+    let (codex_home, auth_home) = {
+        let codex_home = match find_codex_home() {
+            Ok(codex_home) => codex_home,
+            Err(err) => {
+                eprintln!("Error finding codex home: {err}");
+                std::process::exit(1);
+            }
+        };
+        let auth_home = match find_codex_auth_home(&codex_home) {
+            Ok(auth_home) => auth_home,
+            Err(err) => {
+                eprintln!("Error finding Codex auth home: {err}");
+                std::process::exit(1);
+            }
+        };
+        (codex_home, auth_home)
     };
 
     let mut launch_loader_overrides = loader_overrides.clone();
@@ -996,8 +1007,11 @@ pub async fn run_main(
     .await;
     let bootstrap_config_toml = &bootstrap_config.config_toml;
     let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-        app_server_target
-            .auth_config_for_cloud_loader(bootstrap_auth_config(&codex_home, &bootstrap_config)?),
+        app_server_target.auth_config_for_cloud_loader(bootstrap_auth_config(
+            &codex_home,
+            &auth_home,
+            &bootstrap_config,
+        )?),
         /*enable_codex_api_key_env*/ false,
     )
     .await;
@@ -1083,6 +1097,10 @@ pub async fn run_main(
     };
 
     let config = load_config_or_exit(
+        ResolvedHomes {
+            codex_home: codex_home.to_path_buf(),
+            auth_home,
+        },
         cli_kv_overrides.clone(),
         overrides.clone(),
         loader_overrides.clone(),
@@ -1290,6 +1308,10 @@ async fn run_ratatui_app(
     environment_manager: Arc<EnvironmentManager>,
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
+    let homes = ResolvedHomes {
+        codex_home: initial_config.codex_home.to_path_buf(),
+        auth_home: initial_config.auth_home.clone(),
+    };
     color_eyre::install()?;
 
     tooltips::announcement::prewarm(initial_config.http_client_factory());
@@ -1445,6 +1467,7 @@ async fn run_ratatui_app(
             || (show_login_screen && !uses_remote_workspace)
         {
             load_config_or_exit(
+                homes.clone(),
                 cli_kv_overrides.clone(),
                 overrides.clone(),
                 loader_overrides.clone(),
@@ -1636,6 +1659,7 @@ async fn run_ratatui_app(
     let mut config = match &session_selection {
         resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
             load_config_or_exit_with_fallback_cwd(
+                homes.clone(),
                 cli_kv_overrides.clone(),
                 overrides.clone(),
                 loader_overrides.clone(),
@@ -1647,6 +1671,7 @@ async fn run_ratatui_app(
         }
         resume_picker::SessionSelection::StartFresh if picker_cancelled_without_selection => {
             load_config_or_exit(
+                homes.clone(),
                 cli_kv_overrides.clone(),
                 overrides.clone(),
                 loader_overrides.clone(),
@@ -1854,6 +1879,12 @@ pub enum LoginStatus {
     NotAuthenticated,
 }
 
+#[derive(Clone)]
+struct ResolvedHomes {
+    codex_home: PathBuf,
+    auth_home: AbsolutePathBuf,
+}
+
 /// Determines the user's authentication mode using a lightweight account read
 /// rather than a full `bootstrap`, avoiding the model-list fetch and
 /// rate-limit round-trip that `bootstrap` would trigger.
@@ -1875,6 +1906,7 @@ async fn get_login_status(
 }
 
 async fn load_config_or_exit(
+    homes: ResolvedHomes,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
@@ -1882,6 +1914,7 @@ async fn load_config_or_exit(
     strict_config: bool,
 ) -> Config {
     load_config_or_exit_with_fallback_cwd(
+        homes,
         cli_kv_overrides,
         overrides,
         loader_overrides,
@@ -1893,6 +1926,7 @@ async fn load_config_or_exit(
 }
 
 async fn load_config_or_exit_with_fallback_cwd(
+    homes: ResolvedHomes,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
@@ -1902,6 +1936,8 @@ async fn load_config_or_exit_with_fallback_cwd(
 ) -> Config {
     #[allow(clippy::print_stderr)]
     match ConfigBuilder::default()
+        .codex_home(homes.codex_home)
+        .auth_home(homes.auth_home)
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
         .loader_overrides(loader_overrides)

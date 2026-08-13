@@ -6,7 +6,6 @@
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Cli;
@@ -29,7 +28,9 @@ use codex_config::LoaderOverrides;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_protocol::ThreadId;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
+use codex_utils_home_dir::find_codex_auth_home;
 use codex_utils_home_dir::find_codex_home;
 use codex_utils_oss::get_default_model_for_oss_provider;
 use color_eyre::eyre::Result;
@@ -84,8 +85,9 @@ pub async fn run_session_archive_command(
     options: SessionArchiveCommandOptions,
 ) -> Result<String> {
     let codex_home = find_codex_home().wrap_err("failed to find Codex home")?;
+    let auth_home = find_codex_auth_home(&codex_home).wrap_err("failed to find Codex auth home")?;
     let mut app_server =
-        start_app_server_for_archive_command(options, codex_home.to_path_buf()).await?;
+        start_app_server_for_archive_command(options, codex_home.clone(), auth_home).await?;
     run_session_archive_action_with_app_server(
         &mut app_server,
         codex_home.as_path(),
@@ -255,7 +257,8 @@ fn confirm_session_delete(target: &ResolvedSessionTarget) -> Result<bool> {
 
 async fn start_app_server_for_archive_command(
     options: SessionArchiveCommandOptions,
-    codex_home: PathBuf,
+    codex_home: AbsolutePathBuf,
+    auth_home: AbsolutePathBuf,
 ) -> Result<AppServerSession> {
     let SessionArchiveCommandOptions {
         cli,
@@ -339,7 +342,8 @@ async fn start_app_server_for_archive_command(
     let config_toml = &bootstrap_config.config_toml;
     let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
         app_server_target.auth_config_for_cloud_loader(bootstrap_auth_config(
-            codex_home.as_path(),
+            &codex_home,
+            &auth_home,
             &bootstrap_config,
         )?),
         /*enable_codex_api_key_env*/ false,
@@ -359,6 +363,8 @@ async fn start_app_server_for_archive_command(
     });
     let cwd = cli.cwd.clone();
     let config = ConfigBuilder::default()
+        .codex_home(codex_home.to_path_buf())
+        .auth_home(auth_home)
         .cli_overrides(cli_kv_overrides.clone())
         .harness_overrides(ConfigOverrides {
             model,
