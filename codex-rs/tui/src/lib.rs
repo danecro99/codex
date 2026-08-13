@@ -64,6 +64,7 @@ use codex_rollout::state_db;
 use codex_state::log_db;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
+use codex_utils_home_dir::find_codex_auth_home;
 use codex_utils_home_dir::find_codex_home;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
@@ -1772,6 +1773,7 @@ async fn get_login_status(
 }
 
 async fn load_config_or_exit(
+    homes: ResolvedHomes,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
@@ -1779,6 +1781,7 @@ async fn load_config_or_exit(
     strict_config: bool,
 ) -> Config {
     load_config_or_exit_with_fallback_cwd(
+        homes,
         cli_kv_overrides,
         overrides,
         loader_overrides,
@@ -1790,6 +1793,7 @@ async fn load_config_or_exit(
 }
 
 async fn load_config_or_exit_with_fallback_cwd(
+    homes: ResolvedHomes,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
@@ -1799,6 +1803,8 @@ async fn load_config_or_exit_with_fallback_cwd(
 ) -> Config {
     #[allow(clippy::print_stderr)]
     match ConfigBuilder::default()
+        .codex_home(homes.codex_home)
+        .auth_home(homes.auth_home)
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
         .loader_overrides(loader_overrides)

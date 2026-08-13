@@ -68,6 +68,7 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigTomlLoadResult;
 use codex_core::config::bootstrap_auth_config;
+use codex_core::config::find_codex_auth_home;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_toml_with_layer_stack;
 use codex_core::config::resolve_oss_provider;
@@ -324,6 +325,13 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             std::process::exit(1);
         }
     };
+    let auth_home = match find_codex_auth_home(&codex_home) {
+        Ok(auth_home) => auth_home,
+        Err(err) => {
+            eprintln!("Error finding Codex auth home: {err}");
+            std::process::exit(1);
+        }
+    };
     let user_config_path = config_profile_v2
         .as_ref()
         .map(|profile_v2| resolve_profile_v2_config_path(&codex_home, profile_v2));
@@ -435,6 +443,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let build_config = |overrides| {
         ConfigBuilder::default()
             .codex_home(codex_home.to_path_buf())
+            .auth_home(auth_home.clone())
             .cli_overrides(cli_kv_overrides.clone())
             .harness_overrides(overrides)
             .loader_overrides(loader_overrides.clone())

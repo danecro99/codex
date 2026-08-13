@@ -3661,6 +3661,7 @@ async fn guardian_review_session_config_uses_requirements_guardian_policy_config
             ..Default::default()
         },
         codex_home.abs(),
+        codex_home.abs(),
         config_layer_stack,
     )
     .await
@@ -3700,6 +3701,7 @@ async fn guardian_review_session_config_uses_default_guardian_policy_without_req
             cwd: Some(workspace.path().to_path_buf()),
             ..Default::default()
         },
+        codex_home.abs(),
         codex_home.abs(),
         config_layer_stack,
     )
