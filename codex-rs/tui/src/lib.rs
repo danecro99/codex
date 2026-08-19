@@ -876,11 +876,15 @@ fn app_server_target_for_launch(
 async fn cloud_config_bundle_for_app_server_target(
     app_server_target: &AppServerTarget,
     bootstrap_config: &ConfigTomlLoadResult,
-    codex_home: &Path,
+    codex_home: &AbsolutePathBuf,
+    auth_home: &AbsolutePathBuf,
 ) -> std::io::Result<CloudConfigBundleLoader> {
     cloud_config_bundle_loader_for_storage(
-        app_server_target
-            .auth_config_for_cloud_loader(bootstrap_auth_config(codex_home, bootstrap_config)?),
+        app_server_target.auth_config_for_cloud_loader(bootstrap_auth_config(
+            codex_home,
+            auth_home,
+            bootstrap_config,
+        )?),
         /*enable_codex_api_key_env*/ false,
     )
     .await
@@ -970,6 +974,10 @@ async fn run_ratatui_app(
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
     let workload_identity_selected = is_workload_identity_selected();
+    let homes = ResolvedHomes {
+        codex_home: initial_config.codex_home.clone(),
+        auth_home: initial_config.auth_home.clone(),
+    };
     color_eyre::install()?;
 
     tooltips::announcement::prewarm(initial_config.http_client_factory());
@@ -1173,6 +1181,7 @@ async fn run_ratatui_app(
                         || (show_login_screen && !uses_remote_workspace)
                     {
                         load_config_or_exit(
+                            homes.clone(),
                             cli_kv_overrides.clone(),
                             overrides.clone(),
                             loader_overrides.clone(),
@@ -1482,6 +1491,7 @@ async fn run_ratatui_app(
                 .run_until(
                     &mut tui,
                     load_config_or_exit_with_fallback_cwd(
+                        homes.clone(),
                         cli_kv_overrides.clone(),
                         overrides.clone(),
                         loader_overrides.clone(),
@@ -1497,6 +1507,7 @@ async fn run_ratatui_app(
                 .run_until(
                     &mut tui,
                     load_config_or_exit(
+                        homes.clone(),
                         cli_kv_overrides.clone(),
                         overrides.clone(),
                         loader_overrides.clone(),
@@ -1759,6 +1770,12 @@ pub enum LoginStatus {
     NotAuthenticated,
 }
 
+#[derive(Clone)]
+struct ResolvedHomes {
+    codex_home: AbsolutePathBuf,
+    auth_home: AbsolutePathBuf,
+}
+
 /// Reads the account once to determine login status and preserve the response for bootstrap.
 async fn get_login_status(
     app_server: &mut AppServerSession,
@@ -1803,7 +1820,7 @@ async fn load_config_or_exit_with_fallback_cwd(
 ) -> Config {
     #[allow(clippy::print_stderr)]
     match ConfigBuilder::default()
-        .codex_home(homes.codex_home)
+        .codex_home(homes.codex_home.to_path_buf())
         .auth_home(homes.auth_home)
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
