@@ -405,7 +405,8 @@ pub(super) async fn start_app_server_for_session_command(
     let cloud_config_bundle = super::cloud_config_bundle_for_app_server_target(
         &app_server_target,
         &bootstrap_config,
-        codex_home.as_path(),
+        &codex_home,
+        &auth_home,
     )
     .await?;
 

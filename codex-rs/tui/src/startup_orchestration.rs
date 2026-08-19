@@ -51,13 +51,27 @@ pub(super) async fn run_main_inner(
 
     // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
-    let codex_home = match find_codex_home() {
-        Ok(codex_home) => codex_home.to_path_buf(),
-        Err(err) => {
-            eprintln!("Error finding codex home: {err}");
-            std::process::exit(1);
+    let homes = {
+        let codex_home = match find_codex_home() {
+            Ok(codex_home) => codex_home,
+            Err(err) => {
+                eprintln!("Error finding codex home: {err}");
+                std::process::exit(1);
+            }
+        };
+        let auth_home = match find_codex_auth_home(&codex_home) {
+            Ok(auth_home) => auth_home,
+            Err(err) => {
+                eprintln!("Error finding Codex auth home: {err}");
+                std::process::exit(1);
+            }
+        };
+        ResolvedHomes {
+            codex_home,
+            auth_home,
         }
     };
+    let codex_home = homes.codex_home.clone();
 
     let mut launch_loader_overrides = loader_overrides.clone();
     if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
@@ -103,12 +117,14 @@ pub(super) async fn run_main_inner(
                 &validation_target,
                 &validation_bootstrap,
                 &codex_home,
+                &homes.auth_home,
             )
             .await?
         } else {
             CloudConfigBundleLoader::default()
         };
         load_config_or_exit(
+            homes.clone(),
             cli_kv_overrides.clone(),
             ConfigOverrides {
                 model: cli.model.clone(),
@@ -237,6 +253,7 @@ pub(super) async fn run_main_inner(
             &app_server_target,
             &bootstrap_config,
             &codex_home,
+            &homes.auth_home,
         ))
         .await??;
 
@@ -338,6 +355,7 @@ pub(super) async fn run_main_inner(
 
     let config = startup_draft
         .run_until(load_config_or_exit(
+            homes.clone(),
             cli_kv_overrides.clone(),
             overrides.clone(),
             loader_overrides.clone(),

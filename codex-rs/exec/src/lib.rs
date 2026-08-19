@@ -353,7 +353,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     )
     .await;
     let bootstrap_config_toml = &bootstrap_config.config_toml;
-    let bootstrap_auth_config = bootstrap_auth_config(&codex_home, &bootstrap_config)?;
+    let bootstrap_auth_config = bootstrap_auth_config(&codex_home, &auth_home, &bootstrap_config)?;
     // API keys cannot fetch workspace-managed configuration. Preserve the
     // existing ChatGPT bootstrap identity even when model requests allow
     // CODEX_API_KEY.
