@@ -2020,7 +2020,10 @@ impl ThreadRequestProcessor {
             )
             .await?;
         let (thread_history, resume_source_thread) = self
-            .load_resume_initial_history_from_stored_thread(stored_thread)
+            .load_resume_initial_history_from_stored_thread(
+                stored_thread,
+                /*require_complete_history*/ true,
+            )
             .await?;
         let response_history = thread_history.clone();
         let NewThread {
@@ -3429,9 +3432,12 @@ impl ThreadRequestProcessor {
                 .await
                 .map(|thread_history| (thread_history, None))
         } else if let Some(stored_thread) = stored_thread_from_running_probe {
-            self.load_resume_initial_history_from_stored_thread(*stored_thread)
-                .await
-                .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
+            self.load_resume_initial_history_from_stored_thread(
+                *stored_thread,
+                include_turns || initial_turns_page.is_some(),
+            )
+            .await
+            .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
         } else {
             match self
                 .read_stored_thread_for_resume(
@@ -3442,7 +3448,10 @@ impl ThreadRequestProcessor {
                 .await
             {
                 Ok(stored_thread) => self
-                    .load_resume_initial_history_from_stored_thread(stored_thread)
+                    .load_resume_initial_history_from_stored_thread(
+                        stored_thread,
+                        include_turns || initial_turns_page.is_some(),
+                    )
                     .await
                     .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread))),
                 Err(error) => Err(error),
@@ -4069,13 +4078,20 @@ impl ThreadRequestProcessor {
     async fn load_resume_initial_history_from_stored_thread(
         &self,
         stored_thread: StoredThread,
+        require_complete_history: bool,
     ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
-        if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
+        if !requires_complete_resume_history(stored_thread.history_mode, require_complete_history) {
+            let rollout_path = if matches!(stored_thread.history_mode, ThreadHistoryMode::Legacy) {
+                stored_thread.rollout_path.clone()
+            } else {
+                None
+            };
             let model_context = self
                 .thread_store
-                .load_latest_model_context(StoreLoadThreadHistoryParams {
+                .load_latest_model_context(StoreLoadModelContextParams {
                     thread_id: stored_thread.thread_id,
                     include_archived: true,
+                    rollout_path,
                 })
                 .await
                 .map_err(thread_store_resume_read_error)?;
@@ -4519,9 +4535,10 @@ impl ThreadRequestProcessor {
             } else if last_turn_id.is_some() || before_turn_id.is_some() {
                 Some(
                     self.thread_store
-                        .load_latest_model_context(StoreLoadThreadHistoryParams {
+                        .load_latest_model_context(StoreLoadModelContextParams {
                             thread_id: source_thread_id,
                             include_archived: true,
+                            rollout_path: None,
                         })
                         .await
                         .map_err(thread_store_resume_read_error)?
@@ -4972,6 +4989,15 @@ impl ThreadRequestProcessor {
 
         Ok((items, next_cursor))
     }
+}
+
+fn requires_complete_resume_history(
+    history_mode: ThreadHistoryMode,
+    client_requires_complete_history: bool,
+) -> bool {
+    // Legacy API turns are still projected from the loaded rollout. Callers that expose them
+    // therefore retain the full transcript; model-only resume can use the bounded context.
+    matches!(history_mode, ThreadHistoryMode::Legacy) && client_requires_complete_history
 }
 
 fn xcode_26_4_mcp_elicitations_auto_deny(

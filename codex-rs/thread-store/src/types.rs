@@ -156,6 +156,20 @@ pub struct LoadThreadHistoryParams {
     pub include_archived: bool,
 }
 
+/// Parameters for loading only the persisted items needed to resume model context.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadModelContextParams {
+    /// Thread whose model context is being reconstructed.
+    pub thread_id: ThreadId,
+    /// Whether archived threads are eligible.
+    pub include_archived: bool,
+    /// Exact local rollout path selected by a path-addressed resume.
+    ///
+    /// Stores that support this field must verify that the path belongs to `thread_id` rather than
+    /// resolving another rollout for the same logical thread.
+    pub rollout_path: Option<PathBuf>,
+}
+
 /// Persisted rollout history for a thread, without any filesystem path requirement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThreadHistory {
