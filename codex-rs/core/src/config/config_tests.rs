@@ -976,11 +976,13 @@ env_http_headers = { "x-openai-internal-codex-residency" = "CODEX_TEST_UNSET_RES
         };
         let config_layer_stack =
             ConfigLayerStack::new(Vec::new(), requirements, requirements_toml)?;
+        let codex_home = tempdir()?;
         let config = Config::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             cfg,
             ConfigOverrides::default(),
-            tempdir()?.abs(),
+            codex_home.abs(),
+            codex_home.abs(),
             config_layer_stack,
         )
         .await?;
@@ -6050,6 +6052,7 @@ async fn config_applies_managed_auth_store_and_chatgpt_base_url() -> std::io::Re
             cwd: Some(codex_home.path().to_path_buf()),
             ..Default::default()
         },
+        codex_home.abs(),
         codex_home.abs(),
         config_layer_stack,
     )
