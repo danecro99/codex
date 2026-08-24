@@ -8,7 +8,7 @@ use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
 use codex_features::Features;
 use codex_login::AuthConfig;
-use std::path::Path;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 impl Config {
     pub fn auth_keyring_backend_kind(&self) -> AuthKeyringBackendKind {
@@ -20,6 +20,7 @@ impl Config {
     pub fn auth_config(&self) -> AuthConfig {
         AuthConfig {
             codex_home: self.codex_home.to_path_buf(),
+            auth_home: self.auth_home.to_path_buf(),
             auth_credentials_store_mode: self.cli_auth_credentials_store_mode,
             keyring_backend_kind: self.auth_keyring_backend_kind(),
             forced_login_method: self.forced_login_method,
@@ -37,7 +38,8 @@ impl Config {
 /// yet available. Preserves the configured credential store, keyring backend,
 /// ChatGPT base URL, auth routing, and managed login/workspace restrictions.
 pub fn bootstrap_auth_config(
-    codex_home: &Path,
+    codex_home: &AbsolutePathBuf,
+    auth_home: &AbsolutePathBuf,
     bootstrap_config: &ConfigTomlLoadResult,
 ) -> std::io::Result<AuthConfig> {
     let config = &bootstrap_config.config_toml;
@@ -57,6 +59,7 @@ pub fn bootstrap_auth_config(
         .filter(|workspaces| !workspaces.is_empty());
     let mut auth_config = AuthConfig {
         codex_home: codex_home.to_path_buf(),
+        auth_home: auth_home.to_path_buf(),
         auth_credentials_store_mode: config.cli_auth_credentials_store.unwrap_or_default(),
         keyring_backend_kind: resolve_bootstrap_auth_keyring_backend_kind(bootstrap_config)?,
         forced_login_method: config.forced_login_method,

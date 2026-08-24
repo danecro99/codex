@@ -482,7 +482,7 @@ use codex_thread_store::ItemSortKey as StoreItemSortKey;
 use codex_thread_store::ListItemsParams as StoreListItemsParams;
 use codex_thread_store::ListThreadsParams as StoreListThreadsParams;
 use codex_thread_store::ListTurnsParams as StoreListTurnsParams;
-use codex_thread_store::LoadThreadHistoryParams as StoreLoadThreadHistoryParams;
+use codex_thread_store::LoadModelContextParams as StoreLoadModelContextParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::ReadThreadByRolloutPathParams as StoreReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams as StoreReadThreadParams;

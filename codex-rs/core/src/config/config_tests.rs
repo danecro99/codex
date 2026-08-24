@@ -976,11 +976,13 @@ env_http_headers = { "x-openai-internal-codex-residency" = "CODEX_TEST_UNSET_RES
         };
         let config_layer_stack =
             ConfigLayerStack::new(Vec::new(), requirements, requirements_toml)?;
+        let codex_home = tempdir()?;
         let config = Config::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             cfg,
             ConfigOverrides::default(),
-            tempdir()?.abs(),
+            codex_home.abs(),
+            codex_home.abs(),
             config_layer_stack,
         )
         .await?;
@@ -5322,6 +5324,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
             ..Default::default()
         },
         codex_home.abs(),
+        codex_home.abs(),
         refreshed_layer_stack,
     )
     .await?;
@@ -5388,6 +5391,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
             cwd: Some(codex_home.path().to_path_buf()),
             ..Default::default()
         },
+        codex_home.abs(),
         codex_home.abs(),
         thread_layer_stack,
     )
@@ -5483,6 +5487,7 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
             ..Default::default()
         },
         codex_home.abs(),
+        codex_home.abs(),
         refreshed_layer_stack,
     )
     .await?;
@@ -5511,6 +5516,7 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
             cwd: Some(codex_home.path().to_path_buf()),
             ..Default::default()
         },
+        codex_home.abs(),
         codex_home.abs(),
         thread_layer_stack,
     )
@@ -6046,6 +6052,7 @@ async fn config_applies_managed_auth_store_and_chatgpt_base_url() -> std::io::Re
             cwd: Some(codex_home.path().to_path_buf()),
             ..Default::default()
         },
+        codex_home.abs(),
         codex_home.abs(),
         config_layer_stack,
     )
@@ -8011,6 +8018,7 @@ async fn load_config_uses_requirements_guardian_policy_config() -> std::io::Resu
             ..Default::default()
         },
         codex_home.abs(),
+        codex_home.abs(),
         config_layer_stack,
     )
     .await?;
@@ -8096,6 +8104,7 @@ async fn requirements_guardian_policy_beats_auto_review() -> std::io::Result<()>
             ..Default::default()
         },
         codex_home.abs(),
+        codex_home.abs(),
         config_layer_stack,
     )
     .await?;
@@ -8153,6 +8162,7 @@ async fn load_config_ignores_empty_requirements_guardian_policy_config() -> std:
             cwd: Some(codex_home.path().to_path_buf()),
             ..Default::default()
         },
+        codex_home.abs(),
         codex_home.abs(),
         config_layer_stack,
     )
@@ -8294,6 +8304,7 @@ config_file = "./agents/researcher.toml"
             cwd: Some(codex_home.path().to_path_buf()),
             ..Default::default()
         },
+        codex_home.abs(),
         codex_home.abs(),
         config_layer_stack,
     )
@@ -9892,6 +9903,7 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
             cwd: Some(fixture.cwd_path()),
             ..Default::default()
         },
+        fixture.codex_home(),
         fixture.codex_home(),
         config_layer_stack,
     )

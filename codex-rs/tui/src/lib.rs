@@ -64,6 +64,7 @@ use codex_rollout::state_db;
 use codex_state::log_db;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
+use codex_utils_home_dir::find_codex_auth_home;
 use codex_utils_home_dir::find_codex_home;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
@@ -878,11 +879,15 @@ fn app_server_target_for_launch(
 async fn cloud_config_bundle_for_app_server_target(
     app_server_target: &AppServerTarget,
     bootstrap_config: &ConfigTomlLoadResult,
-    codex_home: &Path,
+    codex_home: &AbsolutePathBuf,
+    auth_home: &AbsolutePathBuf,
 ) -> std::io::Result<CloudConfigBundleLoader> {
     cloud_config_bundle_loader_for_storage(
-        app_server_target
-            .auth_config_for_cloud_loader(bootstrap_auth_config(codex_home, bootstrap_config)?),
+        app_server_target.auth_config_for_cloud_loader(bootstrap_auth_config(
+            codex_home,
+            auth_home,
+            bootstrap_config,
+        )?),
         /*enable_codex_api_key_env*/ false,
     )
     .await
@@ -972,6 +977,10 @@ async fn run_ratatui_app(
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
     let workload_identity_selected = is_workload_identity_selected();
+    let homes = ResolvedHomes {
+        codex_home: initial_config.codex_home.clone(),
+        auth_home: initial_config.auth_home.clone(),
+    };
     color_eyre::install()?;
 
     tooltips::announcement::prewarm(initial_config.http_client_factory());
@@ -1203,6 +1212,7 @@ async fn run_ratatui_app(
                         && (onboarding_result.directory_trust_persisted || show_login_screen)
                     {
                         load_config_or_exit(
+                            homes.clone(),
                             cli_kv_overrides.clone(),
                             overrides.clone(),
                             loader_overrides.clone(),
@@ -1514,6 +1524,7 @@ async fn run_ratatui_app(
                 .run_until(
                     &mut tui,
                     load_config_or_exit_with_fallback_cwd(
+                        homes.clone(),
                         cli_kv_overrides.clone(),
                         overrides.clone(),
                         loader_overrides.clone(),
@@ -1529,6 +1540,7 @@ async fn run_ratatui_app(
                 .run_until(
                     &mut tui,
                     load_config_or_exit(
+                        homes.clone(),
                         cli_kv_overrides.clone(),
                         overrides.clone(),
                         loader_overrides.clone(),
@@ -1791,6 +1803,12 @@ pub enum LoginStatus {
     NotAuthenticated,
 }
 
+#[derive(Clone)]
+struct ResolvedHomes {
+    codex_home: AbsolutePathBuf,
+    auth_home: AbsolutePathBuf,
+}
+
 /// Reads the account once to determine login status and preserve the response for bootstrap.
 async fn get_login_status(
     app_server: &mut AppServerSession,
@@ -1805,6 +1823,7 @@ async fn get_login_status(
 }
 
 async fn load_config_or_exit(
+    homes: ResolvedHomes,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
@@ -1812,6 +1831,7 @@ async fn load_config_or_exit(
     strict_config: bool,
 ) -> Config {
     load_config_or_exit_with_fallback_cwd(
+        homes,
         cli_kv_overrides,
         overrides,
         loader_overrides,
@@ -1823,6 +1843,7 @@ async fn load_config_or_exit(
 }
 
 async fn load_config_or_exit_with_fallback_cwd(
+    homes: ResolvedHomes,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
@@ -1832,6 +1853,8 @@ async fn load_config_or_exit_with_fallback_cwd(
 ) -> Config {
     #[allow(clippy::print_stderr)]
     match ConfigBuilder::default()
+        .codex_home(homes.codex_home.to_path_buf())
+        .auth_home(homes.auth_home)
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
         .loader_overrides(loader_overrides)

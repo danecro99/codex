@@ -1602,7 +1602,7 @@ async fn subtree_listing_uses_injected_graph_store_without_state_db() {
 }
 
 #[tokio::test]
-async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
+async fn rollout_path_resume_uses_model_context_while_fork_reads_full_history() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -1699,6 +1699,7 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
 
     let calls = in_memory_store.calls().await;
     assert_eq!(calls.read_thread_by_rollout_path, 2);
+    assert_eq!(calls.load_latest_model_context, 1);
 
     resumed_from_path
         .thread
