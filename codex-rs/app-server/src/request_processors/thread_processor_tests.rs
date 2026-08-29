@@ -1,3 +1,24 @@
+mod resume_history_load_tests {
+    use super::super::requires_complete_resume_history;
+    use codex_protocol::protocol::ThreadHistoryMode;
+
+    #[test]
+    fn only_visible_legacy_transcripts_require_complete_resume_history() {
+        assert!(!requires_complete_resume_history(
+            ThreadHistoryMode::Legacy,
+            /*client_requires_complete_history*/ false,
+        ));
+        assert!(requires_complete_resume_history(
+            ThreadHistoryMode::Legacy,
+            /*client_requires_complete_history*/ true,
+        ));
+        assert!(!requires_complete_resume_history(
+            ThreadHistoryMode::Paginated,
+            /*client_requires_complete_history*/ true,
+        ));
+    }
+}
+
 mod thread_list_cwd_filter_tests {
     use super::super::normalize_thread_list_cwd_filters;
     use codex_app_server_protocol::ThreadListCwdFilter;

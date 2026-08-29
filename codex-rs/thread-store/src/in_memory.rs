@@ -26,6 +26,7 @@ use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ListThreadsParams;
+use crate::LoadModelContextParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveThreadToSectionParams;
 use crate::PersistContext;
@@ -638,10 +639,32 @@ impl InMemoryThreadStore {
 
     async fn load_latest_model_context(
         &self,
-        params: LoadThreadHistoryParams,
+        params: LoadModelContextParams,
     ) -> ThreadStoreResult<StoredModelContext> {
         let mut state = self.state.lock().await;
         state.calls.load_latest_model_context += 1;
+        if let Some(rollout_path) = params.rollout_path.as_ref() {
+            let path_thread_id =
+                state
+                    .rollout_paths
+                    .get(rollout_path)
+                    .copied()
+                    .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                        message: format!(
+                            "in-memory thread store does not know rollout path {}",
+                            rollout_path.display()
+                        ),
+                    })?;
+            if path_thread_id != params.thread_id {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "rollout at {} belongs to thread {path_thread_id}, not {}",
+                        rollout_path.display(),
+                        params.thread_id
+                    ),
+                });
+            }
+        }
         let items =
             state
                 .histories
@@ -903,7 +926,7 @@ impl ThreadStore for InMemoryThreadStore {
 
     fn load_latest_model_context(
         &self,
-        params: LoadThreadHistoryParams,
+        params: LoadModelContextParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(InMemoryThreadStore::load_latest_model_context(self, params))
     }

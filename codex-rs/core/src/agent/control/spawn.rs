@@ -129,6 +129,8 @@ async fn load_agent_model_context(
     history_mode: ThreadHistoryMode,
 ) -> CodexResult<Option<Vec<RolloutItem>>> {
     match history_mode {
+        // V2 agent restore and fork still consume complete copied Legacy history. Model-only
+        // path-addressed resume is handled at the ThreadManager and Appserver boundaries.
         ThreadHistoryMode::Legacy => Ok(state
             .read_stored_thread(ReadThreadParams {
                 thread_id,
@@ -140,9 +142,10 @@ async fn load_agent_model_context(
             .map(|history| history.items)),
         ThreadHistoryMode::Paginated => Ok(Some(
             state
-                .load_latest_model_context(LoadThreadHistoryParams {
+                .load_latest_model_context(LoadModelContextParams {
                     thread_id,
                     include_archived: true,
+                    rollout_path: None,
                 })
                 .await?
                 .items,

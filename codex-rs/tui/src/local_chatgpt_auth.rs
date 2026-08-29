@@ -15,12 +15,12 @@ pub(crate) struct LocalChatgptAuth {
 }
 
 pub(crate) fn load_local_chatgpt_auth(
-    codex_home: &Path,
+    auth_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     forced_chatgpt_workspace_id: Option<&[String]>,
 ) -> Result<LocalChatgptAuth, String> {
     let auth = load_auth_dot_json(
-        codex_home,
+        auth_home,
         auth_credentials_store_mode,
         AuthKeyringBackendKind::default(),
     )
@@ -99,7 +99,7 @@ mod tests {
         format!("{header_b64}.{payload_b64}.{signature_b64}")
     }
 
-    fn write_chatgpt_auth(codex_home: &Path, plan_type: &str) {
+    fn write_chatgpt_auth(auth_home: &Path, plan_type: &str) {
         let id_token = fake_jwt("user@example.com", "workspace-1", plan_type);
         let access_token = fake_jwt("user@example.com", "workspace-1", plan_type);
         let auth = AuthDotJson {
@@ -119,7 +119,7 @@ mod tests {
             bedrock_access_keys: None,
         };
         save_auth(
-            codex_home,
+            auth_home,
             &auth,
             AuthCredentialsStoreMode::File,
             AuthKeyringBackendKind::default(),
@@ -129,11 +129,11 @@ mod tests {
 
     #[test]
     fn loads_local_chatgpt_auth_from_managed_auth() {
-        let codex_home = TempDir::new().expect("tempdir");
-        write_chatgpt_auth(codex_home.path(), "business");
+        let auth_home = TempDir::new().expect("tempdir");
+        write_chatgpt_auth(auth_home.path(), "business");
 
         let auth = load_local_chatgpt_auth(
-            codex_home.path(),
+            auth_home.path(),
             AuthCredentialsStoreMode::File,
             Some(&["workspace-1".to_string()]),
         )
@@ -146,10 +146,10 @@ mod tests {
 
     #[test]
     fn rejects_missing_local_auth() {
-        let codex_home = TempDir::new().expect("tempdir");
+        let auth_home = TempDir::new().expect("tempdir");
 
         let err = load_local_chatgpt_auth(
-            codex_home.path(),
+            auth_home.path(),
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
         )
@@ -160,9 +160,9 @@ mod tests {
 
     #[test]
     fn rejects_api_key_auth() {
-        let codex_home = TempDir::new().expect("tempdir");
+        let auth_home = TempDir::new().expect("tempdir");
         save_auth(
-            codex_home.path(),
+            auth_home.path(),
             &AuthDotJson {
                 auth_mode: Some(AuthMode::ApiKey),
                 openai_api_key: Some("sk-test".to_string()),
@@ -179,7 +179,7 @@ mod tests {
         .expect("api key auth should save");
 
         let err = load_local_chatgpt_auth(
-            codex_home.path(),
+            auth_home.path(),
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
         )
@@ -190,10 +190,10 @@ mod tests {
 
     #[test]
     fn prefers_managed_auth_over_external_ephemeral_tokens() {
-        let codex_home = TempDir::new().expect("tempdir");
-        write_chatgpt_auth(codex_home.path(), "business");
+        let auth_home = TempDir::new().expect("tempdir");
+        write_chatgpt_auth(auth_home.path(), "business");
         login_with_chatgpt_auth_tokens(
-            codex_home.path(),
+            auth_home.path(),
             &fake_jwt("user@example.com", "workspace-2", "enterprise"),
             "workspace-2",
             Some("enterprise"),
@@ -201,7 +201,7 @@ mod tests {
         .expect("external auth should save");
 
         let auth = load_local_chatgpt_auth(
-            codex_home.path(),
+            auth_home.path(),
             AuthCredentialsStoreMode::File,
             Some(&["workspace-1".to_string(), "workspace-2".to_string()]),
         )
@@ -213,11 +213,11 @@ mod tests {
 
     #[test]
     fn preserves_usage_based_plan_type_wire_name() {
-        let codex_home = TempDir::new().expect("tempdir");
-        write_chatgpt_auth(codex_home.path(), "self_serve_business_usage_based");
+        let auth_home = TempDir::new().expect("tempdir");
+        write_chatgpt_auth(auth_home.path(), "self_serve_business_usage_based");
 
         let auth = load_local_chatgpt_auth(
-            codex_home.path(),
+            auth_home.path(),
             AuthCredentialsStoreMode::File,
             Some(&["workspace-1".to_string()]),
         )

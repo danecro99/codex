@@ -70,6 +70,7 @@ pub use types::ListItemsParams;
 pub use types::ListThreadsParams;
 pub use types::ListTimelineParams;
 pub use types::ListTurnsParams;
+pub use types::LoadModelContextParams;
 pub use types::LoadThreadHistoryParams;
 pub use types::MoveThreadToSectionParams;
 pub use types::PrepareForkParams;

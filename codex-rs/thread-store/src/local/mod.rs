@@ -64,6 +64,7 @@ use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
 use crate::ListTimelineParams;
 use crate::ListTurnsParams;
+use crate::LoadModelContextParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveProjectParams;
 use crate::MoveThreadToSectionParams;
@@ -495,7 +496,7 @@ impl ThreadStore for LocalThreadStore {
 
     fn load_latest_model_context(
         &self,
-        params: LoadThreadHistoryParams,
+        params: LoadModelContextParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(async move { model_context::load_latest_model_context(self, params).await })
     }

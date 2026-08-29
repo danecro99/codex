@@ -14,6 +14,7 @@ use codex_app_server_protocol::ThreadQueueAddResponse;
 use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::experimental_required_message;
 use codex_protocol::ThreadId;
+use codex_utils_home_dir::find_codex_auth_home;
 use codex_utils_home_dir::find_codex_home;
 use color_eyre::Report;
 use color_eyre::eyre::Result;
@@ -31,9 +32,10 @@ pub async fn run_session_queue_command(
     options: SessionArchiveCommandOptions,
 ) -> Result<String> {
     let codex_home = find_codex_home().wrap_err("failed to find Codex home")?;
+    let auth_home = find_codex_auth_home(&codex_home).wrap_err("failed to find Codex auth home")?;
     let explicit_remote = options.explicit_remote_endpoint.is_some();
     let mut app_server =
-        start_app_server_for_session_command(options, codex_home.to_path_buf()).await?;
+        start_app_server_for_session_command(options, codex_home.clone(), auth_home).await?;
     if !explicit_remote
         && app_server.uses_embedded_app_server()
         && super::maybe_probe_default_daemon_socket(codex_home.as_path())

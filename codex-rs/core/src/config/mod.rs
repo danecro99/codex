@@ -895,6 +895,10 @@ pub struct Config {
     /// overridden by the `CODEX_HOME` environment variable).
     pub codex_home: AbsolutePathBuf,
 
+    /// Directory containing persisted Codex authentication state. Defaults to
+    /// `CODEX_HOME` and can be overridden by `CODEX_AUTH_HOME`.
+    pub auth_home: AbsolutePathBuf,
+
     /// Resolved configuration shared by all Codex SQLite databases.
     pub sqlite: codex_state::SqliteConfig,
 
@@ -1323,6 +1327,10 @@ impl AuthManagerConfig for Config {
         self.codex_home.to_path_buf()
     }
 
+    fn auth_home(&self) -> PathBuf {
+        self.auth_home.to_path_buf()
+    }
+
     fn cli_auth_credentials_store_mode(&self) -> AuthCredentialsStoreMode {
         self.cli_auth_credentials_store_mode
     }
@@ -1355,6 +1363,7 @@ impl AuthManagerConfig for Config {
 #[derive(Clone, Default)]
 pub struct ConfigBuilder {
     codex_home: Option<PathBuf>,
+    auth_home: Option<AbsolutePathBuf>,
     cli_overrides: Option<Vec<(String, TomlValue)>>,
     harness_overrides: Option<ConfigOverrides>,
     loader_overrides: Option<LoaderOverrides>,
@@ -1367,6 +1376,12 @@ pub struct ConfigBuilder {
 impl ConfigBuilder {
     pub fn codex_home(mut self, codex_home: PathBuf) -> Self {
         self.codex_home = Some(codex_home);
+        self
+    }
+
+    /// Supplies an already-resolved authentication root for this config construction.
+    pub fn auth_home(mut self, auth_home: AbsolutePathBuf) -> Self {
+        self.auth_home = Some(auth_home);
         self
     }
 
@@ -1416,6 +1431,7 @@ impl ConfigBuilder {
     async fn build_inner(self) -> std::io::Result<Config> {
         let Self {
             codex_home,
+            auth_home,
             cli_overrides,
             harness_overrides,
             loader_overrides,
@@ -1427,6 +1443,10 @@ impl ConfigBuilder {
         let codex_home = match codex_home {
             Some(codex_home) => AbsolutePathBuf::from_absolute_path(codex_home)?,
             None => find_codex_home()?,
+        };
+        let auth_home = match auth_home {
+            Some(auth_home) => auth_home,
+            None => codex_utils_home_dir::find_codex_auth_home(&codex_home)?,
         };
         let cli_overrides = cli_overrides.unwrap_or_default();
         let mut harness_overrides = harness_overrides.unwrap_or_default();
@@ -1481,6 +1501,7 @@ impl ConfigBuilder {
             config_toml,
             harness_overrides,
             codex_home,
+            auth_home,
             config_layer_stack,
         )
         .await
@@ -1841,6 +1862,7 @@ impl Config {
                 ..Default::default()
             },
             refreshed_config.codex_home.clone(),
+            refreshed_config.auth_home.clone(),
             config_layer_stack,
         )
         .await
@@ -1883,12 +1905,14 @@ impl Config {
         let cli_layer = codex_config::build_cli_overrides_layer(&cli_overrides);
         codex_config::merge_toml_values(&mut merged, &cli_layer);
         let codex_home = AbsolutePathBuf::from_absolute_path_checked(codex_home)?;
+        let auth_home = codex_utils_home_dir::find_codex_auth_home(&codex_home)?;
         let config_toml = deserialize_config_toml_with_base(merged, &codex_home)?;
         Self::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             config_toml,
             ConfigOverrides::default(),
             codex_home,
+            auth_home,
             ConfigLayerStack::default(),
         )
         .await
@@ -3119,11 +3143,13 @@ impl Config {
     ) -> std::io::Result<Self> {
         // Note this ignores requirements.toml enforcement for tests.
         let config_layer_stack = ConfigLayerStack::default();
+        let auth_home = codex_home.clone();
         Self::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             cfg,
             overrides,
             codex_home,
+            auth_home,
             config_layer_stack,
         )
         .await
@@ -3134,6 +3160,7 @@ impl Config {
         mut cfg: ConfigToml,
         overrides: ConfigOverrides,
         codex_home: AbsolutePathBuf,
+        auth_home: AbsolutePathBuf,
         config_layer_stack: ConfigLayerStack,
     ) -> std::io::Result<Self> {
         // Keep the large config-construction future off small test thread stacks.
@@ -4213,6 +4240,7 @@ impl Config {
             memories: memories_config,
             agent_interrupt_message_enabled,
             codex_home,
+            auth_home,
             sqlite: codex_state::SqliteConfig::from_sqlite_home(sqlite_home),
             log_dir,
             config_layer_stack,
@@ -4726,6 +4754,11 @@ fn normalize_guardian_policy_config(value: Option<&str>) -> Option<String> {
 ///   directory exists.
 pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
     codex_utils_home_dir::find_codex_home()
+}
+
+/// Resolves the directory used exclusively for Codex authentication state.
+pub fn find_codex_auth_home(codex_home: &AbsolutePathBuf) -> std::io::Result<AbsolutePathBuf> {
+    codex_utils_home_dir::find_codex_auth_home(codex_home)
 }
 
 /// Returns the path to the folder where Codex logs are stored. Does not verify

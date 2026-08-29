@@ -70,7 +70,7 @@ use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
 use codex_skills_extension::HostSkillsService;
 use codex_thread_store::InMemoryThreadStore;
-use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::LoadModelContextParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::MoveThreadToSectionParams;
@@ -1028,7 +1028,9 @@ impl ThreadManager {
         parent_trace: Option<W3cTraceContext>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> CodexResult<NewThread> {
-        let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
+        let initial_history = self
+            .resume_initial_history_from_rollout_path(rollout_path)
+            .await?;
         Box::pin(self.resume_thread_with_history(
             config,
             initial_history,
@@ -1135,7 +1137,9 @@ impl ThreadManager {
         client_mcp_extensions: ClientMcpExtensions,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&config);
-        let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
+        let initial_history = self
+            .resume_initial_history_from_rollout_path(rollout_path)
+            .await?;
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
             .unwrap_or_else(|| (self.state.session_source.clone(), None));
@@ -1274,6 +1278,41 @@ impl ThreadManager {
             .await
             .map_err(thread_store_rollout_read_error)?;
         stored_thread_to_initial_history(stored_thread, Some(requested_rollout_path))
+    }
+
+    /// Loads only the model-reconstruction history for a path-addressed resume.
+    ///
+    /// Fork and transcript consumers retain their complete-history paths.
+    async fn resume_initial_history_from_rollout_path(
+        &self,
+        rollout_path: PathBuf,
+    ) -> CodexResult<InitialHistory> {
+        let requested_rollout_path = rollout_path.clone();
+        let stored_thread = self
+            .state
+            .thread_store
+            .read_thread_by_rollout_path(ReadThreadByRolloutPathParams {
+                rollout_path,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+            .map_err(thread_store_rollout_read_error)?;
+        let model_context = self
+            .state
+            .thread_store
+            .load_latest_model_context(LoadModelContextParams {
+                thread_id: stored_thread.thread_id,
+                include_archived: true,
+                rollout_path: Some(requested_rollout_path.clone()),
+            })
+            .await
+            .map_err(thread_store_model_context_read_error)?;
+        Ok(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: model_context.thread_id,
+            history: Arc::new(model_context.items),
+            rollout_path: Some(requested_rollout_path),
+        }))
     }
 
     /// Fork an existing thread from already-loaded store history.
@@ -1500,7 +1539,7 @@ impl ThreadManagerState {
 
     pub(crate) async fn load_latest_model_context(
         &self,
-        params: LoadThreadHistoryParams,
+        params: LoadModelContextParams,
     ) -> CodexResult<StoredModelContext> {
         let thread_id = params.thread_id;
         self.thread_store
@@ -2140,6 +2179,16 @@ fn thread_store_rollout_read_error(err: ThreadStoreError) -> CodexErr {
         ThreadStoreError::ThreadNotFound { thread_id } => CodexErr::ThreadNotFound(thread_id),
         ThreadStoreError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
         err => CodexErr::Fatal(format!("failed to read thread by rollout path: {err}")),
+    }
+}
+
+fn thread_store_model_context_read_error(err: ThreadStoreError) -> CodexErr {
+    match err {
+        ThreadStoreError::ThreadNotFound { thread_id } => CodexErr::ThreadNotFound(thread_id),
+        ThreadStoreError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
+        err => CodexErr::Fatal(format!(
+            "failed to load model context by rollout path: {err}"
+        )),
     }
 }
 
