@@ -1897,11 +1897,9 @@ impl PluginRequestProcessor {
             }
         };
         if !codex_apps_ready {
-            warn!(
-                plugin = plugin_id,
-                "codex_apps MCP not ready after plugin install; skipping appsNeedingAuth check"
-            );
-            return Ok(Vec::new());
+            return Err(internal_error(format!(
+                "codex_apps MCP is not ready after plugin install for plugin {plugin_id}"
+            )));
         }
 
         let accessible_ids = accessible_connectors
