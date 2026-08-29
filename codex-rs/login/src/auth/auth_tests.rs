@@ -2532,9 +2532,61 @@ async fn auth_manager_rejects_disallowed_stored_and_external_auth() {
 
 #[tokio::test]
 #[serial(codex_auth_env)]
-async fn api_only_policy_rejects_access_tokens_before_hydration() {
+async fn auth_manager_validates_environment_and_ephemeral_auth_after_selection() {
+    let environment_auth_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    let api_key_guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-environment");
+    let mut config = build_config(
+        environment_auth_home.path(),
+        /*forced_login_method*/ None,
+        /*forced_chatgpt_workspace_id*/ None,
+    )
+    .await;
+    config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Chatgpt]);
+    let error =
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ true)
+            .await
+            .expect_err("disallowed environment auth must fail manager initialization");
+    assert_eq!(error.to_string(), "ChatGPT login is required");
+    drop(api_key_guard);
+
+    let ephemeral_auth_home = tempdir().unwrap();
+    login_with_api_key(
+        ephemeral_auth_home.path(),
+        "sk-ephemeral",
+        AuthCredentialsStoreMode::Ephemeral,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("seed ephemeral api key");
+    let mut config = build_config(
+        ephemeral_auth_home.path(),
+        /*forced_login_method*/ None,
+        /*forced_chatgpt_workspace_id*/ None,
+    )
+    .await;
+    config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Chatgpt]);
+    let error =
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .expect_err("disallowed ephemeral auth must fail manager initialization");
+    assert_eq!(error.to_string(), "ChatGPT login is required");
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn auth_manager_validates_access_token_policy_after_selection() {
     let codex_home = tempdir().unwrap();
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/user-auth-credential/whoami"))
+        .and(header("authorization", "Bearer at-rejected"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(personal_access_token_whoami(WORKSPACE_ID_ALLOWED)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     let _authapi_guard = EnvVarGuard::set("CODEX_AUTHAPI_BASE_URL", &server.uri());
     let _access_token_guard = EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, "at-rejected");
     let mut config = build_config(
@@ -2544,20 +2596,13 @@ async fn api_only_policy_rejects_access_tokens_before_hydration() {
     )
     .await;
     config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Api]);
-    let manager =
+    let error =
         AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
             .await
-            .expect("auth manager");
+            .expect_err("disallowed access token must fail manager initialization");
 
-    assert_eq!(manager.auth().await.expect("auth should load"), None);
-    assert!(
-        server
-            .received_requests()
-            .await
-            .expect("inspect auth requests")
-            .is_empty(),
-        "rejected access tokens must not call whoami or register Agent Identity"
-    );
+    assert_eq!(error.to_string(), "API key login is required");
+    server.verify().await;
 }
 
 #[tokio::test]

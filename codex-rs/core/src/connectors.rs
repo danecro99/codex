@@ -90,7 +90,7 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
 ) -> anyhow::Result<Vec<DiscoverableTool>> {
     let connector_ids = tool_suggest_connector_ids(config, loaded_plugin_app_connector_ids);
     let directory_connectors = codex_connectors::merge::merge_plugin_connectors(
-        cached_directory_connectors_for_tool_suggest_with_auth(config, auth).await,
+        cached_directory_connectors_for_tool_suggest_with_auth(config, auth).await?,
         connector_ids.iter().cloned(),
     );
     let discoverable_connectors =
@@ -420,36 +420,27 @@ fn tool_suggest_connector_ids(
 async fn cached_directory_connectors_for_tool_suggest_with_auth(
     config: &Config,
     auth: Option<&CodexAuth>,
-) -> Vec<AppInfo> {
+) -> anyhow::Result<Vec<AppInfo>> {
     if !config.features.enabled(Feature::Apps) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let loaded_auth;
     let auth = if let Some(auth) = auth {
         Some(auth)
     } else {
-        let Ok(auth_manager) =
-            AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await
-        else {
-            return Vec::new();
-        };
-        loaded_auth = match auth_manager.auth().await {
-            Ok(auth) => auth,
-            Err(error) => {
-                tracing::error!(%error, "failed to load auth for cached connector directory");
-                return Vec::new();
-            }
-        };
+        let auth_manager =
+            AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
+        loaded_auth = auth_manager.auth().await?;
         loaded_auth.as_ref()
     };
     let Some(auth) = auth.filter(|auth| auth.uses_codex_backend()) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let account_id = match auth.get_account_id() {
         Some(account_id) if !account_id.is_empty() => account_id,
-        _ => return Vec::new(),
+        _ => return Ok(Vec::new()),
     };
     let is_workspace_account = auth.is_workspace_account();
     let cache_context = ConnectorDirectoryCacheContext::new(
@@ -462,7 +453,7 @@ async fn cached_directory_connectors_for_tool_suggest_with_auth(
         ),
     );
 
-    codex_connectors::cached_directory_connectors(&cache_context).unwrap_or_default()
+    Ok(codex_connectors::cached_directory_connectors(&cache_context).unwrap_or_default())
 }
 
 pub(crate) fn accessible_connectors_from_mcp_tools(mcp_tools: &[ToolInfo]) -> Vec<AppInfo> {

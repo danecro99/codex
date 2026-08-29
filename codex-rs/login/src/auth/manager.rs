@@ -1189,7 +1189,7 @@ impl AuthConfig {
             &self.auth_home,
             enable_codex_api_key_env,
             self.auth_credentials_store_mode,
-            Some(&allowed_login_methods),
+            /*allowed_login_methods*/ None,
             workspaces.as_deref(),
             self.chatgpt_base_url.as_deref(),
             self.keyring_backend_kind,

@@ -1891,24 +1891,9 @@ impl PluginRequestProcessor {
         let (accessible_connectors, codex_apps_ready) = match accessible_connectors_result {
             Ok(status) => (status.connectors, status.codex_apps_ready),
             Err(err) => {
-                warn!(
-                    plugin = plugin_id,
-                    "failed to load accessible apps after plugin install: {err:#}"
-                );
-                let cached_connectors =
-                    connectors::list_cached_accessible_connectors_from_mcp_tools(config)
-                        .await
-                        .map_err(|error| {
-                            internal_error(format!(
-                                "failed to load cached accessible apps after plugin install: {error}"
-                            ))
-                        })?
-                        .ok_or_else(|| {
-                            internal_error(
-                                "cached accessible apps are unavailable after plugin install",
-                            )
-                        })?;
-                (cached_connectors, false)
+                return Err(internal_error(format!(
+                    "failed to load accessible apps after plugin install: {err}"
+                )));
             }
         };
         if !codex_apps_ready {

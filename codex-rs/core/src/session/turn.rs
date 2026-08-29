@@ -1535,55 +1535,51 @@ pub(crate) async fn built_tools(
         auth,
         endpoint_candidates: endpoint_recommended_plugin_candidates,
     } = prepared_recommendations;
-    let tool_suggest_candidates =
-        if let Some(recommended_plugin_candidates) = endpoint_recommended_plugin_candidates {
-            Some(ToolSuggestCandidates {
-                tools: recommended_plugin_candidates,
-                presentation: ToolSuggestPresentation::RecommendationContext,
-            })
-        } else {
-            let loaded_plugin_app_connector_ids = connector_snapshot
-                .connector_ids()
-                .iter()
-                .map(|connector_id| connector_id.0.clone())
-                .collect::<Vec<_>>();
-            async {
-                if apps_enabled && tool_suggest_is_enabled {
-                    if let Some(accessible_connectors) = accessible_connectors.as_ref() {
-                        match connectors::list_tool_suggest_discoverable_tools_with_auth(
-                            &turn_context.config,
-                            sess.services.plugins_manager.as_ref(),
-                            auth.as_ref(),
-                            accessible_connectors.as_slice(),
-                            &loaded_plugin_app_connector_ids,
-                        )
-                        .await
-                        .map(|discoverable_tools| {
-                            filter_request_plugin_install_discoverable_tools_for_client(
-                                discoverable_tools,
-                                turn_context.app_server_client_name.as_deref(),
-                            )
-                        }) {
-                            Ok(discoverable_tools) if discoverable_tools.is_empty() => None,
-                            Ok(discoverable_tools) => Some(ToolSuggestCandidates {
-                                tools: discoverable_tools,
-                                presentation: ToolSuggestPresentation::ListTool,
-                            }),
-                            Err(err) => {
-                                warn!("failed to load discoverable tool suggestions: {err:#}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+    let tool_suggest_candidates = if let Some(recommended_plugin_candidates) =
+        endpoint_recommended_plugin_candidates
+    {
+        Some(ToolSuggestCandidates {
+            tools: recommended_plugin_candidates,
+            presentation: ToolSuggestPresentation::RecommendationContext,
+        })
+    } else {
+        let loaded_plugin_app_connector_ids = connector_snapshot
+            .connector_ids()
+            .iter()
+            .map(|connector_id| connector_id.0.clone())
+            .collect::<Vec<_>>();
+        async {
+            if !apps_enabled || !tool_suggest_is_enabled {
+                return Ok::<Option<ToolSuggestCandidates>, anyhow::Error>(None);
             }
-            .instrument(trace_span!("built_tools.load_discoverable_tools"))
-            .await
-        };
+            let Some(accessible_connectors) = accessible_connectors.as_ref() else {
+                return Ok::<Option<ToolSuggestCandidates>, anyhow::Error>(None);
+            };
+            let discoverable_tools = connectors::list_tool_suggest_discoverable_tools_with_auth(
+                &turn_context.config,
+                sess.services.plugins_manager.as_ref(),
+                auth.as_ref(),
+                accessible_connectors.as_slice(),
+                &loaded_plugin_app_connector_ids,
+            )
+            .await?;
+            let discoverable_tools = filter_request_plugin_install_discoverable_tools_for_client(
+                discoverable_tools,
+                turn_context.app_server_client_name.as_deref(),
+            );
+            if discoverable_tools.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(ToolSuggestCandidates {
+                    tools: discoverable_tools,
+                    presentation: ToolSuggestPresentation::ListTool,
+                }))
+            }
+        }
+        .instrument(trace_span!("built_tools.load_discoverable_tools"))
+        .await
+        .map_err(std::io::Error::other)?
+    };
     Ok(Arc::new(build_tool_router(
         sess,
         turn_context,
