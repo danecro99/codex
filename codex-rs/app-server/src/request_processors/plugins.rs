@@ -1561,7 +1561,7 @@ impl PluginRequestProcessor {
                 &result.plugin_id.as_key(),
                 &plugin_app_declarations,
             )
-            .await;
+            .await?;
 
         Ok(PluginInstallResponse {
             auth_policy: result.auth_policy.into(),
@@ -1807,7 +1807,7 @@ impl PluginRequestProcessor {
                 &result.plugin_id.as_key(),
                 &plugin_app_declarations,
             )
-            .await
+            .await?
         };
 
         Ok(PluginInstallResponse {
@@ -1858,13 +1858,13 @@ impl PluginRequestProcessor {
         auth: Option<&CodexAuth>,
         plugin_id: &str,
         plugin_app_declarations: &[codex_plugin::AppDeclaration],
-    ) -> Vec<AppSummary> {
+    ) -> Result<Vec<AppSummary>, JSONRPCErrorError> {
         if plugin_app_declarations.is_empty()
             || !config
                 .features
                 .apps_enabled_for_auth(auth.is_some_and(CodexAuth::is_chatgpt_auth))
         {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let plugin_apps =
@@ -1895,12 +1895,20 @@ impl PluginRequestProcessor {
                     plugin = plugin_id,
                     "failed to load accessible apps after plugin install: {err:#}"
                 );
-                (
+                let cached_connectors =
                     connectors::list_cached_accessible_connectors_from_mcp_tools(config)
                         .await
-                        .unwrap_or_default(),
-                    false,
-                )
+                        .map_err(|error| {
+                            internal_error(format!(
+                                "failed to load cached accessible apps after plugin install: {error}"
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            internal_error(
+                                "cached accessible apps are unavailable after plugin install",
+                            )
+                        })?;
+                (cached_connectors, false)
             }
         };
         if !codex_apps_ready {
@@ -1908,17 +1916,17 @@ impl PluginRequestProcessor {
                 plugin = plugin_id,
                 "codex_apps MCP not ready after plugin install; skipping appsNeedingAuth check"
             );
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let accessible_ids = accessible_connectors
             .iter()
             .map(|connector| connector.id.as_str())
             .collect::<HashSet<_>>();
-        app_summaries
+        Ok(app_summaries
             .into_iter()
             .filter(|app| !accessible_ids.contains(app.id.as_str()))
-            .collect()
+            .collect())
     }
 
     async fn start_plugin_mcp_oauth_logins(

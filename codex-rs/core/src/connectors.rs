@@ -117,26 +117,18 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
 
 pub async fn list_cached_accessible_connectors_from_mcp_tools(
     config: &Config,
-) -> Option<Vec<AppInfo>> {
+) -> anyhow::Result<Option<Vec<AppInfo>>> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
-            .await
-            .ok()?;
-    let auth = match auth_manager.auth().await {
-        Ok(auth) => auth,
-        Err(error) => {
-            tracing::error!(%error, "failed to load auth for cached accessible connectors");
-            return None;
-        }
-    };
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
+    let auth = auth_manager.auth().await?;
     if !config
         .features
         .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
     {
-        return Some(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     let cache_key = accessible_connectors_cache_key(config, auth.as_ref());
-    read_cached_accessible_connectors(&cache_key)
+    Ok(read_cached_accessible_connectors(&cache_key))
 }
 
 pub(crate) fn refresh_accessible_connectors_cache_from_mcp_tools(

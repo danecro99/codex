@@ -1177,13 +1177,6 @@ impl AuthConfig {
         }
     }
 
-    pub fn allows_auth(&self, auth: &CodexAuth) -> bool {
-        let allowed_login_methods = self.allowed_login_methods();
-        let workspaces = self.effective_chatgpt_workspaces();
-        validate_auth_restrictions(Some(&allowed_login_methods), workspaces.as_deref(), auth)
-            .is_ok()
-    }
-
     pub async fn load_auth(
         &self,
         enable_codex_api_key_env: bool,
@@ -1204,7 +1197,11 @@ impl AuthConfig {
             &self.auth_route_config,
         )
         .await?;
-        Ok(auth.filter(|auth| self.allows_auth(auth)))
+        if let Some(auth) = auth.as_ref() {
+            validate_auth_restrictions(Some(&allowed_login_methods), workspaces.as_deref(), auth)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+        }
+        Ok(auth)
     }
 
     fn allowed_login_methods(&self) -> Vec<ForcedLoginMethod> {
@@ -1525,9 +1522,6 @@ async fn load_auth(
         Some(auth) => auth,
         None => return Ok(None),
     };
-    if !auth_mode_is_allowed(allowed_login_methods, auth_dot_json.resolved_mode()) {
-        return Ok(None);
-    }
     if let Some(agent_identity) = auth_dot_json.agent_identity.as_ref() {
         ensure_agent_identity_workspace_allowed(forced_chatgpt_workspace_id, agent_identity)?;
     }
@@ -2340,11 +2334,8 @@ impl AuthManager {
         let Some(auth) = self.auth_cached() else {
             return Ok(None);
         };
-        if Self::should_refresh_proactively(&auth)
-            && let Err(err) = self.refresh_token().await
-        {
-            tracing::error!("Failed to refresh token: {}", err);
-            return Ok(Some(auth));
+        if Self::should_refresh_proactively(&auth) {
+            self.refresh_token().await?;
         }
         Ok(self.auth_cached())
     }

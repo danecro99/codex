@@ -1679,6 +1679,59 @@ async fn auth_manager_reload_propagates_policy_errors_without_clearing_cache() {
 }
 
 #[tokio::test]
+async fn auth_manager_auth_propagates_proactive_reload_errors_without_reusing_cache() {
+    let auth_home = tempdir().expect("tempdir");
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        auth_home.path(),
+    )
+    .expect("seed ChatGPT credentials");
+    let auth_path = get_auth_file(auth_home.path());
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_path).expect("read auth file"))
+            .expect("parse auth file");
+    stored["tokens"]["account_id"] = json!(WORKSPACE_ID_ALLOWED);
+    stored["last_refresh"] = json!(Utc::now() - chrono::Duration::days(9));
+    std::fs::write(
+        &auth_path,
+        serde_json::to_vec(&stored).expect("serialize auth file"),
+    )
+    .expect("write stale auth file");
+
+    let manager = AuthManager::new(
+        auth_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await
+    .expect("auth manager");
+    let cached = manager.auth_cached();
+    std::fs::write(&auth_path, "{not-json").expect("write malformed auth file");
+
+    let error = manager
+        .auth()
+        .await
+        .expect_err("proactive reload error must propagate");
+
+    let RefreshTokenError::Transient(storage_error) = &error else {
+        panic!("unexpected proactive reload error: {error:?}");
+    };
+    assert!(
+        storage_error.to_string().contains("key must be a string"),
+        "{storage_error}"
+    );
+    assert_eq!(manager.auth_cached(), cached);
+}
+
+#[tokio::test]
 async fn external_header_auth_obeys_workspace_policy() {
     for (account_id, should_succeed) in [
         (Some(WORKSPACE_ID_ALLOWED), true),
@@ -2451,12 +2504,21 @@ async fn auth_manager_rejects_disallowed_stored_and_external_auth() {
     )
     .await;
     config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Chatgpt]);
+    let error = AuthManager::shared_from_auth_config(
+        config.clone(),
+        /*enable_codex_api_key_env*/ false,
+    )
+    .await
+    .expect_err("disallowed stored auth must fail manager initialization");
+    assert_eq!(error.to_string(), "ChatGPT login is required");
+
+    let empty_auth_home = tempdir().unwrap();
+    config.codex_home = empty_auth_home.path().to_path_buf();
+    config.auth_home = empty_auth_home.path().to_path_buf();
     let manager =
         AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
             .await
-            .expect("auth manager");
-
-    assert_eq!(manager.auth().await.expect("auth should load"), None);
+            .expect("empty auth manager");
     assert!(
         manager
             .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
@@ -2590,12 +2652,11 @@ async fn workspace_policy_checks_the_selected_request_account() {
         Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
     )
     .await;
-    let manager =
+    let error =
         AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
             .await
-            .expect("auth manager");
-
-    assert_eq!(manager.auth().await.expect("auth should load"), None);
+            .expect_err("selected account mismatch must fail manager initialization");
+    assert!(error.to_string().contains("Login is restricted"), "{error}");
 }
 
 #[tokio::test]
