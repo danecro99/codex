@@ -5,6 +5,18 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::TruncationPolicy;
+use std::error::Error;
+use std::fmt;
+
+use crate::reverse_jsonl_scanner::MAX_ROLLOUT_LINE_BYTES;
+
+/// Maximum number of durable rollout items admitted to a resumed model context.
+pub const MODEL_CONTEXT_MAX_ITEMS: usize = 16 * 1024;
+/// Maximum serialized bytes admitted to a resumed model context.
+pub const MODEL_CONTEXT_MAX_BYTES: usize = MAX_ROLLOUT_LINE_BYTES;
+/// Maximum estimated model tokens admitted to a resumed model context.
+pub const MODEL_CONTEXT_MAX_TOKENS: usize = 1_000_000;
 
 /// Whether a reverse model-context scan needs more rollout items.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +26,46 @@ pub enum ModelContextScanProgress {
     /// The scan has collected a safe bounded suffix.
     Complete,
 }
+
+/// Failure to prove or assemble a bounded model-context replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelContextScanError {
+    /// The scanned history did not contain a checkpoint that safely replaces its older prefix.
+    MissingSafeCutoff,
+    /// The candidate suffix exceeded one of the canonical resume limits.
+    LimitExceeded {
+        dimension: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
+    /// A rollout item could not be measured before admission.
+    Serialization(String),
+}
+
+impl fmt::Display for ModelContextScanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSafeCutoff => formatter
+                .write_str("rollout does not contain a safe bounded model-context checkpoint"),
+            Self::LimitExceeded {
+                dimension,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "bounded model context exceeds the {dimension} limit: {actual} > {maximum}"
+            ),
+            Self::Serialization(message) => {
+                write!(
+                    formatter,
+                    "failed to measure bounded model context: {message}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ModelContextScanError {}
 
 /// Accumulates newest-to-oldest rollout items until they are sufficient to reconstruct the latest
 /// model context.
@@ -27,8 +79,10 @@ pub enum ModelContextScanProgress {
 /// - `saw_compaction`: a `CompactedItem` with `replacement_history` and `window_number`;
 /// - `saw_completed_turn_context`: a completed user turn with a compatible `TurnContextItem`.
 ///
-/// If the scan reaches the beginning before finding a bounded cutoff, it has already collected
-/// the complete replay and so we can return that directly.
+/// Reaching the beginning without this cutoff is an error for legacy resume. Callers that have
+/// independently proved a canonical paginated lineage origin can finish through
+/// [`Self::finish_paginated_origin`]. Callers with a separate, explicit frozen prefix boundary can
+/// finish through [`Self::finish_frozen_prefix`].
 ///
 /// `TurnContextItem` does not identify whether it came from a user turn, so one only counts after
 /// the same turn also proves a user-turn boundary: a paginated
@@ -44,10 +98,12 @@ pub enum ModelContextScanProgress {
 /// - compaction without `replacement_history` or `window_number`;
 /// - rollback markers;
 ///
-/// When one appears, the scanner continues to the beginning and returns the complete replay.
+/// When one appears, the scanner cannot produce a safe resume checkpoint.
 #[derive(Debug, Default)]
 pub struct ModelContextScan {
     items_newest_first: Vec<RolloutItem>,
+    serialized_bytes: usize,
+    estimated_tokens: usize,
     saw_compaction: bool,
     saw_completed_turn_context: bool,
     must_scan_to_start: bool,
@@ -56,26 +112,100 @@ pub struct ModelContextScan {
 
 impl ModelContextScan {
     /// Adds the next newest-to-oldest rollout item and reports whether the reader can stop.
-    pub fn push(&mut self, item: RolloutItem) -> ModelContextScanProgress {
+    pub fn push(
+        &mut self,
+        item: RolloutItem,
+    ) -> Result<ModelContextScanProgress, ModelContextScanError> {
+        self.admit(&item)?;
         let progress = self.observe(&item);
         self.items_newest_first.push(item);
-        progress
+        Ok(progress)
     }
 
     /// Returns the collected items in chronological order with canonical head metadata.
     ///
     /// Call this after the reader reaches the beginning of its source or after [`Self::push`]
     /// returns [`ModelContextScanProgress::Complete`].
-    pub fn finish(mut self, session_meta: SessionMetaLine) -> Vec<RolloutItem> {
-        self.items_newest_first.reverse();
-        if self.has_bounded_cutoff() {
-            // A bounded scan stops before reaching the head. Prepend the separately loaded head
-            // SessionMeta, which remains canonical when copied fork history contains later
-            // metadata.
-            self.items_newest_first
-                .insert(0, RolloutItem::SessionMeta(session_meta));
+    pub fn finish(
+        mut self,
+        session_meta: SessionMetaLine,
+    ) -> Result<Vec<RolloutItem>, ModelContextScanError> {
+        if !self.has_bounded_cutoff() {
+            return Err(ModelContextScanError::MissingSafeCutoff);
         }
-        self.items_newest_first
+        self.prepend_session_meta(session_meta)?;
+        self.items_newest_first.reverse();
+        Ok(self.items_newest_first)
+    }
+
+    /// Finishes a bounded scan that reached the canonical origin of a paginated lineage.
+    ///
+    /// The caller must prove the origin from the lineage rather than inferring it from an arbitrary
+    /// `SessionMeta` item in replay history. Unsupported compaction and rollback shapes still fail
+    /// because they cannot be reconstructed by this selector.
+    pub fn finish_paginated_origin(
+        mut self,
+        session_meta: SessionMetaLine,
+    ) -> Result<Vec<RolloutItem>, ModelContextScanError> {
+        if self.must_scan_to_start {
+            return Err(ModelContextScanError::MissingSafeCutoff);
+        }
+        self.prepend_session_meta(session_meta)?;
+        self.items_newest_first.reverse();
+        Ok(self.items_newest_first)
+    }
+
+    /// Finishes history whose older edge is already frozen by a durable `HistoryPosition`.
+    pub fn finish_frozen_prefix(
+        mut self,
+        session_meta: SessionMetaLine,
+    ) -> Result<Vec<RolloutItem>, ModelContextScanError> {
+        self.items_newest_first.reverse();
+        if !matches!(
+            self.items_newest_first.first(),
+            Some(RolloutItem::SessionMeta(_))
+        ) {
+            let item = RolloutItem::SessionMeta(session_meta);
+            self.admit(&item)?;
+            self.items_newest_first.insert(0, item);
+        }
+        Ok(self.items_newest_first)
+    }
+
+    fn prepend_session_meta(
+        &mut self,
+        session_meta: SessionMetaLine,
+    ) -> Result<(), ModelContextScanError> {
+        let item = RolloutItem::SessionMeta(session_meta);
+        self.admit(&item)?;
+        self.items_newest_first.push(item);
+        Ok(())
+    }
+
+    fn admit(&mut self, item: &RolloutItem) -> Result<(), ModelContextScanError> {
+        let item_bytes = serde_json::to_vec(item)
+            .map_err(|err| ModelContextScanError::Serialization(err.to_string()))?
+            .len();
+        let item_tokens = TruncationPolicy::Bytes(item_bytes).token_budget();
+        let items = self.items_newest_first.len().saturating_add(1);
+        let serialized_bytes = self.serialized_bytes.saturating_add(item_bytes);
+        let estimated_tokens = self.estimated_tokens.saturating_add(item_tokens);
+        for (dimension, actual, maximum) in [
+            ("item", items, MODEL_CONTEXT_MAX_ITEMS),
+            ("byte", serialized_bytes, MODEL_CONTEXT_MAX_BYTES),
+            ("token", estimated_tokens, MODEL_CONTEXT_MAX_TOKENS),
+        ] {
+            if actual > maximum {
+                return Err(ModelContextScanError::LimitExceeded {
+                    dimension,
+                    actual,
+                    maximum,
+                });
+            }
+        }
+        self.serialized_bytes = serialized_bytes;
+        self.estimated_tokens = estimated_tokens;
+        Ok(())
     }
 
     fn observe(&mut self, item: &RolloutItem) -> ModelContextScanProgress {

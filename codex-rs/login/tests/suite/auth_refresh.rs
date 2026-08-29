@@ -144,7 +144,8 @@ async fn refresh_token_honors_respect_system_proxy() -> Result<()> {
             OutboundProxyPolicy::RespectSystemProxy,
         )),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
         auth_mode: Some(AuthMode::Chatgpt),
@@ -375,7 +376,8 @@ async fn shared_auth_home_serializes_refresh_across_auth_managers() -> Result<()
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     let second = AuthManager::shared(
         auth_home.path().to_path_buf(),
         false,
@@ -385,7 +387,8 @@ async fn shared_auth_home_serializes_refresh_across_auth_managers() -> Result<()
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
 
     let (first_result, second_result) = tokio::join!(
         first.refresh_token_from_authority(),
@@ -1621,7 +1624,8 @@ impl RefreshTokenTestContext {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await;
+        .await
+        .expect("auth manager should initialize");
 
         Ok(Self {
             codex_home,

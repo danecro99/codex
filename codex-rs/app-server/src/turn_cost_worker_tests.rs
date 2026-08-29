@@ -411,7 +411,8 @@ async fn auth_manager_at(codex_home: &std::path::Path) -> Arc<AuthManager> {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await,
+        .await
+        .expect("auth manager should initialize"),
     )
 }
 

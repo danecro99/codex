@@ -225,7 +225,9 @@ enum AuthManagerInitializationErrorSource {
     #[error(transparent)]
     WorkloadIdentityConfiguration(WorkloadIdentitySessionError),
     #[error(transparent)]
-    InitialAuth(RefreshTokenError),
+    InitialAuth(std::io::Error),
+    #[error(transparent)]
+    ExternalAuth(RefreshTokenError),
 }
 
 impl From<WorkloadIdentitySessionError> for AuthManagerInitializationError {
@@ -236,7 +238,7 @@ impl From<WorkloadIdentitySessionError> for AuthManagerInitializationError {
 
 impl From<RefreshTokenError> for AuthManagerInitializationError {
     fn from(error: RefreshTokenError) -> Self {
-        Self(AuthManagerInitializationErrorSource::InitialAuth(error))
+        Self(AuthManagerInitializationErrorSource::ExternalAuth(error))
     }
 }
 
@@ -2112,10 +2114,8 @@ fn default_agent_identity_authapi_base_url() -> Option<String> {
 }
 
 impl AuthManager {
-    /// Create a new manager loading the initial auth using the provided
-    /// preferred auth method. Errors loading auth are swallowed; `auth()` will
-    /// simply return `None` in that case so callers can treat it as an
-    /// unauthenticated state.
+    /// Create a new manager loading the initial auth using the provided preferred auth method.
+    /// Storage and credential errors are returned instead of being presented as unauthenticated.
     pub async fn new(
         auth_home: PathBuf,
         enable_codex_api_key_env: bool,
@@ -2124,7 +2124,7 @@ impl AuthManager {
         chatgpt_base_url: Option<String>,
         keyring_backend_kind: AuthKeyringBackendKind,
         auth_route_config: AuthRouteConfig,
-    ) -> Self {
+    ) -> Result<Self, AuthManagerInitializationError> {
         Self::new_from_auth_config(
             AuthConfig {
                 codex_home: auth_home.clone(),
@@ -2142,12 +2142,18 @@ impl AuthManager {
         .await
     }
 
-    async fn new_from_auth_config(auth_config: AuthConfig, enable_codex_api_key_env: bool) -> Self {
+    async fn new_from_auth_config(
+        auth_config: AuthConfig,
+        enable_codex_api_key_env: bool,
+    ) -> Result<Self, AuthManagerInitializationError> {
         let managed_auth = auth_config
             .load_auth(enable_codex_api_key_env)
             .await
-            .ok()
-            .flatten();
+            .map_err(|error| {
+                AuthManagerInitializationError(AuthManagerInitializationErrorSource::InitialAuth(
+                    error,
+                ))
+            })?;
         let AuthConfig {
             codex_home: _,
             auth_home,
@@ -2162,7 +2168,7 @@ impl AuthManager {
         let agent_identity_authapi_base_url =
             agent_identity_authapi_base_url(chatgpt_base_url.as_deref()).ok();
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
-        Self {
+        Ok(Self {
             auth_home,
             inner: RwLock::new(CachedAuth {
                 auth: managed_auth,
@@ -2183,7 +2189,7 @@ impl AuthManager {
             external_auth: RwLock::new(None),
             workload_identity_selected: false,
             auth_route_config,
-        }
+        })
     }
 
     /// Create an AuthManager with a specific CodexAuth, for testing only.
@@ -2689,8 +2695,8 @@ impl AuthManager {
         chatgpt_base_url: Option<String>,
         keyring_backend_kind: AuthKeyringBackendKind,
         auth_route_config: AuthRouteConfig,
-    ) -> Arc<Self> {
-        Arc::new(
+    ) -> Result<Arc<Self>, AuthManagerInitializationError> {
+        Ok(Arc::new(
             Self::new(
                 auth_home,
                 enable_codex_api_key_env,
@@ -2700,8 +2706,8 @@ impl AuthManager {
                 keyring_backend_kind,
                 auth_route_config,
             )
-            .await,
-        )
+            .await?,
+        ))
     }
 
     /// Builds a shared manager and activates process-configured workload identity when selected.
@@ -2718,7 +2724,7 @@ impl AuthManager {
         enable_codex_api_key_env: bool,
     ) -> Result<Arc<Self>, AuthManagerInitializationError> {
         let external_auth = WorkloadIdentityExternalAuth::from_process_config(&auth_config)?;
-        let mut manager = Self::new_from_auth_config(auth_config, enable_codex_api_key_env).await;
+        let mut manager = Self::new_from_auth_config(auth_config, enable_codex_api_key_env).await?;
         manager.workload_identity_selected = external_auth.is_some();
         let manager = Arc::new(manager);
         if let Some(external_auth) = external_auth {

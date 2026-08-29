@@ -51,7 +51,8 @@ async fn auth_manager_with_replacement(
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     let mut replacement_auth = remote_control_auth_dot_json(Some(replacement_account_id));
     replacement_auth
         .tokens
@@ -1089,7 +1090,8 @@ async fn remote_control_handle_discards_pairing_response_after_auth_change() {
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     let remote_handle =
         remote_control_handle_with_current_enrollment(&remote_control_url, auth_manager.clone());
     let pairing_task = tokio::spawn({

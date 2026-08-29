@@ -21,6 +21,7 @@ pub(super) fn has_only_search_config_override(cli_kv_overrides: &[(String, toml:
 /// Hide the composer when the default file-backed account cannot already be authenticated.
 pub(super) fn should_delay_startup_composer_for_first_login(
     codex_home: &Path,
+    auth_home: &Path,
     system_config_path: io::Result<AbsolutePathBuf>,
     managed_configuration: impl FnOnce() -> io::Result<bool>,
     environment_variable: impl Fn(&str) -> Option<OsString>,
@@ -42,10 +43,14 @@ pub(super) fn should_delay_startup_composer_for_first_login(
         return false;
     }
 
+    if !matches!(auth_home.join("auth.json").try_exists(), Ok(false)) {
+        return false;
+    }
+
     match std::fs::metadata(codex_home) {
         Ok(metadata) if !metadata.is_dir() => return false,
         Ok(_) => {
-            for state_file in ["auth.json", "config.toml", "environments.toml"] {
+            for state_file in ["config.toml", "environments.toml"] {
                 if !matches!(codex_home.join(state_file).try_exists(), Ok(false)) {
                     return false;
                 }

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::MODEL_CONTEXT_MAX_BYTES;
 use codex_rollout::ModelContextScan;
 use codex_rollout::ModelContextScanProgress;
 use codex_rollout::ReverseJsonlScanner;
@@ -30,11 +31,9 @@ mod tests;
 ///
 /// Plain JSONL rollouts use a reverse scan. When it finds both a usable replacement-
 /// history checkpoint and the completed user-turn context needed for resume metadata, the returned
-/// replay starts with the canonical `SessionMeta` followed by that newest suffix. When no
-/// bounded cutoff is available, the scan continues to the beginning and returns the complete
-/// replay it already accumulated.
-///
-/// Compressed rollout shapes keep the existing full-history path because they are not seekable.
+/// replay starts with the canonical `SessionMeta` followed by that newest suffix. Missing cutoffs,
+/// malformed records, compressed rollouts without a bounded streaming implementation, and
+/// byte/item/token overflow fail loudly before any history reaches a resume consumer.
 pub(super) async fn load_latest_model_context(
     store: &LocalThreadStore,
     params: LoadModelContextParams,
@@ -62,7 +61,9 @@ pub(super) async fn load_latest_model_context(
         .and_then(|file_name| file_name.to_str())
         .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"));
     let items = if compressed {
-        read_thread::load_history_items(path.as_path()).await?
+        return Err(ThreadStoreError::Unsupported {
+            operation: "bounded_model_context_from_compressed_rollout",
+        });
     } else {
         match session_meta.meta.history_mode {
             ThreadHistoryMode::Legacy => {
@@ -73,7 +74,12 @@ pub(super) async fn load_latest_model_context(
                     ensure_current_paginated_path(store, &params, path.as_path()).await?;
                 }
                 let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
-                scan_model_context_from_lineage(lineage, session_meta).await?
+                scan_model_context_from_lineage(
+                    lineage,
+                    session_meta,
+                    ScanCompletion::CheckpointOrPaginatedOrigin,
+                )
+                .await?
             }
         }
     };
@@ -162,7 +168,8 @@ pub(super) async fn load_for_fork(
     match history_base {
         Some(history_base) => {
             let lineage = lineage.truncate_at(history_base).await?;
-            scan_model_context_from_lineage(lineage, session_meta).await
+            scan_model_context_from_lineage(lineage, session_meta, ScanCompletion::FrozenPrefix)
+                .await
         }
         None => Ok(vec![RolloutItem::SessionMeta(session_meta)]),
     }
@@ -171,9 +178,10 @@ pub(super) async fn load_for_fork(
 async fn scan_model_context_from_lineage(
     lineage: RolloutLineage,
     session_meta: SessionMetaLine,
+    completion: ScanCompletion,
 ) -> ThreadStoreResult<Vec<RolloutItem>> {
     let scan = tokio::task::spawn_blocking(move || {
-        scan_model_context_from_lineage_blocking(&lineage, session_meta)
+        scan_model_context_from_lineage_blocking(&lineage, session_meta, completion)
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
@@ -193,8 +201,11 @@ async fn scan_model_context_from_rollout(
 ) -> ThreadStoreResult<Vec<RolloutItem>> {
     let scan = tokio::task::spawn_blocking(move || {
         scan_model_context_from_segments_blocking(
-            vec![(path, None, /*stop_at_session_meta*/ false)],
+            vec![(
+                path, None, /*stop_at_session_meta*/ false, /*is_paginated_origin*/ false,
+            )],
             session_meta,
+            ScanCompletion::Checkpoint,
         )
     })
     .await
@@ -209,53 +220,89 @@ async fn scan_model_context_from_rollout(
 fn scan_model_context_from_lineage_blocking(
     lineage: &RolloutLineage,
     session_meta: SessionMetaLine,
+    completion: ScanCompletion,
 ) -> io::Result<Vec<RolloutItem>> {
+    let segment_count = lineage.segments().len();
     let segments = lineage
         .segments()
         .iter()
         .rev()
-        .map(|segment| {
+        .enumerate()
+        .map(|(index, segment)| {
             (
                 segment.rollout_path.clone(),
                 segment.end.map(|end| end.end_byte_offset),
                 /*stop_at_session_meta*/ true,
+                /*is_paginated_origin*/ index + 1 == segment_count,
             )
         })
         .collect();
-    scan_model_context_from_segments_blocking(segments, session_meta)
+    scan_model_context_from_segments_blocking(segments, session_meta, completion)
+}
+
+#[derive(Clone, Copy)]
+enum ScanCompletion {
+    Checkpoint,
+    CheckpointOrPaginatedOrigin,
+    FrozenPrefix,
 }
 
 fn scan_model_context_from_segments_blocking(
-    segments: Vec<(PathBuf, Option<u64>, bool)>,
+    segments: Vec<(PathBuf, Option<u64>, bool, bool)>,
     session_meta: SessionMetaLine,
+    completion: ScanCompletion,
 ) -> io::Result<Vec<RolloutItem>> {
     let mut scan = ModelContextScan::default();
-    'segments: for (rollout_path, end_byte_offset, stop_at_session_meta) in segments {
+    let mut completed_at_checkpoint = false;
+    let mut reached_paginated_origin = false;
+    'segments: for (rollout_path, end_byte_offset, stop_at_session_meta, is_paginated_origin) in
+        segments
+    {
         let file = File::open(rollout_path)?;
         let mut scanner = match end_byte_offset {
             Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
             None => ReverseJsonlScanner::new(file)?,
-        };
+        }
+        .with_strict_max_record_bytes(MODEL_CONTEXT_MAX_BYTES);
         while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
-            let ScanOutcome::Parsed(line) = outcome else {
-                continue;
+            let line = match outcome {
+                ScanOutcome::Parsed(line) => line,
+                ScanOutcome::Rejected(err) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid rollout record: {err}"),
+                    ));
+                }
             };
             // Each rollout segment contributes only its local delta. Its session metadata is
             // replaced with the requested thread's canonical SessionMeta after replay.
             if stop_at_session_meta && matches!(&line.item, RolloutItem::SessionMeta(_)) {
+                reached_paginated_origin |= is_paginated_origin;
                 break;
             }
-            match scan.push(line.item) {
+            match scan.push(line.item).map_err(io::Error::other)? {
                 ModelContextScanProgress::Continue => {}
-                ModelContextScanProgress::Complete => break 'segments,
+                ModelContextScanProgress::Complete => {
+                    completed_at_checkpoint = true;
+                    break 'segments;
+                }
             }
         }
     }
 
-    let canonical_meta = session_meta.clone();
-    let mut items = scan.finish(session_meta);
-    if !matches!(items.first(), Some(RolloutItem::SessionMeta(_))) {
-        items.insert(0, RolloutItem::SessionMeta(canonical_meta));
+    match completion {
+        ScanCompletion::Checkpoint => scan.finish(session_meta).map_err(io::Error::other),
+        ScanCompletion::CheckpointOrPaginatedOrigin if completed_at_checkpoint => {
+            scan.finish(session_meta).map_err(io::Error::other)
+        }
+        ScanCompletion::CheckpointOrPaginatedOrigin if reached_paginated_origin => scan
+            .finish_paginated_origin(session_meta)
+            .map_err(io::Error::other),
+        ScanCompletion::CheckpointOrPaginatedOrigin => {
+            Err(io::Error::other("paginated lineage has no durable origin"))
+        }
+        ScanCompletion::FrozenPrefix => scan
+            .finish_frozen_prefix(session_meta)
+            .map_err(io::Error::other),
     }
-    Ok(items)
 }

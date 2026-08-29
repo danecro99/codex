@@ -81,7 +81,8 @@ async fn login_with_bedrock_api_key_replaces_openai_auth() -> anyhow::Result<()>
         AuthKeyringBackendKind::default(),
         crate::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
 
     let loaded = storage.load()?.expect("auth should be stored");
     let expected = AuthDotJson {
@@ -133,7 +134,8 @@ async fn logout_removes_bedrock_auth() -> anyhow::Result<()> {
         AuthKeyringBackendKind::default(),
         crate::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
 
     assert!(auth_manager.logout().await?);
 
@@ -164,7 +166,8 @@ async fn access_keys_auth_round_trips_and_logs_out() -> anyhow::Result<()> {
         AuthKeyringBackendKind::default(),
         crate::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
 
     assert_eq!(auth_manager.auth_mode(), Some(AuthMode::BedrockAccessKeys));
     assert_eq!(
@@ -212,7 +215,8 @@ async fn bedrock_only_auth_storage_creates_primary_auth() -> anyhow::Result<()> 
         AuthKeyringBackendKind::default(),
         crate::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
 
     assert_eq!(auth_manager.auth_mode(), Some(AuthMode::BedrockApiKey));
     assert_eq!(

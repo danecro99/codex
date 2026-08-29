@@ -84,6 +84,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
@@ -107,7 +108,10 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_rollout::CompactedItem;
@@ -154,6 +158,241 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
+
+#[tokio::test]
+async fn legacy_exclude_turns_resume_sends_only_the_bounded_checkpoint_suffix() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_assistant_message("msg-1", "Done"),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T11-59-57",
+        "2025-01-05T11:59:57Z",
+        "legacy prefix must be excluded",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let path = rollout_path(codex_home.path(), "2025-01-05T11-59-57", &thread_id);
+    append_legacy_resume_checkpoint(&path, "bounded suffix must remain").await?;
+
+    let mut app = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let resume_id = app
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let resumed: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app.read_response(resume_id)).await??;
+    assert!(resumed.thread.turns.is_empty());
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id,
+            input: vec![UserInput::Text {
+                text: "new turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        }),
+    )
+    .await??;
+
+    let user_texts = response_mock.single_request().message_input_texts("user");
+    assert!(
+        user_texts
+            .iter()
+            .any(|text| text == "bounded suffix must remain"),
+        "bounded checkpoint suffix missing from model request: {user_texts:?}"
+    );
+    assert!(
+        user_texts.iter().any(|text| text == "new turn"),
+        "new turn missing from model request: {user_texts:?}"
+    );
+    assert!(
+        user_texts
+            .iter()
+            .all(|text| text != "legacy prefix must be excluded"),
+        "legacy prefix leaked into model request: {user_texts:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_exclude_turns_resume_rejects_missing_safe_cutoff() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T11-59-58",
+        "2025-01-05T11:59:58Z",
+        "unbounded legacy history",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let resume_id = app
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+
+    assert!(
+        error
+            .error
+            .message
+            .contains("does not contain a safe bounded model-context checkpoint"),
+        "unexpected resume error: {}",
+        error.error.message
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_exclude_turns_resume_rejects_model_context_overflow() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T11-59-59",
+        "2025-01-05T11:59:59Z",
+        "legacy prefix",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let path = rollout_path(codex_home.path(), "2025-01-05T11-59-59", &thread_id);
+    let oversized_suffix = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_TOKENS * 4 + 1);
+    append_legacy_resume_checkpoint(&path, &oversized_suffix).await?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let resume_id = app
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+
+    assert!(
+        error.error.message.contains("exceeds the token limit"),
+        "unexpected resume error: {}",
+        error.error.message
+    );
+    Ok(())
+}
+
+async fn append_legacy_resume_checkpoint(path: &Path, replacement: &str) -> Result<()> {
+    let turn_id = "checkpoint-turn";
+    let items = [
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: Some(1_000_000),
+            collaboration_mode_kind: Default::default(),
+        })),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "checkpoint source turn".to_string(),
+            ..Default::default()
+        })),
+        RolloutItem::TurnContext(TurnContextItem {
+            turn_id: Some(turn_id.to_string()),
+            cwd: test_absolute_path("/"),
+            workspace_roots: None,
+            current_date: None,
+            timezone: None,
+            approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            active_permission_profile: None,
+            network: None,
+            file_system_sandbox_policy: None,
+            model: "gpt-5.4".to_string(),
+            comp_hash: None,
+            personality: None,
+            collaboration_mode: None,
+            multi_agent_version: None,
+            multi_agent_mode: None,
+            realtime_active: None,
+            cyber_access_program: None,
+            effort: None,
+            summary: ReasoningSummary::Auto,
+        }),
+        RolloutItem::Compacted(CompactedItem {
+            message: "bounded checkpoint".to_string(),
+            replacement_history: Some(vec![legacy_user_response(replacement).into()]),
+            mcp_resource_origins: None,
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: turn_id.to_string(),
+            last_agent_message: None,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        })),
+    ];
+    for item in items {
+        append_rollout_item_to_path(path, &item).await?;
+    }
+    Ok(())
+}
+
+fn legacy_user_response(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
 
 #[tokio::test]
 async fn thread_resume_paginated_model_context_preserves_original_metadata() -> Result<()> {

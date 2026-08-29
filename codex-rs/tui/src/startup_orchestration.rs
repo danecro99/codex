@@ -173,6 +173,7 @@ pub(super) async fn run_main_inner(
         && launch_loader_overrides.packaged_defaults_path.is_none()
         && startup_preflight::should_delay_startup_composer_for_first_login(
             &codex_home,
+            &homes.auth_home,
             codex_config::loader::system_config_toml_file(),
             || codex_config::loader::has_local_managed_configuration(&codex_home),
             |name| std::env::var_os(name),

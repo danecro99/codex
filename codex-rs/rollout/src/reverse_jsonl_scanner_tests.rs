@@ -84,6 +84,20 @@ fn skips_records_over_the_configured_limit() -> std::io::Result<()> {
 }
 
 #[test]
+fn strict_record_limit_fails_instead_of_skipping() -> std::io::Result<()> {
+    let input = format!("{}\n", serde_json::to_string(&record(&"x".repeat(128)))?);
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?
+        .with_strict_max_record_bytes(/*max_record_bytes*/ 32);
+
+    let error = scanner
+        .scan_next::<TestRecord>()
+        .expect_err("strict record limit should fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "reverse JSONL record exceeds 32 bytes");
+    Ok(())
+}
+
+#[test]
 fn accepts_valid_json_at_eof() -> std::io::Result<()> {
     let input = b"{\"value\":\"first\"}\n{\"value\":\"second\"}";
 

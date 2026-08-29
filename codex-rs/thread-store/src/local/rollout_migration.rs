@@ -71,7 +71,7 @@ use telemetry::RolloutMigrationTelemetry;
 use telemetry::RolloutMigrationTrigger;
 
 const PROJECTION_BATCH_BYTES: u64 = 256 * 1024;
-const MAX_ROLLOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ROLLOUT_LINE_BYTES: usize = codex_rollout::MAX_ROLLOUT_LINE_BYTES;
 
 enum CanonicalizationAttempt {
     Complete {

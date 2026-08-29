@@ -59,7 +59,8 @@ async fn auth_manager_with_api_key() -> Arc<AuthManager> {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await,
+        .await
+        .expect("auth manager should initialize"),
     )
 }
 
@@ -90,7 +91,8 @@ async fn auth_manager_with_plan_and_identity(
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await,
+        .await
+        .expect("auth manager should initialize"),
     )
 }
 
@@ -743,7 +745,8 @@ async fn get_bundle_recovers_after_unauthorized_reload() {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await,
+        .await
+        .expect("auth manager should initialize"),
     );
 
     write_auth_json(
@@ -800,7 +803,8 @@ async fn get_bundle_recovers_after_unauthorized_reload_updates_cache_identity() 
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await,
+        .await
+        .expect("auth manager should initialize"),
     );
 
     write_auth_json(
@@ -865,7 +869,8 @@ async fn get_bundle_surfaces_auth_recovery_message() {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await,
+        .await
+        .expect("auth manager should initialize"),
     );
 
     write_auth_json(
@@ -919,7 +924,8 @@ async fn get_bundle_refreshes_external_auth_after_unauthorized() {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await,
+        .await
+        .expect("auth manager should initialize"),
     );
     let initial_auth = CodexAuth::from_external_chatgpt_tokens(
         &fake_chatgpt_jwt("enterprise", Some("user-12345"), b"initial"),

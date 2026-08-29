@@ -6,6 +6,7 @@ use std::io::SeekFrom;
 use serde::de::DeserializeOwned;
 
 const READ_CHUNK_SIZE: usize = 64 * 1024;
+pub const MAX_ROLLOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ScanOutcome<T> {
@@ -24,6 +25,7 @@ pub struct ReverseJsonlScanner<R> {
     chunk: Vec<u8>,
     record_reversed: Vec<u8>,
     max_record_bytes: Option<usize>,
+    fail_on_oversized_record: bool,
     discarding_oversized_record: bool,
 }
 
@@ -55,6 +57,7 @@ where
             chunk: vec![0; READ_CHUNK_SIZE],
             record_reversed: Vec::new(),
             max_record_bytes: None,
+            fail_on_oversized_record: false,
             discarding_oversized_record: false,
         })
     }
@@ -62,6 +65,13 @@ where
     /// Skips records larger than the configured limit without buffering or parsing them.
     pub fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
         self.max_record_bytes = Some(max_record_bytes);
+        self
+    }
+
+    /// Fails instead of skipping a record larger than the configured limit.
+    pub fn with_strict_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
+        self.max_record_bytes = Some(max_record_bytes);
+        self.fail_on_oversized_record = true;
         self
     }
 
@@ -78,6 +88,9 @@ where
                 if self.next_chunk_end == 0 {
                     if self.discarding_oversized_record {
                         self.discarding_oversized_record = false;
+                        if self.fail_on_oversized_record {
+                            return Err(self.oversized_record_error());
+                        }
                         return Ok(None);
                     }
                     return Ok(self.finish_record());
@@ -107,6 +120,9 @@ where
                 self.chunk_position = newline_position;
                 if self.discarding_oversized_record {
                     self.discarding_oversized_record = false;
+                    if self.fail_on_oversized_record {
+                        return Err(self.oversized_record_error());
+                    }
                     continue;
                 }
                 if let Some(outcome) = self.finish_record() {
@@ -143,6 +159,14 @@ where
         };
         self.record_reversed.clear();
         outcome
+    }
+
+    fn oversized_record_error(&self) -> io::Error {
+        let max_record_bytes = self.max_record_bytes.unwrap_or_default();
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("reverse JSONL record exceeds {max_record_bytes} bytes"),
+        )
     }
 }
 

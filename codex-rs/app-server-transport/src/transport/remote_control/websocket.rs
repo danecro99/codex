@@ -2245,7 +2245,8 @@ mod tests {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await;
+        .await
+        .expect("auth manager should initialize");
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut auth_change_rx = auth_manager.auth_change_receiver();
         let current_enrollment = test_current_enrollment(/*enrollment*/ None);
@@ -2344,7 +2345,8 @@ mod tests {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await;
+        .await
+        .expect("auth manager should initialize");
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut auth_change_rx = auth_manager.auth_change_receiver();
         let mut expected_enrollment =
@@ -2472,7 +2474,8 @@ mod tests {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await;
+        .await
+        .expect("auth manager should initialize");
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut auth_change_rx = auth_manager.auth_change_receiver();
         let current_enrollment = test_current_enrollment(Some(remote_control_enrollment(Some(

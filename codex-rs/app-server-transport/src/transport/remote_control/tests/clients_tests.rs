@@ -207,7 +207,8 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized() {
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     let mut fresh_auth = remote_control_auth_dot_json(Some("account_id"));
     fresh_auth
         .tokens
@@ -305,7 +306,8 @@ async fn list_remote_control_clients_retries_unauthorized_only_once() {
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     let mut fresh_auth = remote_control_auth_dot_json(Some("account_id"));
     fresh_auth
         .tokens

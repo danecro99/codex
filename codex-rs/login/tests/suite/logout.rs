@@ -209,7 +209,8 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     save_auth(
         codex_home.path(),
         &chatgpt_auth_with_refresh_token("newer-disk-refresh-token"),

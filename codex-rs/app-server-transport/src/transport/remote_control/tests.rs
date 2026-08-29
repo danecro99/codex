@@ -1052,7 +1052,8 @@ async fn remote_control_start_allows_missing_auth_when_enabled() {
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     let (transport_event_tx, _transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown_token = CancellationToken::new();
@@ -1912,7 +1913,8 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     let expected_server_name = gethostname().to_string_lossy().trim().to_string();
     let expected_remote_control_target = normalize_remote_control_url(&remote_control_url)
         .expect("remote control target should normalize");
@@ -2010,7 +2012,8 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
         AuthKeyringBackendKind::default(),
         codex_login::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect("auth manager should initialize");
     let remote_control_target =
         normalize_remote_control_url(&remote_control_url).expect("target should parse");
     let enrollment = RemoteControlEnrollment {

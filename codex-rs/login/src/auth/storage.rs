@@ -236,9 +236,7 @@ const KEYRING_SERVICE: &str = "Codex Auth";
 
 // turns auth_home path into a stable, short key string
 fn compute_store_key(auth_home: &Path) -> std::io::Result<String> {
-    let canonical = auth_home
-        .canonicalize()
-        .unwrap_or_else(|_| auth_home.to_path_buf());
+    let canonical = auth_home.canonicalize()?;
     let path_str = canonical.to_string_lossy();
     let mut hasher = Sha256::new();
     hasher.update(path_str.as_bytes());
@@ -304,7 +302,7 @@ impl AuthStorageBackend for DirectKeyringAuthStorage {
         let serialized = serde_json::to_string(auth).map_err(std::io::Error::other)?;
         self.save_to_keyring(&key, &serialized)?;
         if let Err(err) = delete_file_if_exists(&self.auth_home) {
-            warn!("failed to remove CLI auth fallback file: {err}");
+            warn!("failed to remove stale file-backed CLI auth: {err}");
         }
         Ok(())
     }
@@ -385,7 +383,7 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
                 std::io::Error::other(message)
             })?;
         if let Err(err) = delete_file_if_exists(&self.auth_home) {
-            warn!("failed to remove CLI auth fallback file: {err}");
+            warn!("failed to remove stale file-backed CLI auth: {err}");
         }
         Ok(())
     }
@@ -402,57 +400,6 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
         let file_removed = delete_file_if_exists(&self.auth_home)?;
         let direct_removed = self.direct_storage.delete()?;
         Ok(keyring_removed || file_removed || direct_removed)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct AutoAuthStorage {
-    keyring_storage: Arc<dyn AuthStorageBackend>,
-    file_storage: Arc<FileAuthStorage>,
-}
-
-impl AutoAuthStorage {
-    fn new(
-        auth_home: PathBuf,
-        keyring_store: Arc<dyn KeyringStore>,
-        keyring_backend_kind: AuthKeyringBackendKind,
-    ) -> Self {
-        Self {
-            keyring_storage: create_keyring_auth_storage(
-                auth_home.clone(),
-                keyring_store,
-                keyring_backend_kind,
-            ),
-            file_storage: Arc::new(FileAuthStorage::new(auth_home)),
-        }
-    }
-}
-
-impl AuthStorageBackend for AutoAuthStorage {
-    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
-        match self.keyring_storage.load() {
-            Ok(Some(auth)) => Ok(Some(auth)),
-            Ok(None) => self.file_storage.load(),
-            Err(err) => {
-                warn!("failed to load CLI auth from keyring, falling back to file storage: {err}");
-                self.file_storage.load()
-            }
-        }
-    }
-
-    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
-        match self.keyring_storage.save(auth) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                warn!("failed to save auth to keyring, falling back to file storage: {err}");
-                self.file_storage.save(auth)
-            }
-        }
-    }
-
-    fn delete(&self) -> std::io::Result<bool> {
-        // Keyring storage will delete from disk as well
-        self.keyring_storage.delete()
     }
 }
 
@@ -519,11 +466,9 @@ fn create_auth_storage_with_store(
         AuthCredentialsStoreMode::Keyring => {
             create_keyring_auth_storage(auth_home, keyring_store, keyring_backend_kind)
         }
-        AuthCredentialsStoreMode::Auto => Arc::new(AutoAuthStorage::new(
-            auth_home,
-            keyring_store,
-            keyring_backend_kind,
-        )),
+        AuthCredentialsStoreMode::Auto => {
+            create_keyring_auth_storage(auth_home, keyring_store, keyring_backend_kind)
+        }
         AuthCredentialsStoreMode::Ephemeral => Arc::new(EphemeralAuthStorage::new(auth_home)),
     }
 }

@@ -444,7 +444,8 @@ mod tests {
             AuthKeyringBackendKind::default(),
             codex_login::test_support::transport_default_auth_route_config(),
         )
-        .await;
+        .await
+        .expect("auth manager should initialize");
         let auth = auth_manager.auth().await.expect("auth should load");
         let auth_manager = AuthManager::from_auth_for_testing_with_agent_identity_authapi_base_url(
             auth.clone(),
@@ -634,7 +635,8 @@ mod tests {
                 AuthKeyringBackendKind::default(),
                 codex_login::test_support::transport_default_auth_route_config(),
             )
-            .await,
+            .await
+            .expect("auth manager should initialize"),
         );
         let expected_auth = auth_manager
             .auth_cached()

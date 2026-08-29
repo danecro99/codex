@@ -2,7 +2,22 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use tempfile::TempDir;
 
 use super::has_only_search_config_override;
-use super::should_delay_startup_composer_for_first_login;
+use super::should_delay_startup_composer_for_first_login as should_delay_with_auth_home;
+
+fn should_delay_startup_composer_for_first_login(
+    codex_home: &std::path::Path,
+    system_config_path: std::io::Result<AbsolutePathBuf>,
+    managed_configuration: impl FnOnce() -> std::io::Result<bool>,
+    environment_variable: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    should_delay_with_auth_home(
+        codex_home,
+        codex_home,
+        system_config_path,
+        managed_configuration,
+        environment_variable,
+    )
+}
 
 #[test]
 fn startup_delays_composer_for_homes_without_authentication_state() -> std::io::Result<()> {
@@ -144,6 +159,36 @@ fn startup_delays_composer_for_homes_without_authentication_state() -> std::io::
         &invalid_home,
         Ok(system_config_path),
         || Ok(false),
+        |_| None,
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_reads_auth_only_from_the_resolved_auth_home() -> std::io::Result<()> {
+    let temporary_directory = TempDir::new()?;
+    let codex_home = temporary_directory.path().join("codex-home");
+    let auth_home = temporary_directory.path().join("auth-home");
+    let system_config_path =
+        AbsolutePathBuf::from_absolute_path(temporary_directory.path().join("system.toml"))?;
+    std::fs::create_dir_all(&codex_home)?;
+    std::fs::create_dir_all(&auth_home)?;
+
+    std::fs::write(codex_home.join("auth.json"), "{}")?;
+    assert!(should_delay_with_auth_home(
+        &codex_home,
+        &auth_home,
+        Ok(system_config_path.clone()),
+        || Ok(false),
+        |_| None,
+    ));
+
+    std::fs::write(auth_home.join("auth.json"), "{}")?;
+    assert!(!should_delay_with_auth_home(
+        &codex_home,
+        &auth_home,
+        Ok(system_config_path),
+        || panic!("auth state should not probe managed configuration"),
         |_| None,
     ));
     Ok(())

@@ -269,7 +269,7 @@ async fn loads_turn_metadata_across_an_older_checkpoint() {
 }
 
 #[tokio::test]
-async fn returns_scanned_full_history_for_unsupported_compaction() {
+async fn rejects_unsupported_compaction_without_a_safe_cutoff() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1002);
     let path = write_paginated_rollout(
@@ -287,43 +287,41 @@ async fn returns_scanned_full_history_for_unsupported_compaction() {
         ],
     );
 
-    assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
+    assert_model_context_scan_fails(
+        home.path(),
+        path.as_path(),
+        "does not contain a safe bounded model-context checkpoint",
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn returns_full_legacy_history_without_a_valid_cutoff() {
+async fn rejects_legacy_history_without_a_valid_cutoff() {
     let home = TempDir::new().expect("temp dir");
-    let source_uuid = Uuid::from_u128(/*v*/ 1010);
-    let source_path = write_legacy_rollout(
-        home.path(),
-        "2025-01-03T13-00-09",
-        source_uuid,
-        [user_message("copied source")],
-    );
-    let copied_session_meta = codex_rollout::read_session_meta_line(source_path.as_path())
-        .await
-        .expect("read copied source metadata");
     let uuid = Uuid::from_u128(/*v*/ 1009);
     let path = write_legacy_rollout(
         home.path(),
         "2025-01-03T13-00-10",
         uuid,
         [
-            RolloutItem::SessionMeta(copied_session_meta),
             turn_started("turn-1"),
             user_message("turn"),
             legacy_user_message_event("turn"),
             turn_context(home.path(), "turn-1"),
-            compacted("checkpoint without replacement", None),
             turn_complete("turn-1"),
         ],
     );
 
-    assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
+    assert_model_context_scan_fails(
+        home.path(),
+        path.as_path(),
+        "does not contain a safe bounded model-context checkpoint",
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn returns_scanned_full_history_at_bof_without_checkpoint() {
+async fn loads_bounded_paginated_history_from_its_durable_origin() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1003);
     let path = write_paginated_rollout(
@@ -339,7 +337,124 @@ async fn returns_scanned_full_history_at_bof_without_checkpoint() {
         ],
     );
 
-    assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let context = store
+        .load_latest_model_context(LoadModelContextParams {
+            thread_id: codex_protocol::ThreadId::from_string(&uuid.to_string()).expect("thread id"),
+            include_archived: false,
+            rollout_path: Some(path),
+        })
+        .await
+        .expect("bounded paginated origin should load");
+
+    assert!(matches!(
+        context.items.first(),
+        Some(RolloutItem::SessionMeta(_))
+    ));
+    assert!(context.items.iter().any(|item| {
+        matches!(item, RolloutItem::ResponseItem(item) if matches!(
+            &item.item,
+            ResponseItem::Message { role, .. } if role == "user"
+        ))
+    }));
+}
+
+#[tokio::test]
+async fn rejects_model_context_over_the_token_limit() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1014);
+    let oversized_message = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_TOKENS * 4 + 1);
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-12",
+        uuid,
+        [
+            turn_started("turn-1"),
+            user_message(&oversized_message),
+            legacy_user_message_event("turn"),
+            turn_context(home.path(), "turn-1"),
+            compacted("checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+        ],
+    );
+
+    assert_model_context_scan_fails(home.path(), path.as_path(), "exceeds the token limit").await;
+}
+
+#[tokio::test]
+async fn rejects_model_context_over_the_item_limit() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1016);
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-14",
+        uuid,
+        [
+            turn_started("turn-1"),
+            user_message("turn"),
+            legacy_user_message_event("turn"),
+            turn_context(home.path(), "turn-1"),
+            compacted("checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+        ],
+    );
+    append_repeated_item(
+        path.as_path(),
+        turn_complete("later-turn"),
+        codex_rollout::MODEL_CONTEXT_MAX_ITEMS,
+    );
+
+    assert_model_context_scan_fails(home.path(), path.as_path(), "exceeds the item limit").await;
+}
+
+#[tokio::test]
+async fn rejects_compressed_model_context_without_a_bounded_stream() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1015);
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-13",
+        uuid,
+        [
+            turn_started("turn-1"),
+            user_message("turn"),
+            legacy_user_message_event("turn"),
+            turn_context(home.path(), "turn-1"),
+            compacted("checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+        ],
+    );
+    let compressed_path = path.with_extension("jsonl.zst");
+    let compressed = zstd::stream::encode_all(
+        std::fs::File::open(path.as_path()).expect("open rollout"),
+        3,
+    )
+    .expect("compress rollout");
+    std::fs::write(&compressed_path, compressed).expect("write compressed rollout");
+    std::fs::remove_file(&path).expect("remove plain rollout");
+
+    let session_meta = codex_rollout::read_session_meta_line(&compressed_path)
+        .await
+        .expect("read compressed session metadata");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let error = store
+        .load_latest_model_context(LoadModelContextParams {
+            thread_id: session_meta.meta.id,
+            include_archived: false,
+            rollout_path: Some(compressed_path),
+        })
+        .await
+        .expect_err("compressed resume should require a bounded stream");
+
+    assert!(
+        matches!(
+            error,
+            ThreadStoreError::Unsupported {
+                operation: "bounded_model_context_from_compressed_rollout"
+            }
+        ),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]
@@ -625,27 +740,23 @@ fn rollout_end_byte_offset(path: &Path, end_ordinal_exclusive: u64) -> u64 {
     byte_offset
 }
 
-async fn assert_reverse_scan_matches_full_history(home: &Path, path: &Path) {
+async fn assert_model_context_scan_fails(home: &Path, path: &Path, expected_message: &str) {
     let session_meta = codex_rollout::read_session_meta_line(path)
         .await
         .expect("read session metadata");
     let store = LocalThreadStore::new(test_config(home), /*state_db*/ None);
-    let items = store
+    let error = store
         .load_latest_model_context(LoadModelContextParams {
             thread_id: session_meta.meta.id,
             include_archived: false,
             rollout_path: None,
         })
         .await
-        .expect("scan model context")
-        .items;
-    let full_items = read_thread::load_history_items(path)
-        .await
-        .expect("load full history");
+        .expect_err("model context scan should fail");
 
-    assert_eq!(
-        serde_json::to_value(items).expect("serialize scanned items"),
-        serde_json::to_value(full_items).expect("serialize full items")
+    assert!(
+        error.to_string().contains(expected_message),
+        "unexpected error: {error}"
     );
 }
 
@@ -666,6 +777,22 @@ fn append_items<const N: usize>(path: &Path, items: [RolloutItem; N]) {
             serde_json::to_string(&line).expect("serialize line")
         )
         .expect("append rollout line");
+    }
+}
+
+fn append_repeated_item(path: &Path, item: RolloutItem, count: usize) {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open session file");
+    let line = RolloutLine {
+        timestamp: "2025-01-03T13:00:01Z".to_string(),
+        ordinal: None,
+        item,
+    };
+    let serialized = serde_json::to_string(&line).expect("serialize line");
+    for _ in 0..count {
+        writeln!(file, "{serialized}").expect("append rollout line");
     }
 }
 
