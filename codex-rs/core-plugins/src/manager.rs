@@ -2665,7 +2665,13 @@ impl PluginsManager {
             let manager = Arc::clone(self);
             let on_effective_plugins_changed = on_effective_plugins_changed.clone();
             tokio::spawn(async move {
-                let auth = manager.auth_manager.auth().await;
+                let auth = match manager.auth_manager.auth().await {
+                    Ok(auth) => auth,
+                    Err(error) => {
+                        warn!(%error, "failed to load auth for remote plugin cache refresh");
+                        return;
+                    }
+                };
                 manager.maybe_start_remote_plugin_caches_refresh(
                     &config_for_remote_sync,
                     auth.clone(),
@@ -2697,7 +2703,13 @@ impl PluginsManager {
             let config_for_featured_plugins = config.clone();
             let manager = Arc::clone(self);
             tokio::spawn(async move {
-                let auth = manager.auth_manager.auth().await;
+                let auth = match manager.auth_manager.auth().await {
+                    Ok(auth) => auth,
+                    Err(error) => {
+                        warn!(%error, "failed to load auth for featured plugin cache warmup");
+                        return;
+                    }
+                };
                 if let Err(err) = manager
                     .featured_plugin_ids_for_config(&config_for_featured_plugins, auth.as_ref())
                     .await

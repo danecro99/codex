@@ -3418,7 +3418,8 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
 
     session
         .start_new_context_window(&step_context, world_state)
-        .await;
+        .await
+        .expect("context window should start");
 
     let live_history = session.clone_history().await;
     assert!(live_history.raw_items().next().is_some());
@@ -6138,6 +6139,7 @@ async fn build_initial_context(
     session
         .build_initial_context_with_world_state(turn_context.as_ref(), &world_state)
         .await
+        .expect("initial context should build")
 }
 
 pub(crate) async fn build_world_state_from_turn_context(
@@ -6154,11 +6156,14 @@ pub(crate) async fn build_world_state_from_turn_context(
 // todo: use online model info
 pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let (tx_event, _rx_event) = async_channel::unbounded();
-    let codex_home = tempfile::tempdir().expect("create temp dir");
-    let config = build_test_config(codex_home.path()).await;
+    let codex_home = tempfile::tempdir().expect("create temp dir").keep();
+    let config = build_test_config(&codex_home).await;
     let config = Arc::new(config);
     let thread_id = ThreadId::default();
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("Test API Key"),
+        codex_home,
+    );
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),

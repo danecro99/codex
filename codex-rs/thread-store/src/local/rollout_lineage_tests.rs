@@ -13,6 +13,7 @@ use tempfile::TempDir;
 
 use super::super::LocalThreadStore;
 use super::super::test_support::test_config;
+use super::MAX_ROLLOUT_LINEAGE_SEGMENTS;
 use super::RolloutLineageSegment;
 
 #[tokio::test]
@@ -211,6 +212,45 @@ async fn rejects_missing_cycles_and_out_of_bounds_offsets() {
         "cutoff byte offset is past the source rollout",
     )
     .await;
+}
+
+#[tokio::test]
+async fn rejects_lineage_limit_before_resolving_or_reading_another_segment() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let missing_ancestor = ThreadId::default();
+    let mut history_base =
+        unchecked_history_position(missing_ancestor, /*end_ordinal_exclusive*/ 1);
+    let mut requested_thread_id = missing_ancestor;
+
+    for _ in 0..MAX_ROLLOUT_LINEAGE_SEGMENTS {
+        let thread_id = ThreadId::default();
+        let initial_ordinal = history_base.end_ordinal_exclusive;
+        let path = write_rollout(
+            home.path(),
+            thread_id,
+            Some(history_base),
+            /*next_ordinal*/ 2,
+        );
+        history_base = history_position(path.as_path(), thread_id, initial_ordinal + 2);
+        requested_thread_id = thread_id;
+    }
+
+    let error = store
+        .resolve_rollout_lineage(requested_thread_id)
+        .await
+        .expect_err("lineage segment limit must fail before the missing ancestor is resolved");
+    let crate::ThreadStoreError::InvalidRequest { message } = error else {
+        panic!("unexpected error: {error}");
+    };
+
+    assert_eq!(
+        message,
+        format!(
+            "invalid paginated history lineage for {requested_thread_id}: segment limit exceeded: {} > {MAX_ROLLOUT_LINEAGE_SEGMENTS}",
+            MAX_ROLLOUT_LINEAGE_SEGMENTS + 1
+        )
+    );
 }
 
 async fn assert_invalid_lineage(store: &LocalThreadStore, thread_id: ThreadId, detail: &str) {

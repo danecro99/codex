@@ -40,6 +40,12 @@ pub(super) async fn load_latest_model_context(
 ) -> ThreadStoreResult<StoredModelContext> {
     let path = resolve_model_context_path(store, &params).await?;
 
+    if codex_rollout::is_compressed_rollout_path(path.as_path()) {
+        return Err(ThreadStoreError::Unsupported {
+            operation: "bounded_model_context_from_compressed_rollout",
+        });
+    }
+
     let session_meta = codex_rollout::read_session_meta_line(path.as_path())
         .await
         .map_err(|err| ThreadStoreError::Internal {
@@ -56,31 +62,19 @@ pub(super) async fn load_latest_model_context(
         });
     }
 
-    let compressed = path
-        .file_name()
-        .and_then(|file_name| file_name.to_str())
-        .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"));
-    let items = if compressed {
-        return Err(ThreadStoreError::Unsupported {
-            operation: "bounded_model_context_from_compressed_rollout",
-        });
-    } else {
-        match session_meta.meta.history_mode {
-            ThreadHistoryMode::Legacy => {
-                scan_model_context_from_rollout(path, session_meta).await?
+    let items = match session_meta.meta.history_mode {
+        ThreadHistoryMode::Legacy => scan_model_context_from_rollout(path, session_meta).await?,
+        ThreadHistoryMode::Paginated => {
+            if params.rollout_path.is_some() {
+                ensure_current_paginated_path(store, &params, path.as_path()).await?;
             }
-            ThreadHistoryMode::Paginated => {
-                if params.rollout_path.is_some() {
-                    ensure_current_paginated_path(store, &params, path.as_path()).await?;
-                }
-                let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
-                scan_model_context_from_lineage(
-                    lineage,
-                    session_meta,
-                    ScanCompletion::CheckpointOrPaginatedOrigin,
-                )
-                .await?
-            }
+            let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+            scan_model_context_from_lineage(
+                lineage,
+                session_meta,
+                ScanCompletion::CheckpointOrPaginatedOrigin,
+            )
+            .await?
         }
     };
 

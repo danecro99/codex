@@ -2298,6 +2298,7 @@ mod tests {
                 .auth()
                 .await
                 .expect("auth should remain available")
+                .expect("auth should remain configured")
                 .get_token()
                 .expect("token should be readable"),
             "fresh-token"
@@ -2407,6 +2408,7 @@ mod tests {
                 .auth()
                 .await
                 .expect("auth should remain available")
+                .expect("auth should remain configured")
                 .get_token()
                 .expect("token should be readable"),
             "fresh-token"

@@ -165,14 +165,20 @@ impl AnalyticsEventsQueue {
                     AnalyticsEventsQueueMessage::Flush(done_tx) => {
                         let mut events = Vec::new();
                         reducer.flush(&mut events);
-                        send_track_events(&auth_manager, &destination, events).await;
+                        if let Err(error) =
+                            send_track_events(&auth_manager, &destination, events).await
+                        {
+                            tracing::error!(%error, "failed to load auth for analytics flush");
+                        }
                         let _ = done_tx.send(());
                         continue;
                     }
                 };
                 let mut events = Vec::new();
                 reducer.ingest(input, &mut events).await;
-                send_track_events(&auth_manager, &destination, events).await;
+                if let Err(error) = send_track_events(&auth_manager, &destination, events).await {
+                    tracing::error!(%error, "failed to load auth for analytics events");
+                }
             }
         });
         Self {
@@ -820,26 +826,27 @@ async fn send_track_events(
     auth_manager: &AuthManager,
     destination: &AnalyticsEventsDestination,
     mut events: Vec<TrackEventRequest>,
-) {
+) -> Result<(), codex_login::RefreshTokenError> {
     if events.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let Some(auth) = auth_manager.auth().await else {
-        return;
+    let Some(auth) = auth_manager.auth().await? else {
+        return Ok(());
     };
     if auth.is_api_key_auth() {
         events.retain(TrackEventRequest::can_send_with_api_key_auth);
     } else if !auth.uses_codex_backend() {
-        return;
+        return Ok(());
     }
     if events.is_empty() {
-        return;
+        return Ok(());
     }
 
     for events in track_event_request_batches(events) {
         send_track_events_request(&auth, destination, events).await;
     }
+    Ok(())
 }
 
 fn track_event_request_batches(events: Vec<TrackEventRequest>) -> Vec<Vec<TrackEventRequest>> {

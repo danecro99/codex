@@ -12,6 +12,7 @@ use codex_api::SharedAuthProvider;
 use codex_login::AuthHeaders;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::RefreshTokenError;
 use codex_login::auth::AgentIdentityAuth;
 use codex_login::auth::AgentIdentityAuthError;
 use codex_login::auth::AgentIdentityAuthPolicy;
@@ -159,6 +160,10 @@ impl AuthProvider for AuthManagerAuthProvider {
                 .auth_manager
                 .auth()
                 .await
+                .map_err(|error| match error {
+                    RefreshTokenError::Permanent(error) => AuthError::Build(error.to_string()),
+                    RefreshTokenError::Transient(error) => AuthError::Transient(error.to_string()),
+                })?
                 .filter(|auth| self.is_expected_auth(auth))
                 .ok_or_else(|| {
                     AuthError::Transient("managed authentication is unavailable".to_string())
@@ -446,7 +451,11 @@ mod tests {
         )
         .await
         .expect("auth manager should initialize");
-        let auth = auth_manager.auth().await.expect("auth should load");
+        let auth = auth_manager
+            .auth()
+            .await
+            .expect("auth should load")
+            .expect("auth should be configured");
         let auth_manager = AuthManager::from_auth_for_testing_with_agent_identity_authapi_base_url(
             auth.clone(),
             agent_identity_authapi_base_url,
@@ -655,7 +664,7 @@ mod tests {
             /*chatgpt_plan_type*/ None,
         )
         .expect("save reloaded auth");
-        auth_manager.reload().await;
+        auth_manager.reload().await.expect("auth should reload");
 
         let resolved_headers = provider
             .resolve_auth_headers()
@@ -673,7 +682,7 @@ mod tests {
             /*chatgpt_plan_type*/ None,
         )
         .expect("save switched-account auth");
-        auth_manager.reload().await;
+        auth_manager.reload().await.expect("auth should reload");
 
         assert!(provider.to_auth_headers().is_empty());
     }

@@ -27,7 +27,8 @@ async fn process_compacted_history_with_test_session(
     );
     let initial_context = session
         .build_initial_context_with_world_state(&turn_context, world_state.as_ref())
-        .await;
+        .await
+        .expect("initial context should build");
     let initial_context_injection = InitialContextInjection::BeforeLastUserMessage {
         world_state,
         step_context,
@@ -37,7 +38,8 @@ async fn process_compacted_history_with_test_session(
         compacted_history,
         &initial_context_injection,
     )
-    .await;
+    .await
+    .expect("compacted history should process");
     (refreshed, initial_context)
 }
 

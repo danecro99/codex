@@ -11,6 +11,13 @@ use super::thread_rollout_resolver;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+/// Maximum number of immutable rollout segments admitted to one paginated lineage.
+///
+/// No existing history contract bounds fork depth. 256 preserves a deliberately generous number
+/// of explicit fork and pagination boundaries while bounding path resolution, metadata reads, and
+/// the lineage's `Vec` and cycle-detection `HashSet`.
+pub(super) const MAX_ROLLOUT_LINEAGE_SEGMENTS: usize = 256;
+
 /// One immutable rollout range contributing to a paginated thread's history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RolloutLineageSegment {
@@ -63,6 +70,10 @@ impl LocalThreadStore {
         let mut end = None;
 
         loop {
+            let segment_count = segments.len().saturating_add(1);
+            if segment_count > MAX_ROLLOUT_LINEAGE_SEGMENTS {
+                return Err(lineage_limit_exceeded(requested_thread_id, segment_count));
+            }
             let coordination_id = next_rollout_id.unwrap_or(requested_thread_id);
             let _writer_guard = match representation {
                 LineageRepresentation::Existing => None,
@@ -259,6 +270,14 @@ async fn validate_cutoff_bounds(
 fn malformed_lineage(thread_id: ThreadId, detail: &str) -> ThreadStoreError {
     ThreadStoreError::InvalidRequest {
         message: format!("invalid paginated history lineage for {thread_id}: {detail}"),
+    }
+}
+
+fn lineage_limit_exceeded(thread_id: ThreadId, actual: usize) -> ThreadStoreError {
+    ThreadStoreError::InvalidRequest {
+        message: format!(
+            "invalid paginated history lineage for {thread_id}: segment limit exceeded: {actual} > {MAX_ROLLOUT_LINEAGE_SEGMENTS}"
+        ),
     }
 }
 

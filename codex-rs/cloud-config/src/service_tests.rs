@@ -1067,7 +1067,12 @@ async fn refresh_from_remote_updates_cached_bundle() {
     );
 
     assert_eq!(service.get_latest().await, Ok(Some(test_bundle())));
-    assert!(service.refresh_cache_once().await);
+    assert!(
+        service
+            .refresh_cache_once()
+            .await
+            .expect("refresh should complete")
+    );
     assert_eq!(
         service.get_latest().await,
         Ok(Some(replacement_bundle.clone()))
@@ -1419,7 +1424,12 @@ async fn refresh_can_clear_preserve_and_restore_the_latest_bundle() {
     ));
 
     assert_eq!(service.get_latest().await, Ok(Some(test_bundle())));
-    assert!(service.refresh_cache_once().await);
+    assert!(
+        service
+            .refresh_cache_once()
+            .await
+            .expect("refresh should complete")
+    );
     assert_eq!(service.get_latest().await, Ok(None));
 
     let refresh_service = Arc::clone(&service);
@@ -1427,10 +1437,20 @@ async fn refresh_can_clear_preserve_and_restore_the_latest_bundle() {
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(5)).await;
     tokio::task::yield_now().await;
-    assert!(refresh.await.expect("failed refresh task"));
+    assert!(
+        refresh
+            .await
+            .expect("failed refresh task")
+            .expect("refresh should complete")
+    );
     assert_eq!(service.get_latest().await, Ok(None));
 
-    assert!(service.refresh_cache_once().await);
+    assert!(
+        service
+            .refresh_cache_once()
+            .await
+            .expect("refresh should complete")
+    );
     assert_eq!(service.get_latest().await, Ok(Some(test_bundle())));
 }
 
@@ -1469,14 +1489,24 @@ async fn refresh_replaces_initial_errors_and_recovers_with_success() {
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(5)).await;
     tokio::task::yield_now().await;
-    assert!(refresh.await.expect("failed refresh task"));
+    assert!(
+        refresh
+            .await
+            .expect("failed refresh task")
+            .expect("refresh should complete")
+    );
     let latest_error = service
         .get_latest()
         .await
         .expect_err("latest failed refresh should replace the initial error");
     assert_eq!(latest_error.status_code(), Some(503));
 
-    assert!(service.refresh_cache_once().await);
+    assert!(
+        service
+            .refresh_cache_once()
+            .await
+            .expect("refresh should complete")
+    );
     assert_eq!(service.get_latest().await, Ok(Some(test_bundle())));
 }
 

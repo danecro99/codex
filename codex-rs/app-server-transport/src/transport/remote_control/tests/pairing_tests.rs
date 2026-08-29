@@ -1114,7 +1114,7 @@ async fn remote_control_handle_discards_pairing_response_after_auth_change() {
         AuthKeyringBackendKind::default(),
     )
     .expect("next auth should save");
-    auth_manager.reload().await;
+    auth_manager.reload().await.expect("auth should reload");
     respond_with_json(
         pairing_request.stream,
         json!({

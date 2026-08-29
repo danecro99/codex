@@ -46,7 +46,12 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     let Some(arguments) = arguments_value.as_object() else {
         return Ok(Some(arguments_value));
     };
-    let auth = sess.services.auth_manager.auth().await;
+    let auth = sess
+        .services
+        .auth_manager
+        .auth()
+        .await
+        .map_err(|error| format!("failed to load auth: {error}"))?;
     let mut rewritten_arguments = arguments.clone();
 
     for (field_name, optional_fields) in openai_file_input_optional_fields {

@@ -69,7 +69,8 @@ impl ContextContributor for GitAttributionExtension {
                                 input.turn_store.insert(policy.clone());
                                 policy
                             }
-                            Err(_) => {
+                            Err(error) => {
+                                eprintln!("failed to resolve git attribution policy: {error}");
                                 let auth_generation = auth_generation(self.auth_manager.as_ref());
                                 if auth_generation == current_auth_generation {
                                     input.thread_store.insert(GitAttributionRetry {

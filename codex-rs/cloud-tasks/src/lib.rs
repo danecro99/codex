@@ -85,7 +85,7 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
     append_error_log(format!("startup: base_url={base_url} path_style={style}"));
 
     let auth = match auth_manager.as_ref() {
-        Some(manager) => manager.auth().await,
+        Some(manager) => manager.auth().await?,
         None => None,
     };
     let auth = match auth {
@@ -205,7 +205,7 @@ async fn resolve_environment_id(ctx: &BackendContext, requested: &str) -> anyhow
         return Err(anyhow!("environment id must not be empty"));
     }
     let normalized = util::normalize_base_url(&ctx.base_url);
-    let headers = util::build_chatgpt_headers().await;
+    let headers = util::build_chatgpt_headers().await?;
     let environments =
         crate::env_detect::list_environments(&ctx.environment_http, &normalized, &headers).await?;
     if environments.is_empty() {
@@ -868,17 +868,18 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
         let environment_http = environment_http.clone();
         tokio::spawn(async move {
             let base_url = util::normalize_base_url(&base_url);
-            // Build headers: UA + ChatGPT auth if available
-            let headers = util::build_chatgpt_headers().await;
-
-            // Run autodetect. If it fails, we keep using "All".
-            let res = crate::env_detect::autodetect_environment_id(
-                &environment_http,
-                &base_url,
-                &headers,
-                /*desired_label*/ None,
-            )
-            .await;
+            let res = match util::build_chatgpt_headers().await {
+                Ok(headers) => {
+                    crate::env_detect::autodetect_environment_id(
+                        &environment_http,
+                        &base_url,
+                        &headers,
+                        /*desired_label*/ None,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
             let _ = tx.send(app::AppEvent::EnvironmentAutodetected(res));
         });
     }
@@ -2021,8 +2022,10 @@ fn spawn_environment_load(
 ) {
     tokio::spawn(async move {
         let base_url = util::normalize_base_url(&base_url);
-        let headers = util::build_chatgpt_headers().await;
-        let result = crate::env_detect::list_environments(&http, &base_url, &headers).await;
+        let result = match util::build_chatgpt_headers().await {
+            Ok(headers) => crate::env_detect::list_environments(&http, &base_url, &headers).await,
+            Err(error) => Err(error),
+        };
         let _ = tx.send(app::AppEvent::EnvironmentsLoaded(result));
     });
 }

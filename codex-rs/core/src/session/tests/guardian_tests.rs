@@ -1104,7 +1104,8 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
         ],
         &initial_context_injection,
     )
-    .await;
+    .await
+    .expect("compacted history should process");
 
     let developer_messages = refreshed
         .iter()

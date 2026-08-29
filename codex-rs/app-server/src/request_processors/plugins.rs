@@ -576,7 +576,11 @@ impl PluginRequestProcessor {
         if !context.plugins_enabled() && context.load_errors.is_empty() {
             return Ok(empty_response());
         }
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
         let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
         if include_local
             && force_refetch
@@ -832,7 +836,11 @@ impl PluginRequestProcessor {
         if !context.plugins_enabled() && context.load_errors.is_empty() {
             return Ok(empty_response());
         }
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
         let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
 
         let use_remote_global_catalog = context.remote_plugins_enabled()
@@ -1018,7 +1026,11 @@ impl PluginRequestProcessor {
 
         let config = self.load_latest_config(config_cwd).await?;
         let plugins_input = config.plugins_config_input();
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
 
         let plugin = match read_source {
             Ok(marketplace_path) => {
@@ -1213,7 +1225,11 @@ impl PluginRequestProcessor {
             ));
         }
 
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
         let remote_plugin_service_config = remote_plugin_service_config(&config);
         let remote_skill_detail = codex_core_plugins::remote::fetch_remote_plugin_skill_detail(
             &remote_plugin_service_config,
@@ -1441,7 +1457,11 @@ impl PluginRequestProcessor {
         if !config.features.enabled(Feature::Plugins) {
             return Err(invalid_request("plugin sharing is not enabled"));
         }
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
         Ok((config, auth))
     }
 
@@ -1474,7 +1494,11 @@ impl PluginRequestProcessor {
         };
         let config_cwd = marketplace_path.as_path().parent().map(Path::to_path_buf);
         let config = self.load_latest_config(config_cwd.clone()).await?;
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
 
         let plugins_manager = self.thread_manager.plugins_manager();
         let marketplace_display = marketplace_path.display().to_string();
@@ -1559,7 +1583,11 @@ impl PluginRequestProcessor {
         }
         validate_remote_plugin_id(&remote_plugin_id)?;
 
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
         let remote_plugin_service_config = remote_plugin_service_config(&config);
         let remote_detail =
             codex_core_plugins::remote::fetch_remote_plugin_detail_with_download_urls(
@@ -2140,7 +2168,11 @@ impl PluginRequestProcessor {
         }
         validate_remote_plugin_id(&plugin_id)?;
 
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
         let remote_plugin_service_config = remote_plugin_service_config(&config);
         let uninstall_target = codex_core_plugins::remote::resolve_remote_plugin_uninstall_target(
             &remote_plugin_service_config,

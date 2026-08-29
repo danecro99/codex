@@ -363,22 +363,53 @@ async fn loads_bounded_paginated_history_from_its_durable_origin() {
 async fn rejects_model_context_over_the_token_limit() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1014);
-    let oversized_message = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_TOKENS * 4 + 1);
     let path = write_legacy_rollout(
         home.path(),
         "2025-01-03T13-00-12",
         uuid,
         [
             turn_started("turn-1"),
-            user_message(&oversized_message),
+            user_message("turn"),
             legacy_user_message_event("turn"),
             turn_context(home.path(), "turn-1"),
             compacted("checkpoint", Some(Vec::new())),
             turn_complete("turn-1"),
         ],
     );
+    let bounded_message = "x".repeat((codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS - 1_000) * 4);
+    append_repeated_item(
+        path.as_path(),
+        user_message(&bounded_message),
+        codex_rollout::MODEL_CONTEXT_MAX_TOKENS
+            / (codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS - 1_000)
+            + 2,
+    );
 
     assert_model_context_scan_fails(home.path(), path.as_path(), "exceeds the token limit").await;
+}
+
+#[tokio::test]
+async fn rejects_single_model_context_item_over_the_token_limit() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1017);
+    let oversized_message = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS * 4 + 1);
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-15",
+        uuid,
+        [
+            turn_started("turn-1"),
+            user_message("turn"),
+            legacy_user_message_event("turn"),
+            turn_context(home.path(), "turn-1"),
+            compacted("checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+            user_message(&oversized_message),
+        ],
+    );
+
+    assert_model_context_scan_fails(home.path(), path.as_path(), "exceeds the item token limit")
+        .await;
 }
 
 #[tokio::test]
@@ -425,21 +456,14 @@ async fn rejects_compressed_model_context_without_a_bounded_stream() {
         ],
     );
     let compressed_path = path.with_extension("jsonl.zst");
-    let compressed = zstd::stream::encode_all(
-        std::fs::File::open(path.as_path()).expect("open rollout"),
-        3,
-    )
-    .expect("compress rollout");
-    std::fs::write(&compressed_path, compressed).expect("write compressed rollout");
+    std::fs::write(&compressed_path, b"not a zstd stream")
+        .expect("write intentionally unreadable compressed rollout");
     std::fs::remove_file(&path).expect("remove plain rollout");
 
-    let session_meta = codex_rollout::read_session_meta_line(&compressed_path)
-        .await
-        .expect("read compressed session metadata");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let error = store
         .load_latest_model_context(LoadModelContextParams {
-            thread_id: session_meta.meta.id,
+            thread_id: codex_protocol::ThreadId::from_string(&uuid.to_string()).expect("thread id"),
             include_archived: false,
             rollout_path: Some(compressed_path),
         })

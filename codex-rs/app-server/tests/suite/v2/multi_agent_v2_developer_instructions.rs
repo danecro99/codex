@@ -481,14 +481,14 @@ async fn compacted_full_history_fork_replaces_parent_developer_instructions() ->
     None,
     None,
     PARENT_INSTRUCTIONS,
-    ThreadHistoryMode::Legacy;
+    ThreadHistoryMode::Paginated;
     "inherits parent developer instructions without an override"
 )]
 #[test_case(
     Some(CHILD_INSTRUCTIONS),
     None,
     CHILD_INSTRUCTIONS,
-    ThreadHistoryMode::Legacy;
+    ThreadHistoryMode::Paginated;
     "reapplies configured subagent developer instructions"
 )]
 #[test_case(
@@ -502,7 +502,7 @@ async fn compacted_full_history_fork_replaces_parent_developer_instructions() ->
     Some(CHILD_INSTRUCTIONS),
     Some("default"),
     ROLE_INSTRUCTIONS,
-    ThreadHistoryMode::Legacy;
+    ThreadHistoryMode::Paginated;
     "reapplies an implicitly selected configured default role"
 )]
 #[tokio::test]

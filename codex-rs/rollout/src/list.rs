@@ -1281,7 +1281,10 @@ fn event_msg_preview(event: &EventMsg) -> Option<String> {
 /// callers that need the session metadata (e.g. to derive a cwd for config).
 pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> {
     let mut lines = compression::open_rollout_line_reader(path).await?;
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = lines
+        .next_line_with_max_bytes(crate::MAX_ROLLOUT_LINE_BYTES)
+        .await?
+    {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;

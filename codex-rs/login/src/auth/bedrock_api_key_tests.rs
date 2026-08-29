@@ -192,7 +192,7 @@ async fn access_keys_auth_round_trips_and_logs_out() -> anyhow::Result<()> {
     let mut auth_without_mode = storage.load()?.expect("access keys should be stored");
     auth_without_mode.auth_mode = None;
     storage.save(&auth_without_mode)?;
-    assert!(!auth_manager.reload().await);
+    assert!(!auth_manager.reload().await?);
     assert_eq!(*auth_change_rx.borrow(), auth_revision);
     assert!(auth_manager.logout().await?);
     assert_eq!(storage.load()?, None);

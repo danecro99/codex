@@ -6,16 +6,24 @@ use codex_protocol::protocol::RateLimitWindow;
 use tracing::info;
 use tracing::warn;
 
-pub(crate) async fn rate_limits_ok(auth_manager: &AuthManager, config: &Config) -> bool {
-    rate_limits_check(auth_manager, config)
-        .await
-        .unwrap_or(true)
+pub(crate) async fn rate_limits_ok(
+    auth_manager: &AuthManager,
+    config: &Config,
+) -> anyhow::Result<bool> {
+    Ok(rate_limits_check(auth_manager, config)
+        .await?
+        .unwrap_or(true))
 }
 
-async fn rate_limits_check(auth_manager: &AuthManager, config: &Config) -> Option<bool> {
-    let auth = auth_manager.auth().await?;
+async fn rate_limits_check(
+    auth_manager: &AuthManager,
+    config: &Config,
+) -> anyhow::Result<Option<bool>> {
+    let Some(auth) = auth_manager.auth().await? else {
+        return Ok(None);
+    };
     if !auth.uses_codex_backend() {
-        return None;
+        return Ok(None);
     }
 
     let client = BackendClient::from_auth(
@@ -28,12 +36,18 @@ async fn rate_limits_check(auth_manager: &AuthManager, config: &Config) -> Optio
         .get_rate_limits_many()
         .await
         .map_err(|err| warn!(%err, "failed to fetch rate limits"))
-        .ok()?;
+        .ok();
+    let Some(snapshots) = snapshots else {
+        return Ok(None);
+    };
 
     let snapshot = snapshots
         .iter()
         .find(|s| s.limit_id.as_deref() == Some(crate::guard_limits::CODEX_LIMIT_ID))
-        .or_else(|| snapshots.first())?;
+        .or_else(|| snapshots.first());
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
 
     let min_remaining_percent = config.memories.min_rate_limit_remaining_percent;
     let allowed = snapshot_allows_startup(snapshot, min_remaining_percent);
@@ -45,7 +59,7 @@ async fn rate_limits_check(auth_manager: &AuthManager, config: &Config) -> Optio
         );
     }
 
-    Some(allowed)
+    Ok(Some(allowed))
 }
 
 fn snapshot_allows_startup(snapshot: &RateLimitSnapshot, min_remaining_percent: i64) -> bool {

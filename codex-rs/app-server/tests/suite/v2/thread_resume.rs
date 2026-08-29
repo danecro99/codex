@@ -312,7 +312,7 @@ async fn legacy_exclude_turns_resume_rejects_model_context_overflow() -> Result<
     .await??;
 
     assert!(
-        error.error.message.contains("exceeds the token limit"),
+        error.error.message.contains("exceeds the item token limit"),
         "unexpected resume error: {}",
         error.error.message
     );
@@ -2594,12 +2594,11 @@ async fn thread_resume_can_skip_turns_for_metadata_only_resume() -> Result<()> {
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
 
-    let conversation_id = create_fake_rollout_with_text_elements(
+    let conversation_id = create_fake_paginated_rollout(
         codex_home.path(),
         "2025-01-05T12-00-00",
         "2025-01-05T12:00:00Z",
         "Saved user message",
-        Vec::new(),
         Some("mock_provider"),
         /*git_info*/ None,
     )?;

@@ -12,6 +12,7 @@ use codex_exec_server::HttpRedirectPolicy;
 use codex_exec_server::HttpRequestParams;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::RefreshTokenError;
 use codex_protocol::auth::AuthMode;
 use serde::Deserialize;
 use serde::Serialize;
@@ -34,7 +35,7 @@ impl McpConnectionSet {
         server: &McpServerMetadata,
         arguments: Option<&Value>,
         meta: Option<Value>,
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>, RefreshTokenError> {
         if tool
             .tool
             .meta
@@ -63,7 +64,7 @@ impl McpConnectionSet {
         {
             context.add_context(meta).await
         } else {
-            meta
+            Ok(meta)
         }
     }
 }
@@ -150,26 +151,33 @@ impl TrustedAccessContext {
     }
 
     /// Replaces caller-supplied entitlement metadata with a fresh verified result.
-    pub async fn add_context(&self, meta: Option<Value>) -> Option<Value> {
+    pub async fn add_context(
+        &self,
+        meta: Option<Value>,
+    ) -> Result<Option<Value>, RefreshTokenError> {
         let mut meta = match meta {
             Some(Value::Object(meta)) => meta,
             None => Map::new(),
-            other => return other,
+            other => return Ok(other),
         };
         meta.remove(ENTITLEMENT_CONTEXT_KEY);
 
-        let status = tokio::time::timeout(TRUSTED_ACCESS_TIMEOUT, self.fetch_status())
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                json!({
-                    "schemaVersion": 1,
-                    "status": "unknown",
-                    "grants": [],
-                    "stale": false
-                })
-            });
+        let auth = self.auth_manager.auth().await?;
+        let status = match auth {
+            Some(auth) => tokio::time::timeout(TRUSTED_ACCESS_TIMEOUT, self.fetch_status(auth))
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        }
+        .unwrap_or_else(|| {
+            json!({
+                "schemaVersion": 1,
+                "status": "unknown",
+                "grants": [],
+                "stale": false
+            })
+        });
         meta.insert(
             ENTITLEMENT_CONTEXT_KEY.to_string(),
             json!({
@@ -177,11 +185,10 @@ impl TrustedAccessContext {
                 "entitlements": { "cyber_trusted_access": status }
             }),
         );
-        Some(Value::Object(meta))
+        Ok(Some(Value::Object(meta)))
     }
 
-    async fn fetch_status(&self) -> Option<Value> {
-        let auth = self.auth_manager.auth().await?;
+    async fn fetch_status(&self, auth: CodexAuth) -> Option<Value> {
         let expected_account_id = self
             .auth
             .get_account_id()

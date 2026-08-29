@@ -3382,6 +3382,9 @@ impl Session {
         }
         .or_cancel(cancellation_token)
         .await?;
+        let prepared_recommendations = prepared_recommendations
+            .map_err(std::io::Error::from)
+            .map_err(CodexErr::from)?;
         let mut selected_plugins = self
             .services
             .thread_extension_data
@@ -3676,7 +3679,7 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         world_state: &WorldState,
-    ) -> Vec<ResponseItem> {
+    ) -> CodexResult<Vec<ResponseItem>> {
         let mut developer_sections = Vec::<RenderedFragment>::with_capacity(8);
         let mut contextual_user_sections = Vec::<RenderedFragment>::with_capacity(2);
         let mut separate_developer_sections = Vec::<RenderedFragment>::new();
@@ -3710,7 +3713,12 @@ impl Session {
             && (features.enabled(Feature::ToolSuggest)
                 || features.enabled(Feature::RecommendedPlugins))
         {
-            let auth = self.services.auth_manager.auth().await;
+            let auth = self
+                .services
+                .auth_manager
+                .auth()
+                .await
+                .map_err(std::io::Error::from)?;
             let plugins_config = turn_context.config.plugins_config_input();
             self.services
                 .plugins_manager
@@ -3903,7 +3911,7 @@ impl Session {
         for item in &mut items {
             item.set_turn_id_if_missing(&turn_context.sub_id);
         }
-        items
+        Ok(items)
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -3962,7 +3970,7 @@ impl Session {
         &self,
         step_context: &StepContext,
         world_state: Arc<WorldState>,
-    ) -> u64 {
+    ) -> CodexResult<u64> {
         let turn_context = step_context.turn.as_ref();
         let retained_client_developer_messages =
             if self.enabled(Feature::RetainClientDeveloperMessages) {
@@ -3988,7 +3996,7 @@ impl Session {
         let (window_number, window_ids) = window;
         let context_items = self
             .build_initial_context_with_world_state(turn_context, world_state.as_ref())
-            .await
+            .await?
             .into_iter()
             .map(ResponseItemEnvelope::new)
             .chain(retained_client_developer_messages)
@@ -4006,7 +4014,7 @@ impl Session {
         )
         .await;
         self.recompute_token_usage(turn_context).await;
-        window_number
+        Ok(window_number)
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -4045,7 +4053,7 @@ impl Session {
         let (mut context_items, world_state_item) = if should_inject_full_context {
             let context_items = self
                 .build_initial_context_with_world_state(turn_context, world_state.as_ref())
-                .await;
+                .await?;
             let snapshot = world_state.snapshot();
             self.state
                 .lock()

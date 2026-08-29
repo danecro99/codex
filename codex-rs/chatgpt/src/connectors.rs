@@ -35,7 +35,7 @@ const DEFAULT_APPS_PRODUCT_SKU: &str = "codex";
 async fn apps_enabled(config: &Config) -> anyhow::Result<bool> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
-    let auth = auth_manager.auth().await;
+    let auth = auth_manager.auth().await?;
     Ok(config
         .features
         .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend)))
@@ -46,7 +46,7 @@ async fn connector_auth(config: &Config) -> anyhow::Result<CodexAuth> {
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
     let auth = auth_manager
         .auth()
-        .await
+        .await?
         .ok_or_else(|| anyhow::anyhow!("ChatGPT auth not available"))?;
     anyhow::ensure!(
         auth.uses_codex_backend(),

@@ -65,7 +65,14 @@ pub fn start_memories_startup_task(
         // done before the quota check.
         phase1::prune(context.as_ref(), &config).await;
 
-        if !guard::rate_limits_ok(&auth_manager, &config).await {
+        let rate_limits_ok = match guard::rate_limits_ok(&auth_manager, &config).await {
+            Ok(rate_limits_ok) => rate_limits_ok,
+            Err(error) => {
+                warn!(%error, "failed to load auth for memories startup rate-limit check");
+                return;
+            }
+        };
+        if !rate_limits_ok {
             context.counter(
                 MEMORY_STARTUP,
                 /*inc*/ 1,

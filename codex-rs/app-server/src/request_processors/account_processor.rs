@@ -428,7 +428,10 @@ impl AccountRequestProcessor {
             self.config.auth_keyring_backend_kind(),
         ) {
             Ok(()) => {
-                self.auth_manager.reload().await;
+                self.auth_manager
+                    .reload()
+                    .await
+                    .map_err(|err| internal_error(format!("failed to reload auth: {err}")))?;
                 self.config_manager.clear_cloud_config_bundle_loader();
                 Ok(())
             }
@@ -524,7 +527,10 @@ impl AccountRequestProcessor {
                 }
             }
             .map_err(|err| internal_error(format!("failed to save Amazon Bedrock auth: {err}")))?;
-            self.auth_manager.reload().await;
+            self.auth_manager
+                .reload()
+                .await
+                .map_err(|err| internal_error(format!("failed to reload auth: {err}")))?;
             self.config_manager.clear_cloud_config_bundle_loader();
             Ok(LoginAccountResponse::AmazonBedrock {})
         }
@@ -913,6 +919,14 @@ impl AccountRequestProcessor {
         config: Arc<Config>,
         payload_v2: AccountLoginCompletedNotification,
     ) {
+        let mut payload_v2 = payload_v2;
+        if payload_v2.success {
+            let auth_manager = thread_manager.auth_manager();
+            if let Err(error) = auth_manager.reload().await {
+                payload_v2.success = false;
+                payload_v2.error = Some(format!("failed to reload auth: {error}"));
+            }
+        }
         let success = payload_v2.success;
         outgoing
             .send_server_notification(ServerNotification::AccountLoginCompleted(payload_v2))
@@ -920,7 +934,6 @@ impl AccountRequestProcessor {
 
         if success {
             let auth_manager = thread_manager.auth_manager();
-            auth_manager.reload().await;
             config_manager.replace_cloud_config_bundle_loader(
                 auth_manager.clone(),
                 config.chatgpt_base_url.clone(),
@@ -1056,7 +1069,10 @@ impl AccountRequestProcessor {
             let auth = if do_refresh {
                 self.auth_manager.auth_cached()
             } else {
-                self.auth_manager.auth().await
+                self.auth_manager
+                    .auth()
+                    .await
+                    .map_err(|err| internal_error(format!("failed to load auth: {err}")))?
             };
             match auth {
                 Some(auth) => {
@@ -1131,7 +1147,12 @@ impl AccountRequestProcessor {
     async fn get_account_rate_limits_response(
         &self,
     ) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?
+        else {
             return Err(invalid_request(
                 "codex account authentication required to read rate limits",
             ));
@@ -1213,7 +1234,12 @@ impl AccountRequestProcessor {
             })
             .transpose()?;
 
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?
+        else {
             return Err(invalid_request(
                 "codex account authentication required to read token usage",
             ));
@@ -1298,7 +1324,12 @@ impl AccountRequestProcessor {
     async fn get_workspace_messages_response(
         &self,
     ) -> Result<GetWorkspaceMessagesResponse, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?
+        else {
             return Err(invalid_request(
                 "codex account authentication required to read workspace messages",
             ));
@@ -1390,7 +1421,12 @@ impl AccountRequestProcessor {
         &self,
         params: SendAddCreditsNudgeEmailParams,
     ) -> Result<AddCreditsNudgeEmailStatus, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?
+        else {
             return Err(invalid_request(
                 "codex account authentication required to notify workspace owner",
             ));

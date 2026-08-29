@@ -6,6 +6,7 @@ use codex_backend_client::Client as BackendClient;
 use codex_extension_api::ExtensionData;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
+use codex_login::RefreshTokenError;
 use tokio::time::timeout;
 
 #[derive(Clone, Debug)]
@@ -49,11 +50,28 @@ const POLICY_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 const POLICY_RESOLUTION_TIMEOUT: Duration = Duration::from_millis(500);
 pub(super) const POLICY_RETRY_DELAY: Duration = Duration::from_secs(30);
 
+#[derive(Debug)]
+pub(super) enum GitAttributionPolicyError {
+    Auth(RefreshTokenError),
+    Timeout(tokio::time::error::Elapsed),
+}
+
+impl std::fmt::Display for GitAttributionPolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auth(error) => write!(formatter, "failed to load auth: {error}"),
+            Self::Timeout(error) => write!(formatter, "policy resolution timed out: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GitAttributionPolicyError {}
+
 pub(super) async fn resolve_attribution_policy(
     auth_manager: &Arc<AuthManager>,
     base_url: &str,
     http_client_factory: &HttpClientFactory,
-) -> Result<Option<GitAttributionPolicy>, tokio::time::error::Elapsed> {
+) -> Result<Option<GitAttributionPolicy>, GitAttributionPolicyError> {
     timeout(POLICY_RESOLUTION_TIMEOUT, async {
         let mut recovery_generation = auth_generation(auth_manager);
         let mut auth_recovery = auth_manager.unauthorized_recovery();
@@ -63,7 +81,10 @@ pub(super) async fn resolve_attribution_policy(
                 auth_recovery = auth_manager.unauthorized_recovery();
                 recovery_generation = auth_generation_at_start;
             }
-            let auth = auth_manager.auth().await;
+            let auth = auth_manager
+                .auth()
+                .await
+                .map_err(GitAttributionPolicyError::Auth)?;
             if auth_generation(auth_manager) != auth_generation_at_start {
                 continue;
             }
@@ -92,13 +113,14 @@ pub(super) async fn resolve_attribution_policy(
             if auth_generation(auth_manager) != auth_generation_at_start {
                 continue;
             }
-            return enabled.map(|enabled| GitAttributionPolicy {
+            return Ok(enabled.map(|enabled| GitAttributionPolicy {
                 auth_generation: auth_generation_at_start,
                 enabled,
-            });
+            }));
         }
     })
     .await
+    .map_err(GitAttributionPolicyError::Timeout)?
 }
 
 pub(super) fn auth_generation(auth_manager: &AuthManager) -> u64 {

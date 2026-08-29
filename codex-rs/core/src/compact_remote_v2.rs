@@ -320,7 +320,7 @@ async fn run_remote_compact_task_inner_impl(
     analytics_details.retained_image_count = Some(retained_images);
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
+        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await?;
     let new_history =
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
 

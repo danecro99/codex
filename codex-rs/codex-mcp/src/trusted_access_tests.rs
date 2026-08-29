@@ -164,10 +164,15 @@ fn fedramp_chatgpt_auth(account_id: &str) -> CodexAuth {
 fn context(auth: CodexAuth, client: Arc<RecordingHttpClient>) -> TrustedAccessContext {
     TrustedAccessContext::new(
         auth.clone(),
-        AuthManager::from_auth_for_testing(auth),
+        auth_manager_for_test(auth),
         "https://chatgpt.com/backend-api".to_string(),
         client,
     )
+}
+
+fn auth_manager_for_test(auth: CodexAuth) -> Arc<AuthManager> {
+    let auth_home = tempfile::tempdir().expect("test auth home").keep();
+    AuthManager::from_auth_for_testing_with_home(auth, auth_home)
 }
 
 fn cyber_response(state: &str, grants: Value) -> Value {
@@ -205,7 +210,8 @@ async fn delivers_account_bound_verified_access_to_the_calling_plugin() {
     context.chatgpt_base_url.push('/');
     let metadata = context
         .add_context(Some(json!({ "threadId": "thread-1" })))
-        .await;
+        .await
+        .expect("auth should load");
     let mut expected = expected_metadata(
         "granted",
         json!([
@@ -284,7 +290,8 @@ async fn rejects_auth_without_a_nonempty_account_id() -> anyhow::Result<()> {
         assert_eq!(
             context(auth, client.clone())
                 .add_context(/*meta*/ None)
-                .await,
+                .await
+                .expect("auth should load"),
             Some(expected_metadata("unknown", json!([]))),
             "account_id={account_id:?}"
         );
@@ -306,7 +313,8 @@ async fn rejects_api_key_authentication_without_sending_credentials() {
             "threadId": "thread-1",
             "openai/entitlementContext": { "forged": true }
         })))
-        .await;
+        .await
+        .expect("auth should load");
 
     let mut expected = expected_metadata("unknown", json!([]));
     expected["threadId"] = json!("thread-1");
@@ -324,10 +332,13 @@ async fn rejects_initial_unsupported_auth_after_switch_to_chatgpt() {
         ),
     ));
     let mut context = context(header_auth(), client.clone());
-    context.auth_manager = AuthManager::from_auth_for_testing(chatgpt_auth("account-a"));
+    context.auth_manager = auth_manager_for_test(chatgpt_auth("account-a"));
 
     assert_eq!(
-        context.add_context(/*meta*/ None).await,
+        context
+            .add_context(/*meta*/ None)
+            .await
+            .expect("auth should load"),
         Some(expected_metadata("unknown", json!([])))
     );
     assert!(client.requests.lock().expect("inspect requests").is_empty());
@@ -385,7 +396,11 @@ async fn maps_verified_access_states_and_rejects_invalid_provider_responses() {
             CodexAuth::create_dummy_chatgpt_auth_for_testing(),
             Arc::new(RecordingHttpClient::new(response_status, response)),
         );
-        let metadata = context.add_context(/*meta*/ None).await.expect("metadata");
+        let metadata = context
+            .add_context(/*meta*/ None)
+            .await
+            .expect("auth should load")
+            .expect("metadata");
         assert_eq!(
             metadata, expected,
             "HTTP {response_status}: {response_description}"
@@ -407,7 +422,8 @@ async fn replaces_untrusted_entitlements_on_malformed_response() {
                 "threadId": "thread-1",
                 "openai/entitlementContext": { "forged": true }
             })))
-            .await,
+            .await
+            .expect("auth should load"),
         Some(expected)
     );
 }
@@ -433,7 +449,8 @@ async fn rejects_verified_access_response_larger_than_one_mebibyte() {
     assert_eq!(
         context(chatgpt_auth("account-a"), Arc::new(client))
             .add_context(/*meta*/ None)
-            .await,
+            .await
+            .expect("auth should load"),
         Some(expected_metadata("unknown", json!([])))
     );
 }
@@ -455,7 +472,8 @@ async fn returns_unknown_at_the_lookup_deadline() {
     assert_eq!(
         lookup
             .now_or_never()
-            .expect("lookup must finish at the deadline"),
+            .expect("lookup must finish at the deadline")
+            .expect("auth should load"),
         Some(expected_metadata("unknown", json!([])))
     );
 }
@@ -480,7 +498,10 @@ async fn rejects_duplicate_cyber_programs() {
                 )),
             );
             assert_eq!(
-                context.add_context(/*meta*/ None).await,
+                context
+                    .add_context(/*meta*/ None)
+                    .await
+                    .expect("auth should load"),
                 Some(expected_metadata("unknown", json!([]))),
                 "duplicate programs: {programs}"
             );
@@ -515,9 +536,12 @@ async fn rejects_identity_changes_before_sending_credentials() {
             ),
         ));
         let mut context = context(initial_auth, client.clone());
-        context.auth_manager = AuthManager::from_auth_for_testing(selected_auth);
+        context.auth_manager = auth_manager_for_test(selected_auth);
         assert_eq!(
-            context.add_context(/*meta*/ None).await,
+            context
+                .add_context(/*meta*/ None)
+                .await
+                .expect("auth should load"),
             Some(expected_metadata("unknown", json!([]))),
             "identity change before the request: {description}"
         );
@@ -548,7 +572,10 @@ async fn uses_the_checked_auth_snapshot_for_request_headers() -> anyhow::Result<
         .await?;
 
     assert_eq!(
-        context.add_context(/*meta*/ None).await,
+        context
+            .add_context(/*meta*/ None)
+            .await
+            .expect("auth should load"),
         Some(expected_metadata("not_granted", json!([])))
     );
     let requests = client.requests.lock().expect("recorded requests");
@@ -649,7 +676,7 @@ async fn rejects_identity_changes_while_request_is_in_flight() -> anyhow::Result
         auth_change?;
 
         assert_eq!(
-            metadata,
+            metadata.expect("auth should load"),
             Some(expected_metadata("unknown", json!([]))),
             "auth change after the request: {description}"
         );

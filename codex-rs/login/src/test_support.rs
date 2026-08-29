@@ -11,11 +11,21 @@ use crate::auth::AgentIdentityAuthRecord;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_protocol::account::PlanType as AccountPlanType;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Creates an authentication manager with optional credentials for cross-crate tests.
 pub fn auth_manager_from_optional_auth(auth: Option<CodexAuth>) -> Arc<AuthManager> {
     AuthManager::from_optional_auth_for_testing(auth)
+}
+
+/// Creates an authentication manager with optional credentials and an existing auth home for
+/// cross-crate tests that exercise ephemeral external-auth persistence.
+pub fn auth_manager_from_optional_auth_with_home(
+    auth: Option<CodexAuth>,
+    auth_home: PathBuf,
+) -> Arc<AuthManager> {
+    AuthManager::from_optional_auth_for_testing_with_home(auth, auth_home)
 }
 
 /// Creates an authentication manager with initialized Agent Identity credentials for tests.

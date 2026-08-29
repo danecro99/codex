@@ -1262,6 +1262,7 @@ impl TestAuthAwareModelsEndpoint {
             Some(auth_manager) => auth_manager
                 .auth()
                 .await
+                .expect("auth should load")
                 .as_ref()
                 .is_some_and(CodexAuth::uses_codex_backend),
             None => false,

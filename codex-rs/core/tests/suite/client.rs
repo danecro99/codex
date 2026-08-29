@@ -1389,7 +1389,9 @@ async fn provider_auth_command_supplies_bearer_token() {
     .await;
     let auth_fixture = ProviderAuthCommandFixture::new(&["command-token"]).unwrap();
 
-    send_provider_auth_request(&server, auth_fixture.auth()).await;
+    send_provider_auth_request(&server, auth_fixture.auth())
+        .await
+        .expect("provider auth request should succeed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1421,11 +1423,13 @@ async fn provider_auth_command_refreshes_after_401() {
         .mount(&server)
         .await;
 
-    send_provider_auth_request(&server, auth_fixture.auth()).await;
+    send_provider_auth_request(&server, auth_fixture.auth())
+        .await
+        .expect("provider auth refresh should succeed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn provider_auth_command_recovers_after_initial_resolution_failure() {
+async fn provider_auth_command_surfaces_initial_resolution_failure() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -1433,16 +1437,17 @@ async fn provider_auth_command_recovers_after_initial_resolution_failure() {
     let failure_marker = auth_fixture.tempdir.path().join("fail-until-401");
     std::fs::write(&failure_marker, "").unwrap();
 
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .and(|request: &wiremock::Request| !request.headers.contains_key("authorization"))
-        .respond_with(move |_request: &wiremock::Request| {
-            std::fs::remove_file(&failure_marker).unwrap();
-            ResponseTemplate::new(401).set_body_string("unauthorized")
-        })
-        .expect(1)
-        .mount(&server)
-        .await;
+    let error = send_provider_auth_request(&server, auth_fixture.auth())
+        .await
+        .expect_err("provider auth resolution failure should be returned");
+    assert!(
+        error
+            .to_string()
+            .contains("provider auth command `./print-token.sh` exited with status exit status: 1"),
+        "unexpected provider auth error: {error}"
+    );
+
+    std::fs::remove_file(&failure_marker).unwrap();
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
         .and(header("authorization", "Bearer recovered-token"))
@@ -1458,7 +1463,9 @@ async fn provider_auth_command_recovers_after_initial_resolution_failure() {
         .mount(&server)
         .await;
 
-    send_provider_auth_request(&server, auth_fixture.auth()).await;
+    send_provider_auth_request(&server, auth_fixture.auth())
+        .await
+        .expect("provider auth should succeed after the source is repaired");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1483,7 +1490,9 @@ async fn amazon_bedrock_proxy_uses_command_auth_and_custom_headers() {
         .get_or_insert_default()
         .insert("x-some-header".to_string(), "foo".into());
 
-    send_request_with_provider(provider).await;
+    send_request_with_provider(provider)
+        .await
+        .expect("Amazon Bedrock provider request should succeed");
 
     let request = response.single_request();
     assert_eq!(request.path(), "/v1/responses");
@@ -1504,7 +1513,10 @@ async fn amazon_bedrock_proxy_uses_command_auth_and_custom_headers() {
 ///
 /// The caller owns the server-side assertions, so this helper only validates that the request
 /// reaches `Completed` without surfacing an auth or transport error to the client.
-async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuthInfo) {
+async fn send_provider_auth_request(
+    server: &MockServer,
+    auth: ModelProviderAuthInfo,
+) -> Result<(), CodexErr> {
     let provider = ModelProviderInfo {
         name: "corp".into(),
         base_url: Some(format!("{}/v1", server.uri())),
@@ -1526,11 +1538,11 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         supports_standalone_web_search: false,
     };
 
-    send_request_with_provider(provider).await;
+    send_request_with_provider(provider).await
 }
 
 #[expect(clippy::unwrap_used)]
-async fn send_request_with_provider(provider: ModelProviderInfo) {
+async fn send_request_with_provider(provider: ModelProviderInfo) -> Result<(), CodexErr> {
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
@@ -1600,14 +1612,16 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
             &responses_metadata,
             &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
-        .await
-        .expect("responses stream to start");
+        .await?;
 
     while let Some(event) = stream.next().await {
-        if let Ok(ResponseEvent::Completed { .. }) = event {
-            break;
+        match event {
+            Ok(ResponseEvent::Completed { .. }) => break,
+            Err(error) => return Err(error),
+            Ok(_) => {}
         }
     }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -914,7 +914,7 @@ impl CodexThread {
             }
             None => None,
         };
-        let _ = self.session.services.auth_manager.auth().await;
+        self.session.services.auth_manager.auth().await?;
         self.session.refresh_mcp_if_dirty().await;
         codex_mcp::McpResourceClient::new(Arc::clone(&self.session.services.mcp_runtime))
             .open_event_stream(name, &arguments, meta)

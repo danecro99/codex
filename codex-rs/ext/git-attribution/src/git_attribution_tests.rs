@@ -20,8 +20,16 @@ use wiremock::matchers::path;
 use super::policy::resolve_attribution_policy;
 
 fn enterprise_auth_manager() -> Arc<AuthManager> {
-    AuthManager::from_auth_for_testing(enterprise_auth("workspace-123"))
+    let auth_home = std::env::temp_dir().join(format!(
+        "codex-git-attribution-auth-{}-{}",
+        std::process::id(),
+        AUTH_HOME_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&auth_home).expect("create test auth home");
+    AuthManager::from_auth_for_testing_with_home(enterprise_auth("workspace-123"), auth_home)
 }
+
+static AUTH_HOME_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn http_client_factory() -> HttpClientFactory {
     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)

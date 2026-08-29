@@ -7,6 +7,7 @@ use codex_core::config::Config;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthManager;
+use codex_login::CodexAuth;
 use std::sync::Arc;
 
 pub fn set_user_agent_suffix(suffix: &str) {
@@ -78,7 +79,7 @@ pub async fn load_auth_manager(
 
 /// Build headers for ChatGPT-backed requests: `User-Agent`, optional `Authorization`,
 /// and optional `ChatGPT-Account-Id`.
-pub async fn build_chatgpt_headers() -> HeaderMap {
+pub async fn build_chatgpt_headers() -> anyhow::Result<HeaderMap> {
     use http::header::HeaderValue;
     use http::header::USER_AGENT;
 
@@ -89,13 +90,13 @@ pub async fn build_chatgpt_headers() -> HeaderMap {
         USER_AGENT,
         HeaderValue::from_str(&ua).unwrap_or(HeaderValue::from_static("codex-cli")),
     );
-    if let Some(am) = load_auth_manager(/*chatgpt_base_url*/ None).await.0
-        && let Some(auth) = am.auth().await
-        && auth.uses_codex_backend()
-    {
-        headers.extend(codex_model_provider::auth_provider_from_auth(&auth).to_auth_headers());
+    if let Some(am) = load_auth_manager(/*chatgpt_base_url*/ None).await.0 {
+        let auth = am.auth().await?;
+        if let Some(auth) = auth.filter(CodexAuth::uses_codex_backend) {
+            headers.extend(codex_model_provider::auth_provider_from_auth(&auth).to_auth_headers());
+        }
     }
-    headers
+    Ok(headers)
 }
 
 /// Construct a browser-friendly task URL for the given backend base URL.

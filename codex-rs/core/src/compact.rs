@@ -91,7 +91,7 @@ pub(crate) struct CompactedHistoryMetadata {
 pub(crate) async fn build_compaction_initial_context(
     sess: &Session,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>) {
+) -> CodexResult<(Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>)> {
     // Return the rendered state with its items so history and its baseline stay identical.
     match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage {
@@ -103,13 +103,13 @@ pub(crate) async fn build_compaction_initial_context(
                     step_context.turn.as_ref(),
                     world_state.as_ref(),
                 )
-                .await;
-            (
+                .await?;
+            Ok((
                 items.into_iter().map(ResponseItemEnvelope::new).collect(),
                 Some(Arc::clone(world_state)),
-            )
+            ))
         }
-        InitialContextInjection::DoNotInject => (Vec::new(), None),
+        InitialContextInjection::DoNotInject => Ok((Vec::new(), None)),
     }
 }
 
@@ -365,7 +365,7 @@ async fn run_compact_task_inner_impl(
     let (window_number, window_ids) = sess.advance_auto_compact_window().await;
 
     let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
+        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await?;
     if !initial_context.is_empty() {
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);

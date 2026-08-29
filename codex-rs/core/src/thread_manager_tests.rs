@@ -606,7 +606,8 @@ async fn ignores_session_prefix_messages_when_truncating() {
     let world_state = build_world_state_from_turn_context(&session, &turn_context).await;
     let mut items = session
         .build_initial_context_with_world_state(&turn_context, &world_state)
-        .await;
+        .await
+        .expect("initial context should build");
     items.push(user_msg("feature request"));
     items.push(assistant_msg("ack"));
     items.push(user_msg("second question"));
@@ -1139,7 +1140,8 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
         .thread
         .session
         .build_initial_context_with_world_state(&reviewer_turn, &reviewer_world_state)
-        .await;
+        .await
+        .expect("initial context should build");
     assert!(
         !serde_json::to_string(&reviewer_context)
             .expect("reviewer context should serialize")

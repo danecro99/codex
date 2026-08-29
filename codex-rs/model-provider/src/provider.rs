@@ -200,7 +200,7 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     }
 
     /// Returns the current provider-scoped auth value, if one is configured.
-    fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>>;
+    fn auth(&self) -> ModelProviderFuture<'_, codex_protocol::error::Result<Option<CodexAuth>>>;
 
     /// Returns the current app-visible account state for this provider.
     fn account_state(&self) -> ProviderAccountResult;
@@ -213,7 +213,7 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     /// Returns provider configuration adapted for the API client.
     fn api_provider(&self) -> ModelProviderFuture<'_, codex_protocol::error::Result<Provider>> {
         Box::pin(async move {
-            let auth = self.auth().await;
+            let auth = self.auth().await?;
             let mut provider = self
                 .info()
                 .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
@@ -234,7 +234,7 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
         &self,
     ) -> ModelProviderFuture<'_, codex_protocol::error::Result<SharedAuthProvider>> {
         Box::pin(async move {
-            let auth = self.auth().await;
+            let auth = self.auth().await?;
             resolve_provider_auth(auth.as_ref(), self.info())
         })
     }
@@ -248,7 +248,7 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
             if !provider_uses_first_party_auth_path(self.info()) {
                 return self.api_auth().await.map(ResolvedProviderAuth::new);
             }
-            let auth = self.auth().await;
+            let auth = self.auth().await?;
             resolve_provider_auth_for_scope(self.auth_manager(), auth.as_ref(), self.info(), scope)
                 .await
         })
@@ -377,11 +377,15 @@ impl ModelProvider for ConfiguredModelProvider {
             .is_some_and(|auth| auth.is_chatgpt_auth())
     }
 
-    fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
+    fn auth(&self) -> ModelProviderFuture<'_, codex_protocol::error::Result<Option<CodexAuth>>> {
         Box::pin(async move {
             match self.auth_manager.as_ref() {
-                Some(auth_manager) => auth_manager.auth().await,
-                None => None,
+                Some(auth_manager) => auth_manager
+                    .auth()
+                    .await
+                    .map_err(std::io::Error::from)
+                    .map_err(CodexErr::from),
+                None => Ok(None),
             }
         })
     }
@@ -916,7 +920,7 @@ mod tests {
             Some(AuthManager::from_auth_for_testing(auth.clone())),
         );
 
-        assert_eq!(provider.auth().await, Some(auth));
+        assert_eq!(provider.auth().await.expect("auth should load"), Some(auth));
     }
 
     #[test]

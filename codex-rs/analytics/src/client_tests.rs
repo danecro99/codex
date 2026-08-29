@@ -462,7 +462,8 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
             plugin_measurement("plugin-measurement", "sample@test"),
         ],
     )
-    .await;
+    .await
+    .expect("track events should be sent");
 
     let contents = fs::read_to_string(&capture_path).expect("read capture file");
     let lines = contents.lines().collect::<Vec<_>>();

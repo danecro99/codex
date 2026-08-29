@@ -672,7 +672,7 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
     let mcp_manager = load_mcp_manager(config).await?;
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await?;
-    let auth = auth_manager.auth().await;
+    let auth = auth_manager.auth().await?;
     let mcp_servers = mcp_manager.configured_servers(config).await;
     let effective_mcp_servers = mcp_manager.effective_servers(config, auth.as_ref()).await;
 

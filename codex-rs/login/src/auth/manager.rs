@@ -1973,7 +1973,7 @@ impl UnauthorizedRecovery {
                 match self
                     .manager
                     .reload_if_account_id_matches(self.expected_account_id.as_deref())
-                    .await
+                    .await?
                 {
                     ReloadOutcome::ReloadedChanged => {
                         self.step = UnauthorizedRecoveryStep::RefreshToken;
@@ -2199,6 +2199,13 @@ impl AuthManager {
 
     /// Create an AuthManager with an optional CodexAuth, for testing only.
     pub(crate) fn from_optional_auth_for_testing(auth: Option<CodexAuth>) -> Arc<Self> {
+        Self::from_optional_auth_for_testing_with_home(auth, PathBuf::from("non-existent"))
+    }
+
+    pub(crate) fn from_optional_auth_for_testing_with_home(
+        auth: Option<CodexAuth>,
+        auth_home: PathBuf,
+    ) -> Arc<Self> {
         let cached = CachedAuth {
             auth,
             permanent_refresh_failure: None,
@@ -2206,7 +2213,7 @@ impl AuthManager {
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
 
         Arc::new(Self {
-            auth_home: PathBuf::from("non-existent"),
+            auth_home,
             inner: RwLock::new(cached),
             auth_change_tx,
             enable_codex_api_key_env: false,
@@ -2228,30 +2235,7 @@ impl AuthManager {
 
     /// Create an AuthManager with a specific CodexAuth and codex home, for testing only.
     pub fn from_auth_for_testing_with_home(auth: CodexAuth, auth_home: PathBuf) -> Arc<Self> {
-        let cached = CachedAuth {
-            auth: Some(auth),
-            permanent_refresh_failure: None,
-        };
-        let (auth_change_tx, _auth_change_rx) = watch::channel(0);
-        Arc::new(Self {
-            auth_home,
-            inner: RwLock::new(cached),
-            auth_change_tx,
-            enable_codex_api_key_env: false,
-            auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-            keyring_backend_kind: AuthKeyringBackendKind::default(),
-            forced_login_method: None,
-            forced_chatgpt_workspace_id: RwLock::new(None),
-            managed_auth_policy: ManagedAuthPolicy::default(),
-            chatgpt_base_url: None,
-            agent_identity_authapi_base_url: default_agent_identity_authapi_base_url(),
-            refresh_lock: Semaphore::new(/*permits*/ 1),
-            agent_identity_lock: Semaphore::new(/*permits*/ 1),
-            agent_identity_bootstrap_cooldown: Mutex::default(),
-            external_auth: RwLock::new(None),
-            workload_identity_selected: false,
-            auth_route_config: crate::test_support::transport_default_auth_route_config(),
-        })
+        Self::from_optional_auth_for_testing_with_home(Some(auth), auth_home)
     }
 
     /// Create an AuthManager with a specific CodexAuth and Agent Identity AuthAPI base URL, for testing only.
@@ -2343,24 +2327,26 @@ impl AuthManager {
         })
     }
 
-    /// Current cached auth (clone). May be `None` if not logged in or load failed.
+    /// Current cached auth (clone). Returns `None` only when no auth is configured.
     /// For managed ChatGPT auth that needs a proactive refresh, first performs
     /// a guarded reload and then refreshes only if the on-disk auth is unchanged.
     #[instrument(level = "trace", skip_all)]
-    pub async fn auth(&self) -> Option<CodexAuth> {
+    pub async fn auth(&self) -> Result<Option<CodexAuth>, RefreshTokenError> {
         if self.has_external_auth() {
-            self.reload().await;
-            return self.auth_cached();
+            self.reload().await?;
+            return Ok(self.auth_cached());
         }
 
-        let auth = self.auth_cached()?;
+        let Some(auth) = self.auth_cached() else {
+            return Ok(None);
+        };
         if Self::should_refresh_proactively(&auth)
             && let Err(err) = self.refresh_token().await
         {
             tracing::error!("Failed to refresh token: {}", err);
-            return Some(auth);
+            return Ok(Some(auth));
         }
-        self.auth_cached()
+        Ok(self.auth_cached())
     }
 
     pub async fn agent_identity_auth(
@@ -2368,7 +2354,7 @@ impl AuthManager {
         policy: AgentIdentityAuthPolicy,
         session_source: SessionSource,
     ) -> std::io::Result<Option<AgentIdentityAuth>> {
-        let Some(auth) = self.auth().await else {
+        let Some(auth) = self.auth().await.map_err(std::io::Error::from)? else {
             return Ok(None);
         };
         if policy == AgentIdentityAuthPolicy::ChatGptAuth && matches!(auth, CodexAuth::Chatgpt(_)) {
@@ -2427,25 +2413,27 @@ impl AuthManager {
     }
 
     /// Reloads auth from the active source. Returns whether the auth value changed.
-    pub async fn reload(&self) -> bool {
+    ///
+    /// The cached value is left untouched when storage, policy, or external-provider loading fails.
+    pub async fn reload(&self) -> Result<bool, RefreshTokenError> {
         tracing::info!("Reloading auth");
-        let new_auth = self.load_auth().await;
-        self.set_cached_auth(new_auth)
+        let new_auth = self.load_auth().await?;
+        Ok(self.set_cached_auth(new_auth))
     }
 
     async fn reload_if_account_id_matches(
         &self,
         expected_account_id: Option<&str>,
-    ) -> ReloadOutcome {
+    ) -> Result<ReloadOutcome, RefreshTokenError> {
         let expected_account_id = match expected_account_id {
             Some(account_id) => account_id,
             None => {
                 tracing::info!("Skipping auth reload because no account id is available.");
-                return ReloadOutcome::Skipped;
+                return Ok(ReloadOutcome::Skipped);
             }
         };
 
-        let new_auth = self.load_auth().await;
+        let new_auth = self.load_auth().await?;
         let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
 
         if new_account_id.as_deref() != Some(expected_account_id) {
@@ -2453,7 +2441,7 @@ impl AuthManager {
             tracing::info!(
                 "Skipping auth reload due to account id mismatch (expected: {expected_account_id}, found: {found_account_id})"
             );
-            return ReloadOutcome::Skipped;
+            return Ok(ReloadOutcome::Skipped);
         }
 
         tracing::info!("Reloading auth for account {expected_account_id}");
@@ -2462,9 +2450,9 @@ impl AuthManager {
             !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
         self.set_cached_auth(new_auth);
         if auth_changed {
-            ReloadOutcome::ReloadedChanged
+            Ok(ReloadOutcome::ReloadedChanged)
         } else {
-            ReloadOutcome::ReloadedNoChange
+            Ok(ReloadOutcome::ReloadedNoChange)
         }
     }
 
@@ -2522,39 +2510,36 @@ impl AuthManager {
         }
     }
 
-    async fn load_auth(&self) -> Option<CodexAuth> {
+    async fn load_auth(&self) -> Result<Option<CodexAuth>, RefreshTokenError> {
         if let Some(external_auth) = self.external_auth_provider() {
             let cached_auth = self.auth_cached();
-            if cached_auth
+            if let Some(error) = cached_auth
                 .as_ref()
-                .is_some_and(|auth| self.refresh_failure_for_auth(auth).is_some())
+                .and_then(|auth| self.refresh_failure_for_auth(auth))
             {
-                return cached_auth;
+                return Err(RefreshTokenError::Permanent(error));
             }
             return match self.resolve_external_auth(external_auth.as_ref()).await {
-                Ok(auth) => Some(auth),
+                Ok(auth) => Ok(Some(auth)),
                 Err(err) => {
                     tracing::error!("Failed to resolve external auth: {err}");
-                    match err {
-                        RefreshTokenError::Permanent(error) => {
-                            if let Some(auth) = cached_auth.as_ref() {
-                                self.record_permanent_refresh_failure_if_unchanged(auth, &error);
-                            }
-                            cached_auth
-                        }
-                        RefreshTokenError::Transient(_) => None,
+                    if let RefreshTokenError::Permanent(error) = &err
+                        && let Some(auth) = cached_auth.as_ref()
+                    {
+                        self.record_permanent_refresh_failure_if_unchanged(auth, error);
                     }
+                    Err(err)
                 }
             };
         }
 
         let allowed_login_methods = self.allowed_login_methods();
         let effective_chatgpt_workspaces = self.effective_chatgpt_workspaces();
-        load_auth(
+        let auth = load_auth(
             &self.auth_home,
             self.enable_codex_api_key_env,
             self.auth_credentials_store_mode,
-            Some(&allowed_login_methods),
+            /*allowed_login_methods*/ None,
             effective_chatgpt_workspaces.as_deref(),
             self.chatgpt_base_url.as_deref(),
             self.keyring_backend_kind,
@@ -2562,16 +2547,16 @@ impl AuthManager {
             &self.auth_route_config,
         )
         .await
-        .ok()
-        .flatten()
-        .filter(|auth| {
+        .map_err(RefreshTokenError::Transient)?;
+        if let Some(auth) = auth.as_ref() {
             validate_auth_restrictions(
                 Some(&allowed_login_methods),
                 effective_chatgpt_workspaces.as_deref(),
                 auth,
             )
-            .is_ok()
-        })
+            .map_err(|error| RefreshTokenError::Transient(std::io::Error::other(error)))?;
+        }
+        Ok(auth)
     }
 
     fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool {
@@ -2837,7 +2822,7 @@ impl AuthManager {
 
         match self
             .reload_if_account_id_matches(expected_account_id.as_deref())
-            .await
+            .await?
         {
             ReloadOutcome::ReloadedChanged => {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
@@ -2911,7 +2896,7 @@ impl AuthManager {
         )?;
         // Always reload to clear any cached auth (even if file absent).
         self.clear_external_auth();
-        self.reload().await;
+        self.reload().await.map_err(std::io::Error::from)?;
         Ok(removed)
     }
 
@@ -2931,7 +2916,7 @@ impl AuthManager {
         )?;
         // Always reload to clear any cached auth (even if file absent).
         self.clear_external_auth();
-        self.reload().await;
+        self.reload().await.map_err(std::io::Error::from)?;
         Ok(result)
     }
 
@@ -3062,7 +3047,7 @@ impl AuthManager {
             refresh_response.refresh_token,
         )
         .map_err(RefreshTokenError::from)?;
-        self.reload().await;
+        self.reload().await?;
 
         Ok(())
     }

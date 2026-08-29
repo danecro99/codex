@@ -131,10 +131,10 @@ impl AmazonBedrockModelProvider {
             )
     }
 
-    async fn auth(&self) -> Option<CodexAuth> {
-        match self.auth_source() {
+    async fn auth(&self) -> Result<Option<CodexAuth>> {
+        Ok(match self.auth_source() {
             auth::BedrockAuthSource::CommandBearerToken => match self.auth_manager.as_ref() {
-                Some(auth_manager) => auth_manager.auth().await,
+                Some(auth_manager) => auth_manager.auth().await.map_err(std::io::Error::from)?,
                 None => None,
             },
             auth::BedrockAuthSource::ManagedBearerToken
@@ -143,7 +143,7 @@ impl AmazonBedrockModelProvider {
             | auth::BedrockAuthSource::EnvBearerToken
             | auth::BedrockAuthSource::EnvAwsCredentials
             | auth::BedrockAuthSource::AwsSdk => None,
-        }
+        })
     }
 
     async fn api_provider(&self) -> Result<Provider> {
@@ -173,7 +173,7 @@ impl AmazonBedrockModelProvider {
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
         let source = self.auth_source();
         if source == auth::BedrockAuthSource::CommandBearerToken {
-            let auth = self.auth().await;
+            let auth = self.auth().await?;
             return resolve_configured_provider_auth(auth.as_ref(), &self.info);
         }
 
@@ -267,7 +267,7 @@ impl ModelProvider for AmazonBedrockModelProvider {
         })
     }
 
-    fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
+    fn auth(&self) -> ModelProviderFuture<'_, Result<Option<CodexAuth>>> {
         Box::pin(AmazonBedrockModelProvider::auth(self))
     }
 
@@ -457,7 +457,7 @@ mod tests {
             &auth_manager,
         ));
         assert_eq!(
-            provider.auth().await,
+            provider.auth().await.expect("auth should load"),
             Some(CodexAuth::BedrockApiKey(managed_auth))
         );
         assert_eq!(
@@ -505,7 +505,13 @@ mod tests {
             );
 
             assert!(configured_profile_provider.auth_manager().is_none());
-            assert_eq!(configured_profile_provider.auth().await, None);
+            assert_eq!(
+                configured_profile_provider
+                    .auth()
+                    .await
+                    .expect("auth should load"),
+                None
+            );
             assert_eq!(
                 configured_profile_provider.account_state(),
                 Ok(ProviderAccountState {
@@ -545,7 +551,7 @@ mod tests {
         );
 
         assert!(provider.auth_manager().is_none());
-        assert_eq!(provider.auth().await, None);
+        assert_eq!(provider.auth().await.expect("auth should load"), None);
         assert_eq!(
             provider.account_state(),
             Ok(ProviderAccountState {

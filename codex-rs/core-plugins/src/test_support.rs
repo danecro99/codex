@@ -29,7 +29,7 @@ use codex_login::ExternalAuthFuture;
 use codex_login::ExternalAuthRefreshContext;
 use codex_login::auth::BedrockAccessKeysAuth;
 use codex_login::auth::BedrockApiKeyAuth;
-use codex_login::test_support::auth_manager_from_optional_auth;
+use codex_login::test_support::auth_manager_from_optional_auth_with_home;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
@@ -86,7 +86,8 @@ pub(crate) fn test_plugins_manager_with_auth_manager(
 }
 
 pub(crate) fn test_auth_manager(auth_mode: Option<AuthMode>) -> Arc<AuthManager> {
-    auth_manager_from_optional_auth(test_codex_auth(auth_mode))
+    let auth_home = tempfile::tempdir().expect("test auth home").keep();
+    auth_manager_from_optional_auth_with_home(test_codex_auth(auth_mode), auth_home)
 }
 
 pub(crate) async fn set_test_auth_mode(auth_manager: &AuthManager, auth_mode: Option<AuthMode>) {

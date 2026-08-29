@@ -59,16 +59,21 @@ impl OpenAiModelsEndpoint {
         }
     }
 
-    async fn auth(&self) -> Option<CodexAuth> {
+    async fn auth(&self) -> CoreResult<Option<CodexAuth>> {
         match self.auth_manager.as_ref() {
-            Some(auth_manager) => auth_manager.auth().await,
-            None => None,
+            Some(auth_manager) => auth_manager
+                .auth()
+                .await
+                .map_err(std::io::Error::from)
+                .map_err(CodexErr::from),
+            None => Ok(None),
         }
     }
 
     async fn uses_codex_backend(&self) -> bool {
-        self.auth()
-            .await
+        self.auth_manager
+            .as_ref()
+            .and_then(|auth_manager| auth_manager.auth_cached())
             .as_ref()
             .is_some_and(CodexAuth::uses_codex_backend)
     }
@@ -80,7 +85,7 @@ impl OpenAiModelsEndpoint {
     ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
-        let auth = self.auth().await;
+        let auth = self.auth().await?;
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
         let mut api_provider = self.provider_info.to_api_provider(auth_mode)?;
         enforce_managed_residency(&mut api_provider);

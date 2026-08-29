@@ -335,9 +335,9 @@ impl PreparedMcpCall {
                     .await
                     .map_err(|_| {
                         anyhow::anyhow!("timed out awaiting tools/call after {timeout:.0?}")
-                    })?
+                    })??
             }
-            None => add_trusted_access_context.await,
+            None => add_trusted_access_context.await?,
         };
         let remaining_timeout = match effective_timeout.zip(timeout_deadline) {
             Some((timeout, deadline)) => {

@@ -384,7 +384,11 @@ impl WorkerRuntime {
     ) -> Result<Option<Vec<ApiKeyTurnCost>>, RequestError> {
         match &self.backend {
             TurnCostBackend::OpenAiApiKey(auth_manager) => {
-                let Some(auth) = auth_manager.auth().await else {
+                let Some(auth) = auth_manager
+                    .auth()
+                    .await
+                    .map_err(|error| RequestError::Other(std::io::Error::from(error).into()))?
+                else {
                     return Ok(None);
                 };
                 if !auth.is_api_key_auth() {
@@ -407,7 +411,11 @@ impl WorkerRuntime {
             }
             TurnCostBackend::ModelProvider(model_provider) => {
                 if model_provider.info().requires_openai_auth {
-                    let Some(auth) = model_provider.auth().await else {
+                    let Some(auth) = model_provider
+                        .auth()
+                        .await
+                        .map_err(|error| RequestError::Other(error.into()))?
+                    else {
                         return Ok(None);
                     };
                     if !auth.is_api_key_auth() {

@@ -532,7 +532,11 @@ async fn chatgpt_auth_manager(
     )
     .await
     .expect("auth manager should initialize");
-    let auth = auth_manager.auth().await.expect("auth should load");
+    let auth = auth_manager
+        .auth()
+        .await
+        .expect("auth should load")
+        .expect("auth should be configured");
     AuthManager::from_auth_for_testing_with_agent_identity_authapi_base_url(
         auth,
         agent_identity_authapi_base_url,
@@ -924,7 +928,7 @@ impl ModelProvider for TestRecoveryProvider {
         None
     }
 
-    fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
+    fn auth(&self) -> ModelProviderFuture<'_, codex_protocol::error::Result<Option<CodexAuth>>> {
         self.inner.auth()
     }
 

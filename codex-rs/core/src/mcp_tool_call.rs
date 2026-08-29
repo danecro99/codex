@@ -763,7 +763,13 @@ async fn refresh_codex_apps_after_connector_auth(sess: &Arc<Session>, turn_conte
 
     match mcp_tools_result {
         Ok(mcp_tools) => {
-            let auth = sess.services.auth_manager.auth().await;
+            let auth = match sess.services.auth_manager.auth().await {
+                Ok(auth) => auth,
+                Err(error) => {
+                    tracing::error!(%error, "failed to load auth after connector authentication");
+                    return;
+                }
+            };
             connectors::refresh_accessible_connectors_cache_from_mcp_tools(
                 &turn_context.config,
                 auth.as_ref(),

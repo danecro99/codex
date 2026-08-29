@@ -957,6 +957,8 @@ impl Session {
         let (thread_persistence_result, state_db_ctx, (auth, mcp_projection)) =
             tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
 
+        let auth = auth.map_err(std::io::Error::from)?;
+
         let mut live_thread_init =
             LiveThreadInitGuard::new(thread_persistence_result.map_err(|e| {
                 error!("failed to initialize thread persistence: {e:#}");
@@ -1511,7 +1513,12 @@ impl Session {
             if startup_auth_changed {
                 mcp_auth_changes.mark_unchanged();
             }
-            let latest_auth = sess.services.auth_manager.auth().await;
+            let latest_auth = sess
+                .services
+                .auth_manager
+                .auth()
+                .await
+                .map_err(std::io::Error::from)?;
             let mcp_projection = if startup_auth_changed
                 || mcp_auth_changes.has_changed().unwrap_or(false)
             {

@@ -13,6 +13,8 @@ use crate::reverse_jsonl_scanner::MAX_ROLLOUT_LINE_BYTES;
 
 /// Maximum number of durable rollout items admitted to a resumed model context.
 pub const MODEL_CONTEXT_MAX_ITEMS: usize = 16 * 1024;
+/// Maximum estimated model tokens admitted from one durable rollout item.
+pub const MODEL_CONTEXT_MAX_ITEM_TOKENS: usize = 10_000;
 /// Maximum serialized bytes admitted to a resumed model context.
 pub const MODEL_CONTEXT_MAX_BYTES: usize = MAX_ROLLOUT_LINE_BYTES;
 /// Maximum estimated model tokens admitted to a resumed model context.
@@ -187,6 +189,13 @@ impl ModelContextScan {
             .map_err(|err| ModelContextScanError::Serialization(err.to_string()))?
             .len();
         let item_tokens = TruncationPolicy::Bytes(item_bytes).token_budget();
+        if item_tokens > MODEL_CONTEXT_MAX_ITEM_TOKENS {
+            return Err(ModelContextScanError::LimitExceeded {
+                dimension: "item token",
+                actual: item_tokens,
+                maximum: MODEL_CONTEXT_MAX_ITEM_TOKENS,
+            });
+        }
         let items = self.items_newest_first.len().saturating_add(1);
         let serialized_bytes = self.serialized_bytes.saturating_add(item_bytes);
         let estimated_tokens = self.estimated_tokens.saturating_add(item_tokens);

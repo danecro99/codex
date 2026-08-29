@@ -163,14 +163,17 @@ async fn refresh_token_honors_respect_system_proxy() -> Result<()> {
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
     )?;
-    auth_manager.reload().await;
+    auth_manager.reload().await?;
 
     auth_manager
         .refresh_token_from_authority()
         .await
         .context("refresh should succeed through the configured proxy")?;
 
-    let refreshed_auth = auth_manager.auth().await.context("auth should be cached")?;
+    let refreshed_auth = auth_manager
+        .auth()
+        .await?
+        .context("auth should be cached")?;
     let expected_tokens = TokenData {
         access_token: "new-access-token".to_string(),
         refresh_token: "new-refresh-token".to_string(),
@@ -248,7 +251,7 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should be cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -315,7 +318,7 @@ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should be cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -457,7 +460,7 @@ async fn auth_refreshes_when_access_token_is_near_expiry() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should be cached")?;
 
     let refreshed_tokens = TokenData {
@@ -510,7 +513,7 @@ async fn auth_skips_access_token_outside_refresh_window() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should be cached")?;
 
     let cached = cached_auth
@@ -698,7 +701,7 @@ async fn returns_fresh_tokens_as_is() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should be cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -749,7 +752,7 @@ async fn refreshes_token_when_access_token_is_expired() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should be cached")?;
     let refreshed_tokens = TokenData {
         access_token: "new-access-token".to_string(),
@@ -821,7 +824,7 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should reload from disk")?;
     let cached = cached_auth
         .get_token_data()
@@ -891,7 +894,7 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should reload from disk")?;
     let cached = cached_auth
         .get_token_data()
@@ -950,7 +953,7 @@ async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Re
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should remain cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -1020,7 +1023,7 @@ async fn refresh_token_does_not_retry_after_permanent_failure() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should remain cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -1090,7 +1093,7 @@ async fn refresh_token_does_not_retry_after_bad_request_reused_failure() -> Resu
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should remain cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -1158,7 +1161,7 @@ async fn refresh_token_does_not_retry_after_standard_invalid_grant_failure() -> 
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should remain cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -1222,7 +1225,7 @@ async fn refresh_token_does_not_cache_other_bad_request_failure() -> Result<()> 
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should remain cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -1367,7 +1370,7 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
+        .await?
         .context("auth should remain cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -1467,8 +1470,8 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth()
-        .await
-        .expect("auth should be cached");
+        .await?
+        .context("auth should be cached")?;
     let cached_tokens = cached_auth
         .get_token_data()
         .context("token data should be cached")?;
@@ -1651,7 +1654,7 @@ impl RefreshTokenTestContext {
             AuthCredentialsStoreMode::File,
             AuthKeyringBackendKind::default(),
         )?;
-        self.auth_manager.reload().await;
+        self.auth_manager.reload().await?;
         Ok(())
     }
 }

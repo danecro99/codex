@@ -122,7 +122,13 @@ pub async fn list_cached_accessible_connectors_from_mcp_tools(
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
             .await
             .ok()?;
-    let auth = auth_manager.auth().await;
+    let auth = match auth_manager.auth().await {
+        Ok(auth) => auth,
+        Err(error) => {
+            tracing::error!(%error, "failed to load auth for cached accessible connectors");
+            return None;
+        }
+    };
     if !config
         .features
         .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
@@ -212,7 +218,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
-    let auth = auth_manager.auth().await;
+    let auth = auth_manager.auth().await?;
     if !config
         .features
         .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
@@ -436,7 +442,13 @@ async fn cached_directory_connectors_for_tool_suggest_with_auth(
         else {
             return Vec::new();
         };
-        loaded_auth = auth_manager.auth().await;
+        loaded_auth = match auth_manager.auth().await {
+            Ok(auth) => auth,
+            Err(error) => {
+                tracing::error!(%error, "failed to load auth for cached connector directory");
+                return Vec::new();
+            }
+        };
         loaded_auth.as_ref()
     };
     let Some(auth) = auth.filter(|auth| auth.uses_codex_backend()) else {

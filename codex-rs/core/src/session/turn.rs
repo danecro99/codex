@@ -1470,7 +1470,7 @@ pub(crate) struct PreparedToolRecommendations {
 pub(crate) async fn prepare_tool_recommendations(
     sess: &Session,
     turn_context: &TurnContext,
-) -> PreparedToolRecommendations {
+) -> Result<PreparedToolRecommendations, codex_login::RefreshTokenError> {
     let loaded_plugins = sess
         .services
         .plugins_manager
@@ -1479,7 +1479,7 @@ pub(crate) async fn prepare_tool_recommendations(
         .await;
     let tool_suggest_is_enabled = tool_suggest_enabled(turn_context);
     let auth = if tool_suggest_is_enabled {
-        sess.services.auth_manager.auth().await
+        sess.services.auth_manager.auth().await?
     } else {
         None
     };
@@ -1499,10 +1499,10 @@ pub(crate) async fn prepare_tool_recommendations(
         None
     };
 
-    PreparedToolRecommendations {
+    Ok(PreparedToolRecommendations {
         auth,
         endpoint_candidates,
-    }
+    })
 }
 
 #[instrument(level = "trace",

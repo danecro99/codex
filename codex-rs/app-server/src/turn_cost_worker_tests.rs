@@ -143,7 +143,7 @@ async fn worker_waits_for_late_api_key_login() {
         AuthKeyringBackendKind::default(),
     )
     .expect("write API-key auth");
-    assert!(auth_manager.reload().await);
+    assert!(auth_manager.reload().await.expect("auth should reload"));
     wait_for_request_count(&server, /*expected*/ 1).await;
 
     shutdown.cancel();
@@ -212,7 +212,10 @@ async fn custom_provider_auth_failure_retries_without_auth_changes() {
         AuthKeyringBackendKind::default(),
     )
     .expect("update provider auth");
-    provider_auth_manager.reload().await;
+    provider_auth_manager
+        .reload()
+        .await
+        .expect("auth should reload");
     assert_eq!(runtime.probe_backend().await, BackendAvailability::Ready);
 
     server.verify().await;

@@ -229,7 +229,7 @@ impl LunaSampler {
         }
     }
 
-    async fn responses_endpoint(&self) -> ResponsesEndpoint {
+    async fn responses_endpoint(&self) -> Result<ResponsesEndpoint, LunaSamplerError> {
         let provider = self.config.provider.info();
         if self.config.free_guardian
             && self
@@ -237,6 +237,7 @@ impl LunaSampler {
                 .provider
                 .auth()
                 .await
+                .map_err(LunaSamplerError::Provider)?
                 .as_ref()
                 .is_some_and(CodexAuth::uses_codex_backend)
             && provider.supports_codex_backend_routes()
@@ -246,9 +247,9 @@ impl LunaSampler {
             && provider.auth.is_none()
             && provider.aws.is_none()
         {
-            ResponsesEndpoint::GuardianClassifier
+            Ok(ResponsesEndpoint::GuardianClassifier)
         } else {
-            ResponsesEndpoint::Responses
+            Ok(ResponsesEndpoint::Responses)
         }
     }
 
@@ -302,7 +303,7 @@ impl LunaSampler {
         }
 
         let provider_info = self.config.provider.info();
-        let endpoint = self.responses_endpoint().await;
+        let endpoint = self.responses_endpoint().await?;
         let client = ResponsesWebsocketClient::new(provider, auth).with_endpoint(endpoint);
         let connect = client.connect(
             &self.config.http_client_factory,

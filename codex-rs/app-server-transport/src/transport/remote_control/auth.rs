@@ -39,14 +39,14 @@ pub(super) async fn load_remote_control_auth(
 ) -> io::Result<RemoteControlConnectionAuth> {
     let mut reloaded = false;
     let auth = loop {
-        let Some(auth) = auth_manager.auth().await else {
+        let Some(auth) = auth_manager.auth().await.map_err(io::Error::from)? else {
             if reloaded {
                 return Err(io::Error::new(
                     ErrorKind::PermissionDenied,
                     "remote control requires ChatGPT authentication",
                 ));
             }
-            auth_manager.reload().await;
+            auth_manager.reload().await.map_err(io::Error::from)?;
             reloaded = true;
             continue;
         };
@@ -54,7 +54,7 @@ pub(super) async fn load_remote_control_auth(
             break auth;
         }
         if auth.get_account_id().is_none() && !reloaded {
-            auth_manager.reload().await;
+            auth_manager.reload().await.map_err(io::Error::from)?;
             reloaded = true;
             continue;
         }

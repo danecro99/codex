@@ -50,7 +50,11 @@ impl PluginRequestProcessor {
         }
         let plugin_sharing_enabled = config.features.enabled(Feature::PluginSharing);
 
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
         let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
         let remote_plugin_enabled = config.features.enabled(Feature::RemotePlugin);
         let use_remote_global_catalog =

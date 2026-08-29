@@ -2373,7 +2373,16 @@ async fn websocket_reachability_check(
     ));
 
     let runtime_provider = create_model_provider(provider.clone(), auth_manager);
-    let auth = runtime_provider.auth().await;
+    let auth = match runtime_provider.auth().await {
+        Ok(auth) => auth,
+        Err(error) => {
+            return websocket_probe_warning(
+                "Responses WebSocket auth setup failed",
+                details,
+                format!("failed to load auth: {error}"),
+            );
+        }
+    };
     details.push(format!(
         "auth mode: {}",
         auth.as_ref().map(auth_mode_name).unwrap_or("none")

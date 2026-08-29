@@ -1045,7 +1045,12 @@ enabled = true
                     codex_login::AuthCredentialsStoreMode::File,
                     codex_login::AuthKeyringBackendKind::default(),
                 )?;
-                test_codex.thread_manager.auth_manager().reload().await;
+                test_codex
+                    .thread_manager
+                    .auth_manager()
+                    .reload()
+                    .await
+                    .expect("auth should reload");
                 Some(AuthMode::ApiKey)
             }
             TargetAuth::BedrockApiKey => {
@@ -1056,7 +1061,12 @@ enabled = true
                     codex_login::AuthCredentialsStoreMode::File,
                     codex_login::AuthKeyringBackendKind::default(),
                 )?;
-                test_codex.thread_manager.auth_manager().reload().await;
+                test_codex
+                    .thread_manager
+                    .auth_manager()
+                    .reload()
+                    .await
+                    .expect("auth should reload");
                 Some(AuthMode::BedrockApiKey)
             }
             TargetAuth::NoCodexAuth => {

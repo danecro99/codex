@@ -267,7 +267,7 @@ async fn run_remote_compact_task_inner_impl(
     } = attempt;
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let (new_history, world_state_baseline) =
-        process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await;
+        process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await?;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -312,21 +312,21 @@ pub(crate) async fn process_compacted_history(
     sess: &Session,
     compacted_history: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+) -> CodexResult<(Vec<ResponseItem>, Option<Arc<WorldState>>)> {
     let compacted_history = compacted_history
         .into_iter()
         .map(ResponseItemEnvelope::new)
         .collect();
     let (compacted_history, world_state_baseline) =
         process_annotated_compacted_history(sess, compacted_history, initial_context_injection)
-            .await;
-    (
+            .await?;
+    Ok((
         compacted_history
             .into_iter()
             .map(ResponseItemEnvelope::into_item)
             .collect(),
         world_state_baseline,
-    )
+    ))
 }
 
 /// Installs already-annotated remote compaction output without dropping its metadata sidecar.
@@ -334,21 +334,21 @@ pub(crate) async fn process_annotated_compacted_history(
     sess: &Session,
     compacted_history: Vec<ResponseItemEnvelope>,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>) {
+) -> CodexResult<(Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>)> {
     // Mid-turn compaction is the only path that must inject initial context above the last user
     // message in the replacement history. Pre-turn compaction instead injects context after the
     // compaction item, but mid-turn compaction keeps the compaction item last for model training.
     let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(sess, initial_context_injection).await;
+        build_compaction_initial_context(sess, initial_context_injection).await?;
 
     let compacted_history = history_item_groups(compacted_history)
         .filter(|group| should_keep_compacted_history_item(&group.source.item))
         .flat_map(HistoryItemGroup::into_items)
         .collect();
-    (
+    Ok((
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context),
         world_state_baseline,
-    )
+    ))
 }
 
 /// Returns whether an item from remote compaction output should be preserved.

@@ -1959,7 +1959,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         AuthKeyringBackendKind::default(),
     )
     .expect("auth with account id should save");
-    auth_manager.reload().await;
+    auth_manager.reload().await.expect("auth should reload");
 
     let enroll_request = timeout(Duration::from_millis(100), accept_http_request(&listener))
         .await
@@ -2080,7 +2080,7 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
         AuthKeyringBackendKind::default(),
     )
     .expect("account B auth should save");
-    auth_manager.reload().await;
+    auth_manager.reload().await.expect("auth should reload");
     websocket
         .close(None)
         .await

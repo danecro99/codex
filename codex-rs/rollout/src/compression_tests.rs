@@ -86,6 +86,47 @@ async fn read_session_meta_line_stops_before_invalid_utf8_compressed_tail() -> a
 }
 
 #[tokio::test]
+async fn read_session_meta_line_rejects_oversized_head_before_deserialization() -> anyhow::Result<()>
+{
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(19);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    let oversized = RolloutLine {
+        timestamp: "2025-01-03T12:00:00Z".to_string(),
+        ordinal: None,
+        item: RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: thread_id,
+                session_id: thread_id.into(),
+                originator: "x".repeat(crate::MAX_ROLLOUT_LINE_BYTES),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+    };
+    let serialized = serde_json::to_vec(&oversized)?;
+    assert!(serialized.len() > crate::MAX_ROLLOUT_LINE_BYTES);
+    fs::create_dir_all(rollout_path.parent().expect("rollout parent"))?;
+    fs::write(&rollout_path, serialized)?;
+
+    let error = read_session_meta_line(&rollout_path)
+        .await
+        .expect_err("oversized session metadata must fail at the line reader");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "rollout record exceeds the byte limit: {} > {}",
+            crate::MAX_ROLLOUT_LINE_BYTES + 1,
+            crate::MAX_ROLLOUT_LINE_BYTES
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn read_session_meta_line_preserves_pre_header_and_error_semantics() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let uuid = Uuid::from_u128(18);
