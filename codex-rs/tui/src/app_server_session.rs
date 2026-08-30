@@ -1909,8 +1909,14 @@ fn thread_resume_params_from_config(
     model_settings: ResumeModelSettings,
 ) -> ThreadResumeParams {
     if model_settings == ResumeModelSettings::PreserveExistingThread {
+        let mcp_config = config_request_overrides_from_config(&config).and_then(|mut overrides| {
+            overrides
+                .remove("mcp_servers")
+                .map(|mcp_servers| HashMap::from([("mcp_servers".to_string(), mcp_servers)]))
+        });
         return ThreadResumeParams {
             thread_id: thread_id.to_string(),
+            config: mcp_config,
             ..ThreadResumeParams::default()
         };
     }
@@ -3255,15 +3261,37 @@ approval_mode = "approve"
     }
 
     #[tokio::test]
-    async fn thread_resume_params_can_rejoin_without_overriding_existing_settings() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config = build_config(&temp_dir).await;
+    async fn remote_thread_resume_preserve_forwards_only_session_mcp_servers() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let mcp_servers = toml::Value::Table(toml::from_str(
+            r#"
+["runtime.tools-v1"]
+command = "/Applications/Life of Markus/bin/runtime-mcp"
+args = ["--stdio"]
+required = true
+"#,
+        )?);
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .cli_overrides(vec![
+                (
+                    "features.multi_agent_mode".to_string(),
+                    toml::Value::Boolean(true),
+                ),
+                ("mcp_servers".to_string(), mcp_servers.clone()),
+                (
+                    "model_reasoning_effort".to_string(),
+                    toml::Value::String("high".to_string()),
+                ),
+            ])
+            .build()
+            .await?;
         let thread_id = ThreadId::new();
 
         let params = thread_resume_params_from_config(
             config,
             thread_id,
-            ThreadParamsMode::Embedded,
+            ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
             ResumeModelSettings::PreserveExistingThread,
         );
@@ -3272,9 +3300,14 @@ approval_mode = "approve"
             params,
             ThreadResumeParams {
                 thread_id: thread_id.to_string(),
+                config: Some(HashMap::from([(
+                    "mcp_servers".to_string(),
+                    serde_json::to_value(mcp_servers)?,
+                )])),
                 ..ThreadResumeParams::default()
             }
         );
+        Ok(())
     }
 
     #[tokio::test]
