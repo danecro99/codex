@@ -1705,6 +1705,7 @@ fn config_request_overrides_from_config(
                 "allow_login_shell"
                     | "default_permissions"
                     | "features"
+                    | "mcp_servers"
                     | "network"
                     | "permissions"
                     | "sandbox_workspace_write"
@@ -2657,6 +2658,58 @@ mod tests {
             );
             app_server.shutdown().await?;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_thread_start_and_resume_forward_session_mcp_servers_exactly() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let mcp_servers = toml::Value::Table(toml::from_str(
+            r#"
+["runtime.tools-v1"]
+command = "/Applications/Life of Markus/bin/runtime-mcp"
+args = ["--stdio"]
+required = true
+
+["runtime.tools-v1".tools."document.status"]
+approval_mode = "approve"
+"#,
+        )?);
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .cli_overrides(vec![("mcp_servers".to_string(), mcp_servers.clone())])
+            .build()
+            .await?;
+        let thread_id = ThreadId::new();
+
+        let start = thread_start_params_from_config(
+            &config,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+            /*session_start_source*/ None,
+        );
+        let resume = thread_resume_params_from_config(
+            config,
+            thread_id,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+            ResumeModelSettings::RestoreFromThread,
+        );
+        let expected = serde_json::to_value(mcp_servers)?;
+
+        assert_eq!(
+            (
+                start
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.get("mcp_servers")),
+                resume
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.get("mcp_servers")),
+            ),
+            (Some(&expected), Some(&expected)),
+        );
         Ok(())
     }
 
