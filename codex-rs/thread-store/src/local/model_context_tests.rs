@@ -14,8 +14,11 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -357,6 +360,42 @@ async fn loads_bounded_paginated_history_from_its_durable_origin() {
             ResponseItem::Message { role, .. } if role == "user"
         ))
     }));
+}
+
+#[tokio::test]
+async fn resumes_fresh_written_rollout_with_floating_point_rate_limits() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1015);
+    let items = [
+        turn_started("turn-1"),
+        user_message("fresh turn"),
+        completed_user_message("turn-1", "fresh turn"),
+        turn_context(home.path(), "turn-1"),
+        floating_point_token_count(),
+        turn_complete("turn-1"),
+    ];
+    let path = write_paginated_rollout(home.path(), "2025-01-03T13-00-13", uuid, items.clone());
+    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .expect("read session metadata");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadModelContextParams {
+            thread_id: session_meta.meta.id,
+            include_archived: false,
+            rollout_path: Some(path),
+        })
+        .await
+        .expect("fresh-written rollout should resume");
+
+    let expected = std::iter::once(RolloutItem::SessionMeta(session_meta))
+        .chain(items)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(context.items).expect("serialize resumed context"),
+        serde_json::to_value(expected).expect("serialize expected context")
+    );
 }
 
 #[tokio::test]
@@ -839,6 +878,27 @@ fn turn_complete(turn_id: &str) -> RolloutItem {
         completed_at: None,
         duration_ms: None,
         time_to_first_token_ms: None,
+    }))
+}
+
+fn floating_point_token_count() -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+        info: None,
+        rate_limits: Some(RateLimitSnapshot {
+            limit_id: None,
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 42.0,
+                window_minutes: Some(10_080),
+                resets_at: Some(1_788_643_388),
+            }),
+            secondary: None,
+            credits: None,
+            individual_limit: None,
+            spend_control_reached: None,
+            plan_type: None,
+            rate_limit_reached_type: None,
+        }),
     }))
 }
 

@@ -10,7 +10,6 @@ use codex_rollout::ModelContextScan;
 use codex_rollout::ModelContextScanProgress;
 use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::RolloutItem;
-use codex_rollout::RolloutLine;
 use codex_rollout::ScanOutcome;
 
 use super::LocalThreadStore;
@@ -258,7 +257,7 @@ fn scan_model_context_from_segments_blocking(
             None => ReverseJsonlScanner::new(file)?,
         }
         .with_strict_max_record_bytes(MODEL_CONTEXT_MAX_BYTES);
-        while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
+        while let Some(outcome) = scanner.scan_next_rollout_line()? {
             let line = match outcome {
                 ScanOutcome::Parsed(line) => line,
                 ScanOutcome::Rejected(err) => {
