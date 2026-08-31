@@ -160,7 +160,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
 
 #[tokio::test]
-async fn legacy_exclude_turns_resume_sends_only_the_bounded_checkpoint_suffix() -> Result<()> {
+async fn legacy_exclude_turns_resume_accepts_large_compacted_replacement_history() -> Result<()> {
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
         &server,
@@ -182,7 +182,26 @@ async fn legacy_exclude_turns_resume_sends_only_the_bounded_checkpoint_suffix() 
         /*git_info*/ None,
     )?;
     let path = rollout_path(codex_home.path(), "2025-01-05T11-59-57", &thread_id);
-    append_legacy_resume_checkpoint(&path, "bounded suffix must remain").await?;
+    let replacement_texts = (0..69)
+        .map(|index| format!("replacement-{index:02}:{}", "x".repeat(900)))
+        .collect::<Vec<_>>();
+    let replacement_history = replacement_texts
+        .iter()
+        .map(|text| legacy_user_response(text))
+        .collect::<Vec<_>>();
+    assert_eq!(replacement_history.len(), 69);
+    assert!(replacement_history.iter().all(|item| {
+        let item_bytes = serde_json::to_vec(item).expect("serialize replacement history item");
+        codex_protocol::protocol::TruncationPolicy::Bytes(item_bytes.len()).token_budget()
+            < codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS
+    }));
+    let compacted = legacy_resume_compacted_item(replacement_history.clone());
+    let compacted_bytes = serde_json::to_vec(&compacted).expect("serialize compacted rollout item");
+    assert!(
+        codex_protocol::protocol::TruncationPolicy::Bytes(compacted_bytes.len()).token_budget()
+            > codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS
+    );
+    append_legacy_resume_checkpoint(&path, replacement_history).await?;
 
     let mut app = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -215,10 +234,9 @@ async fn legacy_exclude_turns_resume_sends_only_the_bounded_checkpoint_suffix() 
 
     let user_texts = response_mock.single_request().message_input_texts("user");
     assert!(
-        user_texts
+        replacement_texts
             .iter()
-            .any(|text| text == "bounded suffix must remain"),
-        "bounded checkpoint suffix missing from model request: {user_texts:?}"
+            .all(|expected| user_texts.iter().any(|actual| actual == expected))
     );
     assert!(
         user_texts.iter().any(|text| text == "new turn"),
@@ -277,7 +295,7 @@ async fn legacy_exclude_turns_resume_rejects_missing_safe_cutoff() -> Result<()>
 }
 
 #[tokio::test]
-async fn legacy_exclude_turns_resume_rejects_model_context_overflow() -> Result<()> {
+async fn legacy_exclude_turns_resume_rejects_single_model_visible_item_overflow() -> Result<()> {
     let server = responses::start_mock_server().await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
@@ -290,8 +308,8 @@ async fn legacy_exclude_turns_resume_rejects_model_context_overflow() -> Result<
         /*git_info*/ None,
     )?;
     let path = rollout_path(codex_home.path(), "2025-01-05T11-59-59", &thread_id);
-    let oversized_suffix = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_TOKENS * 4 + 1);
-    append_legacy_resume_checkpoint(&path, &oversized_suffix).await?;
+    let oversized_suffix = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS * 4 + 1);
+    append_legacy_resume_checkpoint(&path, vec![legacy_user_response(&oversized_suffix)]).await?;
     let mut app = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -319,7 +337,10 @@ async fn legacy_exclude_turns_resume_rejects_model_context_overflow() -> Result<
     Ok(())
 }
 
-async fn append_legacy_resume_checkpoint(path: &Path, replacement: &str) -> Result<()> {
+async fn append_legacy_resume_checkpoint(
+    path: &Path,
+    replacement_history: Vec<ResponseItem>,
+) -> Result<()> {
     let turn_id = "checkpoint-turn";
     let items = [
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
@@ -357,15 +378,7 @@ async fn append_legacy_resume_checkpoint(path: &Path, replacement: &str) -> Resu
             effort: None,
             summary: ReasoningSummary::Auto,
         }),
-        RolloutItem::Compacted(CompactedItem {
-            message: "bounded checkpoint".to_string(),
-            replacement_history: Some(vec![legacy_user_response(replacement).into()]),
-            mcp_resource_origins: None,
-            window_number: Some(1),
-            first_window_id: None,
-            previous_window_id: None,
-            window_id: None,
-        }),
+        legacy_resume_compacted_item(replacement_history),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: turn_id.to_string(),
             last_agent_message: None,
@@ -380,6 +393,18 @@ async fn append_legacy_resume_checkpoint(path: &Path, replacement: &str) -> Resu
         append_rollout_item_to_path(path, &item).await?;
     }
     Ok(())
+}
+
+fn legacy_resume_compacted_item(replacement_history: Vec<ResponseItem>) -> RolloutItem {
+    RolloutItem::Compacted(CompactedItem {
+        message: "bounded checkpoint".to_string(),
+        replacement_history: Some(replacement_history.into_iter().map(Into::into).collect()),
+        mcp_resource_origins: None,
+        window_number: Some(1),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    })
 }
 
 fn legacy_user_response(text: &str) -> ResponseItem {
