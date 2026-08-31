@@ -117,7 +117,6 @@ pub use metadata::builder_from_items;
 pub use metadata::forked_from_ordinal_exclusive;
 pub use metadata::rollout_id_from_path;
 pub use model_context::MODEL_CONTEXT_MAX_BYTES;
-pub use model_context::MODEL_CONTEXT_MAX_ITEM_TOKENS;
 pub use model_context::MODEL_CONTEXT_MAX_ITEMS;
 pub use model_context::MODEL_CONTEXT_MAX_TOKENS;
 pub use model_context::ModelContextScan;

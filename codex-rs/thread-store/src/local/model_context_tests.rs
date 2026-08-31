@@ -415,57 +415,27 @@ async fn rejects_model_context_over_the_token_limit() {
             turn_complete("turn-1"),
         ],
     );
-    let bounded_message = "x".repeat((codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS - 1_000) * 4);
-    append_repeated_item(
-        path.as_path(),
-        user_message(&bounded_message),
-        codex_rollout::MODEL_CONTEXT_MAX_TOKENS
-            / (codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS - 1_000)
-            + 2,
-    );
+    let oversized_message = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_TOKENS * 4 + 1);
+    append_repeated_item(path.as_path(), user_message(&oversized_message), 1);
 
     assert_model_context_scan_fails(home.path(), path.as_path(), "exceeds the token limit").await;
 }
 
 #[tokio::test]
-async fn rejects_single_model_context_item_over_the_token_limit() {
+async fn loads_model_context_with_a_large_single_item_below_the_aggregate_limit() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1017);
-    let oversized_message = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS * 4 + 1);
-    let path = write_legacy_rollout(
-        home.path(),
-        "2025-01-03T13-00-15",
-        uuid,
-        [
-            turn_started("turn-1"),
-            user_message("turn"),
-            legacy_user_message_event("turn"),
-            turn_context(home.path(), "turn-1"),
-            compacted("checkpoint", Some(Vec::new())),
-            turn_complete("turn-1"),
-            user_message(&oversized_message),
-        ],
-    );
-
-    assert_model_context_scan_fails(home.path(), path.as_path(), "exceeds the item token limit")
-        .await;
-}
-
-#[tokio::test]
-async fn loads_compacted_context_after_scanning_replaced_oversized_item() {
-    let home = TempDir::new().expect("temp dir");
-    let uuid = Uuid::from_u128(/*v*/ 1018);
-    let oversized_message = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS * 4 + 1);
+    let large_message = "x".repeat(50_000);
     let items = [
         turn_started("turn-1"),
         user_message("turn"),
         legacy_user_message_event("turn"),
         turn_context(home.path(), "turn-1"),
-        user_message(&oversized_message),
+        compacted("checkpoint", Some(Vec::new())),
         turn_complete("turn-1"),
-        compacted("latest checkpoint", Some(Vec::new())),
+        user_message(&large_message),
     ];
-    let path = write_legacy_rollout(home.path(), "2025-01-03T13-00-16", uuid, items.clone());
+    let path = write_legacy_rollout(home.path(), "2025-01-03T13-00-15", uuid, items.clone());
     let session_meta = codex_rollout::read_session_meta_line(path.as_path())
         .await
         .expect("read session metadata");
@@ -478,7 +448,7 @@ async fn loads_compacted_context_after_scanning_replaced_oversized_item() {
             rollout_path: Some(path),
         })
         .await
-        .expect("compacted context should admit superseded oversized items during its scan");
+        .expect("a large item below the aggregate limits should resume");
 
     let expected = std::iter::once(RolloutItem::SessionMeta(session_meta))
         .chain(items)

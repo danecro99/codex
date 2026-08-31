@@ -13,8 +13,6 @@ use crate::reverse_jsonl_scanner::MAX_ROLLOUT_LINE_BYTES;
 
 /// Maximum number of durable rollout items admitted to a resumed model context.
 pub const MODEL_CONTEXT_MAX_ITEMS: usize = 16 * 1024;
-/// Maximum estimated model tokens admitted from one model-visible response item.
-pub const MODEL_CONTEXT_MAX_ITEM_TOKENS: usize = 10_000;
 /// Maximum serialized bytes admitted to a resumed model context.
 pub const MODEL_CONTEXT_MAX_BYTES: usize = MAX_ROLLOUT_LINE_BYTES;
 /// Maximum estimated model tokens admitted to a resumed model context.
@@ -185,7 +183,6 @@ impl ModelContextScan {
     }
 
     fn admit(&mut self, item: &RolloutItem) -> Result<(), ModelContextScanError> {
-        self.validate_model_visible_items(item)?;
         let item_bytes = serde_json::to_vec(item)
             .map_err(|err| ModelContextScanError::Serialization(err.to_string()))?
             .len();
@@ -209,41 +206,6 @@ impl ModelContextScan {
         self.serialized_bytes = serialized_bytes;
         self.estimated_tokens = estimated_tokens;
         Ok(())
-    }
-
-    fn validate_model_visible_items(
-        &self,
-        item: &RolloutItem,
-    ) -> Result<(), ModelContextScanError> {
-        // Reverse scanning reaches the newest suffix first. Once it observes a reconstructible
-        // compaction, that replacement history supersedes every older model-visible record; those
-        // older durable records still count toward the aggregate scan bounds in `admit`.
-        match item {
-            RolloutItem::ResponseItem(response_item) if !self.saw_compaction => {
-                validate_model_visible_item(&response_item.item)
-            }
-            RolloutItem::InterAgentCommunication(communication) if !self.saw_compaction => {
-                validate_model_visible_item(&communication.to_model_input_item())
-            }
-            RolloutItem::Compacted(compacted) if !self.saw_compaction => {
-                if let Some(replacement_history) = &compacted.replacement_history {
-                    for response_item in replacement_history {
-                        validate_model_visible_item(&response_item.item)?;
-                    }
-                }
-                Ok(())
-            }
-            RolloutItem::Compacted(_)
-            | RolloutItem::EventMsg(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::RealtimeItem(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::SecurityRiskScore(_)
-            | RolloutItem::SessionMeta(_)
-            | RolloutItem::TurnContext(_)
-            | RolloutItem::WorldState(_) => Ok(()),
-        }
     }
 
     fn observe(&mut self, item: &RolloutItem) -> ModelContextScanProgress {
@@ -343,21 +305,6 @@ impl ModelContextScan {
     fn has_bounded_cutoff(&self) -> bool {
         !self.must_scan_to_start && self.saw_compaction && self.saw_completed_turn_context
     }
-}
-
-fn validate_model_visible_item(item: &ResponseItem) -> Result<(), ModelContextScanError> {
-    let item_bytes = serde_json::to_vec(item)
-        .map_err(|err| ModelContextScanError::Serialization(err.to_string()))?
-        .len();
-    let item_tokens = TruncationPolicy::Bytes(item_bytes).token_budget();
-    if item_tokens > MODEL_CONTEXT_MAX_ITEM_TOKENS {
-        return Err(ModelContextScanError::LimitExceeded {
-            dimension: "item token",
-            actual: item_tokens,
-            maximum: MODEL_CONTEXT_MAX_ITEM_TOKENS,
-        });
-    }
-    Ok(())
 }
 
 #[derive(Debug, Default)]
