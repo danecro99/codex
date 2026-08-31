@@ -452,6 +452,44 @@ async fn rejects_single_model_context_item_over_the_token_limit() {
 }
 
 #[tokio::test]
+async fn loads_compacted_context_after_scanning_replaced_oversized_item() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1018);
+    let oversized_message = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS * 4 + 1);
+    let items = [
+        turn_started("turn-1"),
+        user_message("turn"),
+        legacy_user_message_event("turn"),
+        turn_context(home.path(), "turn-1"),
+        user_message(&oversized_message),
+        turn_complete("turn-1"),
+        compacted("latest checkpoint", Some(Vec::new())),
+    ];
+    let path = write_legacy_rollout(home.path(), "2025-01-03T13-00-16", uuid, items.clone());
+    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .expect("read session metadata");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadModelContextParams {
+            thread_id: session_meta.meta.id,
+            include_archived: false,
+            rollout_path: Some(path),
+        })
+        .await
+        .expect("compacted context should admit superseded oversized items during its scan");
+
+    let expected = std::iter::once(RolloutItem::SessionMeta(session_meta))
+        .chain(items)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(context.items).expect("serialize resumed context"),
+        serde_json::to_value(expected).expect("serialize expected context")
+    );
+}
+
+#[tokio::test]
 async fn rejects_model_context_over_the_item_limit() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1016);
