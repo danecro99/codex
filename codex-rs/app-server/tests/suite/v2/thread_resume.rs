@@ -173,11 +173,15 @@ async fn legacy_exclude_turns_resume_accepts_large_compacted_replacement_history
     .await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let replaced_prefix = format!(
+        "replaced-prefix:{}",
+        "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_ITEM_TOKENS * 4 + 1)
+    );
     let thread_id = create_fake_rollout(
         codex_home.path(),
         "2025-01-05T11-59-57",
         "2025-01-05T11:59:57Z",
-        "legacy prefix must be excluded",
+        &replaced_prefix,
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
@@ -243,9 +247,7 @@ async fn legacy_exclude_turns_resume_accepts_large_compacted_replacement_history
         "new turn missing from model request: {user_texts:?}"
     );
     assert!(
-        user_texts
-            .iter()
-            .all(|text| text != "legacy prefix must be excluded"),
+        user_texts.iter().all(|text| text != &replaced_prefix),
         "legacy prefix leaked into model request: {user_texts:?}"
     );
     Ok(())

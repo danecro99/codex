@@ -185,7 +185,7 @@ impl ModelContextScan {
     }
 
     fn admit(&mut self, item: &RolloutItem) -> Result<(), ModelContextScanError> {
-        validate_model_visible_items(item)?;
+        self.validate_model_visible_items(item)?;
         let item_bytes = serde_json::to_vec(item)
             .map_err(|err| ModelContextScanError::Serialization(err.to_string()))?
             .len();
@@ -209,6 +209,41 @@ impl ModelContextScan {
         self.serialized_bytes = serialized_bytes;
         self.estimated_tokens = estimated_tokens;
         Ok(())
+    }
+
+    fn validate_model_visible_items(
+        &self,
+        item: &RolloutItem,
+    ) -> Result<(), ModelContextScanError> {
+        // Reverse scanning reaches the newest suffix first. Once it observes a reconstructible
+        // compaction, that replacement history supersedes every older model-visible record; those
+        // older durable records still count toward the aggregate scan bounds in `admit`.
+        match item {
+            RolloutItem::ResponseItem(response_item) if !self.saw_compaction => {
+                validate_model_visible_item(&response_item.item)
+            }
+            RolloutItem::InterAgentCommunication(communication) if !self.saw_compaction => {
+                validate_model_visible_item(&communication.to_model_input_item())
+            }
+            RolloutItem::Compacted(compacted) if !self.saw_compaction => {
+                if let Some(replacement_history) = &compacted.replacement_history {
+                    for response_item in replacement_history {
+                        validate_model_visible_item(&response_item.item)?;
+                    }
+                }
+                Ok(())
+            }
+            RolloutItem::Compacted(_)
+            | RolloutItem::EventMsg(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::RealtimeItem(_)
+            | RolloutItem::ResponseItem(_)
+            | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::SessionMeta(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_) => Ok(()),
+        }
     }
 
     fn observe(&mut self, item: &RolloutItem) -> ModelContextScanProgress {
@@ -307,32 +342,6 @@ impl ModelContextScan {
 
     fn has_bounded_cutoff(&self) -> bool {
         !self.must_scan_to_start && self.saw_compaction && self.saw_completed_turn_context
-    }
-}
-
-fn validate_model_visible_items(item: &RolloutItem) -> Result<(), ModelContextScanError> {
-    match item {
-        RolloutItem::ResponseItem(response_item) => {
-            validate_model_visible_item(&response_item.item)
-        }
-        RolloutItem::InterAgentCommunication(communication) => {
-            validate_model_visible_item(&communication.to_model_input_item())
-        }
-        RolloutItem::Compacted(compacted) => {
-            if let Some(replacement_history) = &compacted.replacement_history {
-                for response_item in replacement_history {
-                    validate_model_visible_item(&response_item.item)?;
-                }
-            }
-            Ok(())
-        }
-        RolloutItem::EventMsg(_)
-        | RolloutItem::InterAgentCommunicationMetadata { .. }
-        | RolloutItem::RealtimeItem(_)
-        | RolloutItem::SecurityRiskScore(_)
-        | RolloutItem::SessionMeta(_)
-        | RolloutItem::TurnContext(_)
-        | RolloutItem::WorldState(_) => Ok(()),
     }
 }
 
