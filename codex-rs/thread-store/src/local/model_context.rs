@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
-use codex_rollout::MODEL_CONTEXT_MAX_BYTES;
 use codex_rollout::ModelContextScan;
 use codex_rollout::ModelContextScanProgress;
+use codex_rollout::ModelContextScanResult;
+use codex_rollout::ModelContextWarning;
 use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::RolloutItem;
 use codex_rollout::ScanOutcome;
@@ -30,20 +31,14 @@ mod tests;
 ///
 /// Plain JSONL rollouts use a reverse scan. When it finds both a usable replacement-
 /// history checkpoint and the completed user-turn context needed for resume metadata, the returned
-/// replay starts with the canonical `SessionMeta` followed by that newest suffix. Missing cutoffs,
-/// malformed records, compressed rollouts without a bounded streaming implementation, and
-/// byte/item/token overflow fail loudly before any history reaches a resume consumer.
+/// replay starts with the canonical `SessionMeta` followed by that newest suffix. Threshold
+/// crossings and histories without a usable cutoff are reported as non-blocking observations;
+/// malformed records remain read errors.
 pub(super) async fn load_latest_model_context(
     store: &LocalThreadStore,
     params: LoadModelContextParams,
 ) -> ThreadStoreResult<StoredModelContext> {
     let path = resolve_model_context_path(store, &params).await?;
-
-    if codex_rollout::is_compressed_rollout_path(path.as_path()) {
-        return Err(ThreadStoreError::Unsupported {
-            operation: "bounded_model_context_from_compressed_rollout",
-        });
-    }
 
     let session_meta = codex_rollout::read_session_meta_line(path.as_path())
         .await
@@ -61,25 +56,40 @@ pub(super) async fn load_latest_model_context(
         });
     }
 
-    let items = match session_meta.meta.history_mode {
-        ThreadHistoryMode::Legacy => scan_model_context_from_rollout(path, session_meta).await?,
-        ThreadHistoryMode::Paginated => {
-            if params.rollout_path.is_some() {
-                ensure_current_paginated_path(store, &params, path.as_path()).await?;
+    let mut scanned = if codex_rollout::is_compressed_rollout_path(path.as_path()) {
+        ModelContextScanResult {
+            items: read_thread::load_history_items(path.as_path()).await?,
+            warnings: vec![ModelContextWarning::CompressedRolloutFullRead],
+        }
+    } else {
+        match session_meta.meta.history_mode {
+            ThreadHistoryMode::Legacy => {
+                scan_model_context_from_rollout(path, session_meta.clone()).await?
             }
-            let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
-            scan_model_context_from_lineage(
-                lineage,
-                session_meta,
-                ScanCompletion::CheckpointOrPaginatedOrigin,
-            )
-            .await?
+            ThreadHistoryMode::Paginated => {
+                if params.rollout_path.is_some() {
+                    ensure_current_paginated_path(store, &params, path.as_path()).await?;
+                }
+                let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+                scan_model_context_from_lineage(
+                    lineage,
+                    session_meta.clone(),
+                    ScanCompletion::CheckpointOrPaginatedOrigin,
+                )
+                .await?
+            }
         }
     };
+    if !matches!(scanned.items.first(), Some(RolloutItem::SessionMeta(_))) {
+        scanned
+            .items
+            .insert(0, RolloutItem::SessionMeta(session_meta));
+    }
 
     Ok(StoredModelContext {
         thread_id: params.thread_id,
-        items,
+        items: scanned.items,
+        warnings: scanned.warnings,
     })
 }
 
@@ -163,6 +173,7 @@ pub(super) async fn load_for_fork(
             let lineage = lineage.truncate_at(history_base).await?;
             scan_model_context_from_lineage(lineage, session_meta, ScanCompletion::FrozenPrefix)
                 .await
+                .map(|scanned| scanned.items)
         }
         None => Ok(vec![RolloutItem::SessionMeta(session_meta)]),
     }
@@ -172,7 +183,7 @@ async fn scan_model_context_from_lineage(
     lineage: RolloutLineage,
     session_meta: SessionMetaLine,
     completion: ScanCompletion,
-) -> ThreadStoreResult<Vec<RolloutItem>> {
+) -> ThreadStoreResult<ModelContextScanResult> {
     let scan = tokio::task::spawn_blocking(move || {
         scan_model_context_from_lineage_blocking(&lineage, session_meta, completion)
     })
@@ -191,7 +202,7 @@ async fn scan_model_context_from_lineage(
 async fn scan_model_context_from_rollout(
     path: PathBuf,
     session_meta: SessionMetaLine,
-) -> ThreadStoreResult<Vec<RolloutItem>> {
+) -> ThreadStoreResult<ModelContextScanResult> {
     let scan = tokio::task::spawn_blocking(move || {
         scan_model_context_from_segments_blocking(
             vec![(
@@ -199,6 +210,7 @@ async fn scan_model_context_from_rollout(
             )],
             session_meta,
             ScanCompletion::Checkpoint,
+            Vec::new(),
         )
     })
     .await
@@ -214,7 +226,8 @@ fn scan_model_context_from_lineage_blocking(
     lineage: &RolloutLineage,
     session_meta: SessionMetaLine,
     completion: ScanCompletion,
-) -> io::Result<Vec<RolloutItem>> {
+) -> io::Result<ModelContextScanResult> {
+    let lineage_warnings = lineage.warnings.clone();
     let segment_count = lineage.segments().len();
     let segments = lineage
         .segments()
@@ -230,7 +243,7 @@ fn scan_model_context_from_lineage_blocking(
             )
         })
         .collect();
-    scan_model_context_from_segments_blocking(segments, session_meta, completion)
+    scan_model_context_from_segments_blocking(segments, session_meta, completion, lineage_warnings)
 }
 
 #[derive(Clone, Copy)]
@@ -244,7 +257,8 @@ fn scan_model_context_from_segments_blocking(
     segments: Vec<(PathBuf, Option<u64>, bool, bool)>,
     session_meta: SessionMetaLine,
     completion: ScanCompletion,
-) -> io::Result<Vec<RolloutItem>> {
+    initial_warnings: Vec<ModelContextWarning>,
+) -> io::Result<ModelContextScanResult> {
     let mut scan = ModelContextScan::default();
     let mut completed_at_checkpoint = false;
     let mut reached_paginated_origin = false;
@@ -255,8 +269,7 @@ fn scan_model_context_from_segments_blocking(
         let mut scanner = match end_byte_offset {
             Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
             None => ReverseJsonlScanner::new(file)?,
-        }
-        .with_strict_max_record_bytes(MODEL_CONTEXT_MAX_BYTES);
+        };
         while let Some(outcome) = scanner.scan_next_rollout_line()? {
             let line = match outcome {
                 ScanOutcome::Parsed(line) => line,
@@ -283,7 +296,7 @@ fn scan_model_context_from_segments_blocking(
         }
     }
 
-    match completion {
+    let mut result = match completion {
         ScanCompletion::Checkpoint => scan.finish(session_meta).map_err(io::Error::other),
         ScanCompletion::CheckpointOrPaginatedOrigin if completed_at_checkpoint => {
             scan.finish(session_meta).map_err(io::Error::other)
@@ -297,5 +310,7 @@ fn scan_model_context_from_segments_blocking(
         ScanCompletion::FrozenPrefix => scan
             .finish_frozen_prefix(session_meta)
             .map_err(io::Error::other),
-    }
+    }?;
+    result.warnings.extend(initial_warnings);
+    Ok(result)
 }

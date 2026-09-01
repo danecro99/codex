@@ -6,6 +6,7 @@ use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::ModelContextWarning;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
@@ -13,7 +14,7 @@ use tempfile::TempDir;
 
 use super::super::LocalThreadStore;
 use super::super::test_support::test_config;
-use super::MAX_ROLLOUT_LINEAGE_SEGMENTS;
+use super::ROLLOUT_LINEAGE_SEGMENTS_WARNING_THRESHOLD;
 use super::RolloutLineageSegment;
 
 #[tokio::test]
@@ -215,15 +216,16 @@ async fn rejects_missing_cycles_and_out_of_bounds_offsets() {
 }
 
 #[tokio::test]
-async fn rejects_lineage_limit_before_resolving_or_reading_another_segment() {
+async fn reports_lineage_threshold_without_blocking_resolution() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
-    let missing_ancestor = ThreadId::default();
+    let root = ThreadId::default();
+    let root_path = write_rollout(home.path(), root, None, /*next_ordinal*/ 2);
     let mut history_base =
-        unchecked_history_position(missing_ancestor, /*end_ordinal_exclusive*/ 1);
-    let mut requested_thread_id = missing_ancestor;
+        history_position(root_path.as_path(), root, /*end_ordinal_exclusive*/ 2);
+    let mut requested_thread_id = root;
 
-    for _ in 0..MAX_ROLLOUT_LINEAGE_SEGMENTS {
+    for _ in 0..ROLLOUT_LINEAGE_SEGMENTS_WARNING_THRESHOLD {
         let thread_id = ThreadId::default();
         let initial_ordinal = history_base.end_ordinal_exclusive;
         let path = write_rollout(
@@ -236,20 +238,16 @@ async fn rejects_lineage_limit_before_resolving_or_reading_another_segment() {
         requested_thread_id = thread_id;
     }
 
-    let error = store
+    let lineage = store
         .resolve_rollout_lineage(requested_thread_id)
         .await
-        .expect_err("lineage segment limit must fail before the missing ancestor is resolved");
-    let crate::ThreadStoreError::InvalidRequest { message } = error else {
-        panic!("unexpected error: {error}");
-    };
-
+        .expect("lineage threshold must not block resolution");
     assert_eq!(
-        message,
-        format!(
-            "invalid paginated history lineage for {requested_thread_id}: segment limit exceeded: {} > {MAX_ROLLOUT_LINEAGE_SEGMENTS}",
-            MAX_ROLLOUT_LINEAGE_SEGMENTS + 1
-        )
+        lineage.warnings,
+        vec![ModelContextWarning::LineageSegmentThresholdExceeded {
+            observed: ROLLOUT_LINEAGE_SEGMENTS_WARNING_THRESHOLD + 1,
+            threshold: ROLLOUT_LINEAGE_SEGMENTS_WARNING_THRESHOLD,
+        }]
     );
 }
 

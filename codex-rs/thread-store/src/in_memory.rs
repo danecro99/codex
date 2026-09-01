@@ -675,6 +675,7 @@ impl InMemoryThreadStore {
         Ok(StoredModelContext {
             thread_id: params.thread_id,
             items: items.clone(),
+            warnings: Vec::new(),
         })
     }
 

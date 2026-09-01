@@ -47,7 +47,7 @@ pub(super) async fn select_bounded_context(
             };
             if scan.push(line.item).map_err(migration_error)? == ModelContextScanProgress::Complete
             {
-                let mut items = scan.finish(session_meta).map_err(migration_error)?;
+                let mut items = scan.finish(session_meta).map_err(migration_error)?.items;
                 items.retain(|item| !matches!(item, RolloutItem::SessionMeta(_)));
                 return Ok(Some(items));
             }

@@ -25,6 +25,7 @@ use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout::CompactedItem;
+use codex_rollout::ModelContextWarning;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
@@ -272,7 +273,7 @@ async fn loads_turn_metadata_across_an_older_checkpoint() {
 }
 
 #[tokio::test]
-async fn rejects_unsupported_compaction_without_a_safe_cutoff() {
+async fn loads_full_history_and_warns_for_unsupported_compaction() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1002);
     let path = write_paginated_rollout(
@@ -290,16 +291,16 @@ async fn rejects_unsupported_compaction_without_a_safe_cutoff() {
         ],
     );
 
-    assert_model_context_scan_fails(
+    assert_model_context_scan_warns(
         home.path(),
         path.as_path(),
-        "does not contain a safe bounded model-context checkpoint",
+        ModelContextWarning::UnsupportedCompactionShape.code(),
     )
     .await;
 }
 
 #[tokio::test]
-async fn rejects_legacy_history_without_a_valid_cutoff() {
+async fn loads_legacy_history_and_warns_without_a_valid_cutoff() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1009);
     let path = write_legacy_rollout(
@@ -315,10 +316,10 @@ async fn rejects_legacy_history_without_a_valid_cutoff() {
         ],
     );
 
-    assert_model_context_scan_fails(
+    assert_model_context_scan_warns(
         home.path(),
         path.as_path(),
-        "does not contain a safe bounded model-context checkpoint",
+        ModelContextWarning::FullHistoryWithoutCheckpoint.code(),
     )
     .await;
 }
@@ -399,7 +400,7 @@ async fn resumes_fresh_written_rollout_with_floating_point_rate_limits() {
 }
 
 #[tokio::test]
-async fn rejects_model_context_over_the_token_limit() {
+async fn loads_model_context_and_warns_over_the_token_threshold() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1014);
     let path = write_legacy_rollout(
@@ -415,10 +416,20 @@ async fn rejects_model_context_over_the_token_limit() {
             turn_complete("turn-1"),
         ],
     );
-    let oversized_message = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_TOKENS * 4 + 1);
+    let oversized_message =
+        "x".repeat(codex_rollout::MODEL_CONTEXT_TOKENS_WARNING_THRESHOLD * 4 + 1);
     append_repeated_item(path.as_path(), user_message(&oversized_message), 1);
 
-    assert_model_context_scan_fails(home.path(), path.as_path(), "exceeds the token limit").await;
+    assert_model_context_scan_warns(
+        home.path(),
+        path.as_path(),
+        ModelContextWarning::TokenThresholdExceeded {
+            observed: 0,
+            threshold: 0,
+        }
+        .code(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -460,7 +471,39 @@ async fn loads_model_context_with_a_large_single_item_below_the_aggregate_limit(
 }
 
 #[tokio::test]
-async fn rejects_model_context_over_the_item_limit() {
+async fn loads_model_context_and_warns_for_a_record_over_the_byte_threshold() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1018);
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-16",
+        uuid,
+        [
+            turn_started("turn-1"),
+            user_message("turn"),
+            legacy_user_message_event("turn"),
+            turn_context(home.path(), "turn-1"),
+            compacted("checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+        ],
+    );
+    let oversized_message = "x".repeat(codex_rollout::MODEL_CONTEXT_BYTES_WARNING_THRESHOLD + 1);
+    append_repeated_item(path.as_path(), user_message(&oversized_message), 1);
+
+    assert_model_context_scan_warns(
+        home.path(),
+        path.as_path(),
+        ModelContextWarning::ByteThresholdExceeded {
+            observed: 0,
+            threshold: 0,
+        }
+        .code(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn loads_model_context_and_warns_over_the_item_threshold() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1016);
     let path = write_legacy_rollout(
@@ -479,14 +522,23 @@ async fn rejects_model_context_over_the_item_limit() {
     append_repeated_item(
         path.as_path(),
         turn_complete("later-turn"),
-        codex_rollout::MODEL_CONTEXT_MAX_ITEMS,
+        codex_rollout::MODEL_CONTEXT_ITEMS_WARNING_THRESHOLD,
     );
 
-    assert_model_context_scan_fails(home.path(), path.as_path(), "exceeds the item limit").await;
+    assert_model_context_scan_warns(
+        home.path(),
+        path.as_path(),
+        ModelContextWarning::ItemThresholdExceeded {
+            observed: 0,
+            threshold: 0,
+        }
+        .code(),
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn rejects_compressed_model_context_without_a_bounded_stream() {
+async fn loads_compressed_model_context_and_warns_about_full_read() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1015);
     let path = write_legacy_rollout(
@@ -503,28 +555,28 @@ async fn rejects_compressed_model_context_without_a_bounded_stream() {
         ],
     );
     let compressed_path = path.with_extension("jsonl.zst");
-    std::fs::write(&compressed_path, b"not a zstd stream")
-        .expect("write intentionally unreadable compressed rollout");
+    let contents = std::fs::read(&path).expect("read plain rollout");
+    let compressed = zstd::stream::encode_all(contents.as_slice(), 3).expect("compress rollout");
+    std::fs::write(&compressed_path, compressed).expect("write compressed rollout");
     std::fs::remove_file(&path).expect("remove plain rollout");
 
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
-    let error = store
+    let context = store
         .load_latest_model_context(LoadModelContextParams {
             thread_id: codex_protocol::ThreadId::from_string(&uuid.to_string()).expect("thread id"),
             include_archived: false,
             rollout_path: Some(compressed_path),
         })
         .await
-        .expect_err("compressed resume should require a bounded stream");
+        .expect("compressed history should resume");
 
     assert!(
-        matches!(
-            error,
-            ThreadStoreError::Unsupported {
-                operation: "bounded_model_context_from_compressed_rollout"
-            }
-        ),
-        "unexpected error: {error}"
+        context
+            .warnings
+            .iter()
+            .any(|warning| warning.code() == ModelContextWarning::CompressedRolloutFullRead.code()),
+        "missing compressed full-read warning: {:?}",
+        context.warnings
     );
 }
 
@@ -811,23 +863,27 @@ fn rollout_end_byte_offset(path: &Path, end_ordinal_exclusive: u64) -> u64 {
     byte_offset
 }
 
-async fn assert_model_context_scan_fails(home: &Path, path: &Path, expected_message: &str) {
+async fn assert_model_context_scan_warns(home: &Path, path: &Path, expected_code: &str) {
     let session_meta = codex_rollout::read_session_meta_line(path)
         .await
         .expect("read session metadata");
     let store = LocalThreadStore::new(test_config(home), /*state_db*/ None);
-    let error = store
+    let context = store
         .load_latest_model_context(LoadModelContextParams {
             thread_id: session_meta.meta.id,
             include_archived: false,
             rollout_path: None,
         })
         .await
-        .expect_err("model context scan should fail");
+        .expect("model context scan should remain resumable");
 
     assert!(
-        error.to_string().contains(expected_message),
-        "unexpected error: {error}"
+        context
+            .warnings
+            .iter()
+            .any(|warning| warning.code() == expected_code),
+        "missing {expected_code} warning: {:?}",
+        context.warnings
     );
 }
 

@@ -76,6 +76,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::WarningNotification;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_features::Feature;
@@ -234,7 +235,7 @@ async fn legacy_exclude_turns_resume_sends_only_the_bounded_checkpoint_suffix() 
 }
 
 #[tokio::test]
-async fn legacy_exclude_turns_resume_rejects_missing_safe_cutoff() -> Result<()> {
+async fn legacy_exclude_turns_resume_warns_about_missing_safe_cutoff() -> Result<()> {
     let server = responses::start_mock_server().await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
@@ -259,25 +260,22 @@ async fn legacy_exclude_turns_resume_rejects_missing_safe_cutoff() -> Result<()>
             ..Default::default()
         })
         .await?;
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        app.read_stream_until_error_message(RequestId::Integer(resume_id)),
-    )
-    .await??;
-
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app.read_response(resume_id)).await??;
+    let warning: WarningNotification =
+        timeout(DEFAULT_READ_TIMEOUT, app.read_notification("warning")).await??;
     assert!(
-        error
-            .error
+        warning
             .message
-            .contains("does not contain a safe bounded model-context checkpoint"),
-        "unexpected resume error: {}",
-        error.error.message
+            .contains("codex_resume_history_full_history_without_checkpoint"),
+        "unexpected resume warning: {}",
+        warning.message
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn legacy_exclude_turns_resume_rejects_model_context_overflow() -> Result<()> {
+async fn legacy_exclude_turns_resume_warns_about_model_context_threshold() -> Result<()> {
     let server = responses::start_mock_server().await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
@@ -290,7 +288,8 @@ async fn legacy_exclude_turns_resume_rejects_model_context_overflow() -> Result<
         /*git_info*/ None,
     )?;
     let path = rollout_path(codex_home.path(), "2025-01-05T11-59-59", &thread_id);
-    let oversized_suffix = "x".repeat(codex_rollout::MODEL_CONTEXT_MAX_TOKENS * 4 + 1);
+    let oversized_suffix =
+        "x".repeat(codex_rollout::MODEL_CONTEXT_TOKENS_WARNING_THRESHOLD * 4 + 1);
     append_legacy_resume_checkpoint(&path, &oversized_suffix).await?;
     let mut app = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -305,16 +304,16 @@ async fn legacy_exclude_turns_resume_rejects_model_context_overflow() -> Result<
             ..Default::default()
         })
         .await?;
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        app.read_stream_until_error_message(RequestId::Integer(resume_id)),
-    )
-    .await??;
-
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app.read_response(resume_id)).await??;
+    let warning: WarningNotification =
+        timeout(DEFAULT_READ_TIMEOUT, app.read_notification("warning")).await??;
     assert!(
-        error.error.message.contains("exceeds the token limit"),
-        "unexpected resume error: {}",
-        error.error.message
+        warning
+            .message
+            .contains("codex_resume_history_token_threshold_exceeded"),
+        "unexpected resume warning: {}",
+        warning.message
     );
     Ok(())
 }

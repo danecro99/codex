@@ -5,18 +5,18 @@ use std::path::PathBuf;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::ModelContextWarning;
 
 use super::LocalThreadStore;
 use super::thread_rollout_resolver;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-/// Maximum number of immutable rollout segments admitted to one paginated lineage.
+/// Segment count whose crossing is reported while resolving one paginated lineage.
 ///
-/// No existing history contract bounds fork depth. 256 preserves a deliberately generous number
-/// of explicit fork and pagination boundaries while bounding path resolution, metadata reads, and
-/// the lineage's `Vec` and cycle-detection `HashSet`.
-pub(super) const MAX_ROLLOUT_LINEAGE_SEGMENTS: usize = 256;
+/// No existing history contract bounds fork depth. The threshold exists only to expose unusually
+/// deep fork and pagination histories through resume diagnostics.
+pub(super) const ROLLOUT_LINEAGE_SEGMENTS_WARNING_THRESHOLD: usize = 256;
 
 /// One immutable rollout range contributing to a paginated thread's history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +34,7 @@ pub(super) struct RolloutLineageSegment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RolloutLineage {
     pub(super) segments: Vec<RolloutLineageSegment>,
+    pub(super) warnings: Vec<ModelContextWarning>,
 }
 
 impl LocalThreadStore {
@@ -68,11 +69,15 @@ impl LocalThreadStore {
         let mut seen = HashSet::new();
         let mut next_rollout_id = None;
         let mut end = None;
+        let mut warnings = Vec::new();
 
         loop {
             let segment_count = segments.len().saturating_add(1);
-            if segment_count > MAX_ROLLOUT_LINEAGE_SEGMENTS {
-                return Err(lineage_limit_exceeded(requested_thread_id, segment_count));
+            if segment_count == ROLLOUT_LINEAGE_SEGMENTS_WARNING_THRESHOLD + 1 {
+                warnings.push(ModelContextWarning::LineageSegmentThresholdExceeded {
+                    observed: segment_count,
+                    threshold: ROLLOUT_LINEAGE_SEGMENTS_WARNING_THRESHOLD,
+                });
             }
             let coordination_id = next_rollout_id.unwrap_or(requested_thread_id);
             let _writer_guard = match representation {
@@ -165,7 +170,7 @@ impl LocalThreadStore {
         }
 
         segments.reverse();
-        Ok(RolloutLineage { segments })
+        Ok(RolloutLineage { segments, warnings })
     }
 }
 
@@ -270,14 +275,6 @@ async fn validate_cutoff_bounds(
 fn malformed_lineage(thread_id: ThreadId, detail: &str) -> ThreadStoreError {
     ThreadStoreError::InvalidRequest {
         message: format!("invalid paginated history lineage for {thread_id}: {detail}"),
-    }
-}
-
-fn lineage_limit_exceeded(thread_id: ThreadId, actual: usize) -> ThreadStoreError {
-    ThreadStoreError::InvalidRequest {
-        message: format!(
-            "invalid paginated history lineage for {thread_id}: segment limit exceeded: {actual} > {MAX_ROLLOUT_LINEAGE_SEGMENTS}"
-        ),
     }
 }
 

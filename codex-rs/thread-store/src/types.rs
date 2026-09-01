@@ -192,6 +192,8 @@ pub struct StoredModelContext {
     pub thread_id: ThreadId,
     /// Persisted rollout items in replay order.
     pub items: Vec<RolloutItem>,
+    /// Non-blocking observations collected while reconstructing the resumable context.
+    pub warnings: Vec<codex_rollout::ModelContextWarning>,
 }
 
 /// Requested boundary for inheriting a paginated thread's history.

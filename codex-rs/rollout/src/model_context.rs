@@ -11,12 +11,12 @@ use std::fmt;
 
 use crate::reverse_jsonl_scanner::MAX_ROLLOUT_LINE_BYTES;
 
-/// Maximum number of durable rollout items admitted to a resumed model context.
-pub const MODEL_CONTEXT_MAX_ITEMS: usize = 16 * 1024;
-/// Maximum serialized bytes admitted to a resumed model context.
-pub const MODEL_CONTEXT_MAX_BYTES: usize = MAX_ROLLOUT_LINE_BYTES;
-/// Maximum estimated model tokens admitted to a resumed model context.
-pub const MODEL_CONTEXT_MAX_TOKENS: usize = 1_000_000;
+/// Item count whose crossing is reported while reconstructing model context.
+pub const MODEL_CONTEXT_ITEMS_WARNING_THRESHOLD: usize = 16 * 1024;
+/// Serialized byte count whose crossing is reported while reconstructing model context.
+pub const MODEL_CONTEXT_BYTES_WARNING_THRESHOLD: usize = MAX_ROLLOUT_LINE_BYTES;
+/// Estimated token count whose crossing is reported while reconstructing model context.
+pub const MODEL_CONTEXT_TOKENS_WARNING_THRESHOLD: usize = 1_000_000;
 
 /// Whether a reverse model-context scan needs more rollout items.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,14 +30,6 @@ pub enum ModelContextScanProgress {
 /// Failure to prove or assemble a bounded model-context replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelContextScanError {
-    /// The scanned history did not contain a checkpoint that safely replaces its older prefix.
-    MissingSafeCutoff,
-    /// The candidate suffix exceeded one of the canonical resume limits.
-    LimitExceeded {
-        dimension: &'static str,
-        actual: usize,
-        maximum: usize,
-    },
     /// A rollout item could not be measured before admission.
     Serialization(String),
 }
@@ -45,16 +37,6 @@ pub enum ModelContextScanError {
 impl fmt::Display for ModelContextScanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingSafeCutoff => formatter
-                .write_str("rollout does not contain a safe bounded model-context checkpoint"),
-            Self::LimitExceeded {
-                dimension,
-                actual,
-                maximum,
-            } => write!(
-                formatter,
-                "bounded model context exceeds the {dimension} limit: {actual} > {maximum}"
-            ),
             Self::Serialization(message) => {
                 write!(
                     formatter,
@@ -66,6 +48,76 @@ impl fmt::Display for ModelContextScanError {
 }
 
 impl Error for ModelContextScanError {}
+
+/// Non-blocking diagnostic produced while reconstructing persisted model context.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "code")]
+pub enum ModelContextWarning {
+    ItemThresholdExceeded { observed: usize, threshold: usize },
+    ByteThresholdExceeded { observed: usize, threshold: usize },
+    TokenThresholdExceeded { observed: usize, threshold: usize },
+    FullHistoryWithoutCheckpoint,
+    UnsupportedCompactionShape,
+    RollbackRequiresFullHistory,
+    CompressedRolloutFullRead,
+    LineageSegmentThresholdExceeded { observed: usize, threshold: usize },
+}
+
+impl ModelContextWarning {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ItemThresholdExceeded { .. } => "item_threshold_exceeded",
+            Self::ByteThresholdExceeded { .. } => "byte_threshold_exceeded",
+            Self::TokenThresholdExceeded { .. } => "token_threshold_exceeded",
+            Self::FullHistoryWithoutCheckpoint => "full_history_without_checkpoint",
+            Self::UnsupportedCompactionShape => "unsupported_compaction_shape",
+            Self::RollbackRequiresFullHistory => "rollback_requires_full_history",
+            Self::CompressedRolloutFullRead => "compressed_rollout_full_read",
+            Self::LineageSegmentThresholdExceeded { .. } => "lineage_segment_threshold_exceeded",
+        }
+    }
+}
+
+impl fmt::Display for ModelContextWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ItemThresholdExceeded { observed, threshold } => write!(
+                formatter,
+                "resume reconstructed {observed} rollout items; observation threshold is {threshold}"
+            ),
+            Self::ByteThresholdExceeded { observed, threshold } => write!(
+                formatter,
+                "resume reconstructed {observed} serialized bytes; observation threshold is {threshold}"
+            ),
+            Self::TokenThresholdExceeded { observed, threshold } => write!(
+                formatter,
+                "resume reconstructed approximately {observed} tokens; observation threshold is {threshold}"
+            ),
+            Self::FullHistoryWithoutCheckpoint => formatter.write_str(
+                "resume reconstructed the complete history because no safe compaction checkpoint was available",
+            ),
+            Self::UnsupportedCompactionShape => formatter.write_str(
+                "resume encountered a compaction without replacement history or window metadata and reconstructed the complete history",
+            ),
+            Self::RollbackRequiresFullHistory => formatter.write_str(
+                "resume encountered a rollback marker and reconstructed the complete history",
+            ),
+            Self::CompressedRolloutFullRead => formatter.write_str(
+                "resume loaded the complete compressed rollout because reverse streaming is unavailable",
+            ),
+            Self::LineageSegmentThresholdExceeded { observed, threshold } => write!(
+                formatter,
+                "resume traversed {observed} rollout lineage segments; observation threshold is {threshold}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelContextScanResult {
+    pub items: Vec<RolloutItem>,
+    pub warnings: Vec<ModelContextWarning>,
+}
 
 /// Accumulates newest-to-oldest rollout items until they are sufficient to reconstruct the latest
 /// model context.
@@ -108,6 +160,12 @@ pub struct ModelContextScan {
     saw_completed_turn_context: bool,
     must_scan_to_start: bool,
     active_segment: ActiveTurnSegment,
+    warnings: Vec<ModelContextWarning>,
+    item_threshold_reported: bool,
+    byte_threshold_reported: bool,
+    token_threshold_reported: bool,
+    unsupported_compaction_reported: bool,
+    rollback_reported: bool,
 }
 
 impl ModelContextScan {
@@ -129,13 +187,17 @@ impl ModelContextScan {
     pub fn finish(
         mut self,
         session_meta: SessionMetaLine,
-    ) -> Result<Vec<RolloutItem>, ModelContextScanError> {
+    ) -> Result<ModelContextScanResult, ModelContextScanError> {
         if !self.has_bounded_cutoff() {
-            return Err(ModelContextScanError::MissingSafeCutoff);
+            self.warnings
+                .push(ModelContextWarning::FullHistoryWithoutCheckpoint);
         }
         self.prepend_session_meta(session_meta)?;
         self.items_newest_first.reverse();
-        Ok(self.items_newest_first)
+        Ok(ModelContextScanResult {
+            items: self.items_newest_first,
+            warnings: self.warnings,
+        })
     }
 
     /// Finishes a bounded scan that reached the canonical origin of a paginated lineage.
@@ -146,20 +208,24 @@ impl ModelContextScan {
     pub fn finish_paginated_origin(
         mut self,
         session_meta: SessionMetaLine,
-    ) -> Result<Vec<RolloutItem>, ModelContextScanError> {
-        if self.must_scan_to_start {
-            return Err(ModelContextScanError::MissingSafeCutoff);
+    ) -> Result<ModelContextScanResult, ModelContextScanError> {
+        if !self.has_bounded_cutoff() {
+            self.warnings
+                .push(ModelContextWarning::FullHistoryWithoutCheckpoint);
         }
         self.prepend_session_meta(session_meta)?;
         self.items_newest_first.reverse();
-        Ok(self.items_newest_first)
+        Ok(ModelContextScanResult {
+            items: self.items_newest_first,
+            warnings: self.warnings,
+        })
     }
 
     /// Finishes history whose older edge is already frozen by a durable `HistoryPosition`.
     pub fn finish_frozen_prefix(
         mut self,
         session_meta: SessionMetaLine,
-    ) -> Result<Vec<RolloutItem>, ModelContextScanError> {
+    ) -> Result<ModelContextScanResult, ModelContextScanError> {
         self.items_newest_first.reverse();
         if !matches!(
             self.items_newest_first.first(),
@@ -169,7 +235,10 @@ impl ModelContextScan {
             self.admit(&item)?;
             self.items_newest_first.insert(0, item);
         }
-        Ok(self.items_newest_first)
+        Ok(ModelContextScanResult {
+            items: self.items_newest_first,
+            warnings: self.warnings,
+        })
     }
 
     fn prepend_session_meta(
@@ -190,18 +259,32 @@ impl ModelContextScan {
         let items = self.items_newest_first.len().saturating_add(1);
         let serialized_bytes = self.serialized_bytes.saturating_add(item_bytes);
         let estimated_tokens = self.estimated_tokens.saturating_add(item_tokens);
-        for (dimension, actual, maximum) in [
-            ("item", items, MODEL_CONTEXT_MAX_ITEMS),
-            ("byte", serialized_bytes, MODEL_CONTEXT_MAX_BYTES),
-            ("token", estimated_tokens, MODEL_CONTEXT_MAX_TOKENS),
-        ] {
-            if actual > maximum {
-                return Err(ModelContextScanError::LimitExceeded {
-                    dimension,
-                    actual,
-                    maximum,
+        if items > MODEL_CONTEXT_ITEMS_WARNING_THRESHOLD && !self.item_threshold_reported {
+            self.item_threshold_reported = true;
+            self.warnings
+                .push(ModelContextWarning::ItemThresholdExceeded {
+                    observed: items,
+                    threshold: MODEL_CONTEXT_ITEMS_WARNING_THRESHOLD,
                 });
-            }
+        }
+        if serialized_bytes > MODEL_CONTEXT_BYTES_WARNING_THRESHOLD && !self.byte_threshold_reported
+        {
+            self.byte_threshold_reported = true;
+            self.warnings
+                .push(ModelContextWarning::ByteThresholdExceeded {
+                    observed: serialized_bytes,
+                    threshold: MODEL_CONTEXT_BYTES_WARNING_THRESHOLD,
+                });
+        }
+        if estimated_tokens > MODEL_CONTEXT_TOKENS_WARNING_THRESHOLD
+            && !self.token_threshold_reported
+        {
+            self.token_threshold_reported = true;
+            self.warnings
+                .push(ModelContextWarning::TokenThresholdExceeded {
+                    observed: estimated_tokens,
+                    threshold: MODEL_CONTEXT_TOKENS_WARNING_THRESHOLD,
+                });
         }
         self.serialized_bytes = serialized_bytes;
         self.estimated_tokens = estimated_tokens;
@@ -218,6 +301,11 @@ impl ModelContextScan {
                 if compacted.replacement_history.is_none() || compacted.window_number.is_none() =>
             {
                 self.must_scan_to_start = true;
+                if !self.unsupported_compaction_reported {
+                    self.unsupported_compaction_reported = true;
+                    self.warnings
+                        .push(ModelContextWarning::UnsupportedCompactionShape);
+                }
             }
             RolloutItem::Compacted(_) => {
                 self.saw_compaction = true;
@@ -226,6 +314,11 @@ impl ModelContextScan {
                 // Paginated threads reject rollback. Keep old rollouts correct rather than
                 // duplicating rollback survival semantics in this bounded selector.
                 self.must_scan_to_start = true;
+                if !self.rollback_reported {
+                    self.rollback_reported = true;
+                    self.warnings
+                        .push(ModelContextWarning::RollbackRequiresFullHistory);
+                }
             }
             RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
                 if self.active_segment.turn_id.is_none() {

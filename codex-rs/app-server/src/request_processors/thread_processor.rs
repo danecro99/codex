@@ -15,6 +15,7 @@ use codex_app_server_protocol::ThreadSection;
 use codex_app_server_protocol::ThreadSectionAppearance;
 use codex_app_server_protocol::ThreadSectionMoveParams;
 use codex_app_server_protocol::ThreadSectionMoveResponse;
+use codex_app_server_protocol::WarningNotification;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::SanitizedGitUrl;
@@ -2200,7 +2201,7 @@ impl ThreadRequestProcessor {
                 /*include_history*/ false,
             )
             .await?;
-        let (thread_history, resume_source_thread) = self
+        let (thread_history, resume_source_thread, _resume_warnings) = self
             .load_resume_initial_history_from_stored_thread(
                 stored_thread,
                 /*require_complete_history*/ true,
@@ -3640,14 +3641,16 @@ impl ThreadRequestProcessor {
         let resume_result = if let Some(history) = history {
             self.resume_thread_from_history(history.as_slice())
                 .await
-                .map(|thread_history| (thread_history, None))
+                .map(|thread_history| (thread_history, None, Vec::new()))
         } else if let Some(stored_thread) = stored_thread_from_running_probe {
             self.load_resume_initial_history_from_stored_thread(
                 *stored_thread,
                 include_turns || initial_turns_page.is_some(),
             )
             .await
-            .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
+            .map(|(thread_history, stored_thread, warnings)| {
+                (thread_history, Some(stored_thread), warnings)
+            })
         } else {
             match self
                 .read_stored_thread_for_resume(
@@ -3663,11 +3666,13 @@ impl ThreadRequestProcessor {
                         include_turns || initial_turns_page.is_some(),
                     )
                     .await
-                    .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread))),
+                    .map(|(thread_history, stored_thread, warnings)| {
+                        (thread_history, Some(stored_thread), warnings)
+                    }),
                 Err(error) => Err(error),
             }
         };
-        let (thread_history, resume_source_thread) = match resume_result {
+        let (thread_history, resume_source_thread, resume_warnings) = match resume_result {
             Ok(value) => value,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -4001,6 +4006,19 @@ impl ThreadRequestProcessor {
                 self.outgoing
                     .send_response_with_thread_originator(request_id, response, thread_originator)
                     .await;
+                for warning in resume_warnings {
+                    self.outgoing
+                        .send_server_notification(ServerNotification::Warning(
+                            WarningNotification {
+                                thread_id: Some(thread_id.to_string()),
+                                message: format!(
+                                    "codex_resume_history_{}: {warning}",
+                                    warning.code()
+                                ),
+                            },
+                        ))
+                        .await;
+                }
                 // `excludeTurns` is explicitly the cheap resume path, so avoid
                 // rebuilding history only to attribute a replayed usage update.
                 if let Some(token_usage_turn_id) = token_usage_turn_id {
@@ -4379,7 +4397,14 @@ impl ThreadRequestProcessor {
         &self,
         stored_thread: StoredThread,
         require_complete_history: bool,
-    ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
+    ) -> Result<
+        (
+            InitialHistory,
+            StoredThread,
+            Vec<codex_rollout::ModelContextWarning>,
+        ),
+        JSONRPCErrorError,
+    > {
         if !requires_complete_resume_history(stored_thread.history_mode, require_complete_history) {
             let rollout_path = if matches!(stored_thread.history_mode, ThreadHistoryMode::Legacy) {
                 stored_thread.rollout_path.clone()
@@ -4400,7 +4425,7 @@ impl ThreadRequestProcessor {
                 history: Arc::new(model_context.items),
                 rollout_path: stored_thread.rollout_path.clone(),
             });
-            return Ok((history, stored_thread));
+            return Ok((history, stored_thread, model_context.warnings));
         }
 
         let thread_id = stored_thread.thread_id.to_string();
@@ -4415,7 +4440,7 @@ impl ThreadRequestProcessor {
         let history = self
             .stored_thread_to_initial_history(&mut stored_thread)
             .await?;
-        Ok((history, stored_thread))
+        Ok((history, stored_thread, Vec::new()))
     }
 
     async fn read_stored_thread_for_resume(
