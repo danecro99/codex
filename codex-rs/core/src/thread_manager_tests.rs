@@ -97,6 +97,7 @@ async fn reserved_thread_id_is_used_without_changing_normal_id_generation() {
         conversation_id: reserved.thread_id,
         history: Arc::new(Vec::new()),
         rollout_path: None,
+        materialized_resume: None,
     });
     let resumed_id = manager.reserve_thread_id();
     resumed_options.reserved_thread_id = Some(resumed_id);
@@ -1991,6 +1992,7 @@ async fn rollout_path_resume_uses_model_context_while_fork_reads_full_history() 
                 conversation_id: source.thread_id,
                 history: Arc::new(vec![RolloutItem::ResponseItem(user_msg("hello").into())]),
                 rollout_path: Some(rollout_path.clone()),
+                materialized_resume: None,
             }),
             auth_manager.clone(),
             /*parent_trace*/ None,

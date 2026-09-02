@@ -22,6 +22,8 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_rollout::MaterializedResume;
+use codex_rollout::MaterializedResumeState;
 use codex_rollout::RolloutItem;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -194,6 +196,41 @@ pub struct StoredModelContext {
     pub items: Vec<RolloutItem>,
     /// Non-blocking observations collected while reconstructing the resumable context.
     pub warnings: Vec<codex_rollout::ModelContextWarning>,
+    /// Private checkpoint input and publication fence for Core reconstruction.
+    pub materialized_resume: Option<MaterializedResume>,
+    /// Read/replay measurements retained for focused acceptance tests and tracing.
+    pub diagnostics: ResumeLoadDiagnostics,
+}
+
+/// Bounded-read measurements for one resume-state load.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeLoadDiagnostics {
+    pub outcome: ResumeCheckpointOutcome,
+    pub source_bytes: u64,
+    pub source_items: u64,
+    pub checkpoint_bytes: u64,
+    pub checkpoint_items: u64,
+    pub suffix_bytes: u64,
+    pub suffix_items: u64,
+    pub scan_elapsed_millis: u64,
+    pub checkpoint_elapsed_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCheckpointOutcome {
+    Hit,
+    #[default]
+    Miss,
+}
+
+/// Publishes exact reconstructed state only if the loaded source fence still matches.
+#[derive(Clone, Debug)]
+pub struct PublishMaterializedResumeParams {
+    pub thread_id: ThreadId,
+    pub source: codex_rollout::MaterializedResumeSource,
+    pub state: MaterializedResumeState,
+    pub max_state_bytes: u64,
 }
 
 /// Requested boundary for inheriting a paginated thread's history.

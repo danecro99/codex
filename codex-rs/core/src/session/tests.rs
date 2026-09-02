@@ -2217,7 +2217,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
         .await;
 
-    assert_eq!(reconstructed.history, replacement_history);
+    assert_eq!(reconstructed.history.as_ref(), &replacement_history);
     assert_eq!(42, reconstructed.window_number);
     assert_eq!(Some(first_window_id), reconstructed.first_window_id);
     assert_eq!(Some(previous_window_id), reconstructed.previous_window_id);
@@ -2234,8 +2234,10 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, raw_history_items(&history));
@@ -2418,7 +2420,8 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
     let (resumed_session, _resumed_turn_context) = make_session_and_context().await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("record initial history");
     assert_eq!(
         strip_response_item_ids(&raw_history_items(&resumed_session.clone_history().await)),
         strip_response_item_ids(std::slice::from_ref(&expected_item))
@@ -2487,7 +2490,8 @@ async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resum
         .await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("record initial history");
     let resumed_history = resumed_session.clone_history().await;
     let resumed_items = raw_history_items(&resumed_history);
     let [resumed_item] = resumed_items.as_slice() else {
@@ -2606,8 +2610,10 @@ async fn prepares_resumed_history_before_installing_it() {
                 metadata: Some(CodexHarnessMetadata::default()),
             })]),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(
@@ -2663,6 +2669,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
+                materialized_resume: None,
             }),
             /*inherited_multi_agent_version*/ None,
         ),
@@ -2674,6 +2681,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
+                materialized_resume: None,
             }),
             Some(MultiAgentVersion::V2),
         ),
@@ -2688,6 +2696,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
                     Some(MultiAgentVersion::Disabled)
                 )]),
                 rollout_path: None,
+                materialized_resume: None,
             }),
             Some(MultiAgentVersion::V2),
         ),
@@ -2716,7 +2725,10 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
 async fn record_initial_history_new_defers_initial_context_until_first_turn() {
     let (session, _turn_context) = make_session_and_context().await;
 
-    session.record_initial_history(InitialHistory::New).await;
+    session
+        .record_initial_history(InitialHistory::New)
+        .await
+        .expect("record initial history");
 
     let history = session.clone_history().await;
     assert_eq!(raw_history_items(&history), Vec::<ResponseItem>::new());
@@ -2750,8 +2762,10 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history_before_seed = session.state.lock().await.clone_history();
     assert_eq!(expected, raw_history_items(&history_before_seed));
@@ -2860,8 +2874,10 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let actual = session.state.lock().await.token_info();
     assert_eq!(actual, Some(info2));
@@ -3386,7 +3402,8 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(
@@ -3485,7 +3502,8 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         .record_initial_history(InitialHistory::Forked(vec![RolloutItem::ResponseItem(
             response_item,
         )]))
-        .await;
+        .await
+        .expect("record initial history");
 
     let live_history = session.clone_history().await;
     let live_items = raw_history_items(&live_history);
@@ -3738,7 +3756,8 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.clone_history().await;
     assert_eq!(
@@ -6724,6 +6743,7 @@ async fn resumed_root_session_uses_thread_id_as_session_id() {
             conversation_id: thread_id,
             history: Arc::new(Vec::new()),
             rollout_path: None,
+            materialized_resume: None,
         }),
         SessionSource::Exec,
         AgentControl::default(),
@@ -6767,6 +6787,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
                 git: None,
             })]),
             rollout_path: None,
+            materialized_resume: None,
         }),
         session_source,
         AgentControl::default(),
@@ -6820,6 +6841,7 @@ async fn resumed_copied_fork_ignores_source_history_base() {
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: None,
+            materialized_resume: None,
         }),
         SessionSource::Exec,
         AgentControl::default(),
@@ -11732,11 +11754,11 @@ async fn sample_rollout(
     let snapshot1 = raw_history_items(&live_history);
     let user_messages1 = collect_user_messages(&snapshot1);
     let rebuilt1 = compact::build_compacted_history(Vec::new(), &user_messages1, summary1);
-    live_history.replace_annotated(rebuilt1);
+    live_history.replace_annotated(rebuilt1.clone());
     let (window_number, window_ids) = session.advance_auto_compact_window().await;
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary1.to_string(),
-        replacement_history: None,
+        replacement_history: Some(rebuilt1),
         mcp_resource_origins: None,
         window_number: Some(window_number),
         first_window_id: Some(window_ids.first_window_id.to_string()),
@@ -11762,11 +11784,11 @@ async fn sample_rollout(
     let snapshot2 = raw_history_items(&live_history);
     let user_messages2 = collect_user_messages(&snapshot2);
     let rebuilt2 = compact::build_compacted_history(Vec::new(), &user_messages2, summary2);
-    live_history.replace_annotated(rebuilt2);
+    live_history.replace_annotated(rebuilt2.clone());
     let (window_number, window_ids) = session.advance_auto_compact_window().await;
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary2.to_string(),
-        replacement_history: None,
+        replacement_history: Some(rebuilt2),
         mcp_resource_origins: None,
         window_number: Some(window_number),
         first_window_id: Some(window_ids.first_window_id.to_string()),

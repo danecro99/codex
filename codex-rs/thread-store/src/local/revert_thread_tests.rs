@@ -67,6 +67,17 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
     )
     .await;
     compress_rollout(original_path.as_path());
+    let materialized_resume_path = home
+        .path()
+        .join("materialized_resume_state_v1")
+        .join(format!("{thread_id}.json"));
+    std::fs::create_dir_all(
+        materialized_resume_path
+            .parent()
+            .expect("materialized resume parent"),
+    )
+    .expect("create materialized resume directory");
+    std::fs::write(&materialized_resume_path, b"derived state").expect("write derived state");
 
     store
         .revert_thread(RevertThreadParams {
@@ -75,6 +86,7 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         })
         .await
         .expect("revert before second turn");
+    assert!(!materialized_resume_path.exists());
     let first_replacement_path = state_db
         .get_thread(thread_id)
         .await

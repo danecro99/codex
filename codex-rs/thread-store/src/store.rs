@@ -28,6 +28,7 @@ use crate::MoveThreadToSectionParams;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
+use crate::PublishMaterializedResumeParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::RenameThreadSectionParams;
@@ -155,6 +156,28 @@ pub trait ThreadStore: Any + Send + Sync {
         Box::pin(async {
             Err(ThreadStoreError::Unsupported {
                 operation: "load_latest_model_context",
+            })
+        })
+    }
+
+    /// Loads source replay for fork and metadata consumers without applying private resume state.
+    /// Stores that never return materialized resume state can use the ordinary implementation.
+    fn load_latest_model_context_for_replay(
+        &self,
+        params: LoadModelContextParams,
+    ) -> ThreadStoreFuture<'_, StoredModelContext> {
+        self.load_latest_model_context(params)
+    }
+
+    /// Atomically publishes a materialized resume state against its previously loaded source
+    /// fence. Stores that do not return a materialization fence never receive this call.
+    fn publish_materialized_resume_state(
+        &self,
+        _params: PublishMaterializedResumeParams,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "publish_materialized_resume_state",
             })
         })
     }

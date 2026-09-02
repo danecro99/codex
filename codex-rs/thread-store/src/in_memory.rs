@@ -32,6 +32,7 @@ use crate::MoveThreadToSectionParams;
 use crate::PersistContext;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
+use crate::ResumeLoadDiagnostics;
 use crate::ResumeThreadParams;
 use crate::StoredModelContext;
 use crate::StoredThread;
@@ -676,6 +677,8 @@ impl InMemoryThreadStore {
             thread_id: params.thread_id,
             items: items.clone(),
             warnings: Vec::new(),
+            materialized_resume: None,
+            diagnostics: ResumeLoadDiagnostics::default(),
         })
     }
 

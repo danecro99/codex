@@ -4424,6 +4424,7 @@ impl ThreadRequestProcessor {
                 conversation_id: model_context.thread_id,
                 history: Arc::new(model_context.items),
                 rollout_path: stored_thread.rollout_path.clone(),
+                materialized_resume: model_context.materialized_resume.map(Box::new),
             });
             return Ok((history, stored_thread, model_context.warnings));
         }
@@ -4528,6 +4529,7 @@ impl ThreadRequestProcessor {
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: stored_thread.rollout_path.clone(),
+            materialized_resume: None,
         }))
     }
 
@@ -4884,7 +4886,7 @@ impl ThreadRequestProcessor {
         {
             Some(
                 self.thread_store
-                    .load_latest_model_context(StoreLoadModelContextParams {
+                    .load_latest_model_context_for_replay(StoreLoadModelContextParams {
                         thread_id: source_thread_id,
                         include_archived: true,
                         rollout_path: None,
@@ -4997,6 +4999,7 @@ impl ThreadRequestProcessor {
                         conversation_id: source_thread_id,
                         history: history_items,
                         rollout_path: source_thread.rollout_path.clone(),
+                        materialized_resume: None,
                     }),
                     thread_source,
                     parent_trace,

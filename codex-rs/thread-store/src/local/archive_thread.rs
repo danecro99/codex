@@ -11,6 +11,7 @@ use chrono::Utc;
 use codex_rollout::RolloutReferenceIndex;
 use tracing::warn;
 
+use super::materialized_resume;
 use super::thread_rollout_resolver;
 pub(super) async fn archive_threads(
     store: &LocalThreadStore,
@@ -111,6 +112,7 @@ async fn archive_thread_with_paths(
         message: format!("failed to archive selected rollout for thread {thread_id}"),
     })?;
 
+    materialized_resume::remove(store, thread_id)?;
     for (index, (source, destination)) in rollout_moves.iter().enumerate() {
         if let Err(err) = std::fs::rename(source, destination) {
             if let Err(restore_err) = restore_rollout_moves(&rollout_moves[..index]) {

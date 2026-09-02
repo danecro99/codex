@@ -16,6 +16,7 @@ use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
+#[cfg(test)]
 use crate::compact;
 use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
@@ -72,6 +73,11 @@ use codex_extension_api::TurnContextContributionInput;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_features::unstable_features_warning_event;
+use codex_history::MATERIALIZED_RESUME_STATE_VERSION;
+use codex_history::MaterializedAutoCompactWindow;
+use codex_history::MaterializedPreviousTurnSettings;
+use codex_history::MaterializedResume;
+use codex_history::MaterializedResumeState;
 use codex_history::RolloutItem;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
@@ -162,6 +168,7 @@ use codex_thread_store::LiveThread;
 use codex_thread_store::LiveThreadInitGuard;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::PersistContext;
+use codex_thread_store::PublishMaterializedResumeParams;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::ThreadPersistenceMetadata;
@@ -276,6 +283,11 @@ pub(crate) struct PreviousTurnSettings {
     pub(crate) model: String,
     pub(crate) comp_hash: Option<String>,
     pub(crate) realtime_active: Option<bool>,
+}
+
+struct AppliedRolloutReconstruction {
+    previous_turn_settings: Option<PreviousTurnSettings>,
+    materialized_state: MaterializedResumeState,
 }
 
 use crate::exec_policy::ExecPolicyUpdateError;
@@ -1339,7 +1351,10 @@ impl Session {
         state.clear_connector_selection();
     }
 
-    async fn record_initial_history(&self, conversation_history: InitialHistory) {
+    async fn record_initial_history(
+        &self,
+        conversation_history: InitialHistory,
+    ) -> anyhow::Result<()> {
         let (is_subagent, is_paginated_subagent) = {
             let state = self.state.lock().await;
             let session_configuration = &state.session_configuration;
@@ -1370,18 +1385,46 @@ impl Session {
             InitialHistory::Resumed(resumed_history) => {
                 let turn_context = self.new_default_turn().await;
                 let rollout_items = resumed_history.history;
+                let materialized_resume = resumed_history.materialized_resume;
+                let reducer_started = std::time::Instant::now();
+                let applied = self
+                    .apply_rollout_reconstruction(
+                        &turn_context,
+                        &rollout_items,
+                        materialized_resume
+                            .as_ref()
+                            .and_then(|resume| resume.state.as_ref()),
+                    )
+                    .await?;
+                let reducer_elapsed_millis =
+                    u64::try_from(reducer_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                tracing::info!(
+                    reducer_elapsed_millis,
+                    replay_input_items = rollout_items.len(),
+                    checkpoint_hit = materialized_resume
+                        .as_ref()
+                        .is_some_and(|resume| resume.state.is_some()),
+                    "reconstructed materialized resume state"
+                );
+                let previous_turn_settings = applied.previous_turn_settings;
                 if matches!(
-                    rollout_items.iter().rev().find_map(|item| match item {
-                        RolloutItem::EventMsg(event) => agent_status_from_event(event),
-                        _ => None,
-                    }),
+                    applied.materialized_state.last_agent_status.as_ref(),
                     Some(AgentStatus::Interrupted)
                 ) {
                     self.agent_status.send_replace(AgentStatus::Interrupted);
                 }
-                let previous_turn_settings = self
-                    .apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+
+                if let Some(materialized_resume) = materialized_resume
+                    && (materialized_resume.state.is_none() || rollout_items.len() > 1)
+                {
+                    self.publish_materialized_resume_state(
+                        &turn_context,
+                        *materialized_resume,
+                        applied.materialized_state,
+                        reducer_elapsed_millis,
+                    )
+                    .await?;
+                }
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info().slug.as_str();
@@ -1403,13 +1446,6 @@ impl Session {
                     .await;
                 }
 
-                // Seed usage info from the recorded rollout so UIs can show token counts
-                // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
-                    let mut state = self.state.lock().await;
-                    state.set_token_info(Some(info));
-                }
-
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
                 if !is_subagent {
@@ -1420,8 +1456,12 @@ impl Session {
             InitialHistory::Forked(mut rollout_items) => {
                 let turn_context = self.new_default_turn().await;
                 Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
-                self.apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+                self.apply_rollout_reconstruction(
+                    &turn_context,
+                    &rollout_items,
+                    /*materialized_state*/ None,
+                )
+                .await?;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -1479,6 +1519,7 @@ impl Session {
                     .await;
             }
         }
+        Ok(())
     }
 
     #[instrument(
@@ -1493,9 +1534,10 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-    ) -> Option<PreviousTurnSettings> {
+        materialized_state: Option<&MaterializedResumeState>,
+    ) -> anyhow::Result<AppliedRolloutReconstruction> {
         let rollout_reconstruction::RolloutReconstruction {
-            mut history,
+            history,
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,
@@ -1503,16 +1545,20 @@ impl Session {
             first_window_id,
             previous_window_id,
             window_id,
+            token_info,
+            last_agent_status,
+            mcp_resource_origins,
         } = self
-            .reconstruct_history_from_rollout(turn_context, rollout_items)
-            .await;
+            .reconstruct_resume_state(turn_context, rollout_items, materialized_state)
+            .await?;
         // Keep the recorded rollout unchanged. Prepare its reconstructed history before
         // installing it, so legacy media is processed once for this resume or fork and
         // will be processed again if the rollout is reconstructed in a future session.
         // Replay disables image-resize notices, so media preparation remains one-to-one. Keep
         // the prior batch behavior and carry history-only metadata in a positional sidecar.
         let (mut prepared_history, metadata): (Vec<_>, Vec<_>) = history
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|envelope| (envelope.item, envelope.metadata))
             .unzip();
         let _ = prepare_image_response_items(
@@ -1526,29 +1572,29 @@ impl Session {
             metadata.len(),
             "replay media preparation must remain one-to-one when resize notices are disabled"
         );
-        history = prepared_history
+        let prepared_history = prepared_history
             .into_iter()
             .zip(metadata)
             .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
             .collect();
-        {
+        let (window_number, window_ids) = {
             let mut state = self.state.lock().await;
-            state.replace_annotated_history(history, reference_context_item);
-            if let Some(world_state) = world_state_baseline {
+            state.replace_annotated_history(prepared_history, reference_context_item.clone());
+            if let Some(world_state) = world_state_baseline.clone() {
                 state.history.set_world_state_baseline(world_state);
             }
             let fallback_ids = state.auto_compact_window_ids();
             let window_id = window_id.unwrap_or(fallback_ids.window_id);
-            state.restore_auto_compact_window(
-                window_number,
-                AutoCompactWindowIds {
-                    first_window_id: first_window_id.unwrap_or(window_id),
-                    previous_window_id,
-                    window_id,
-                },
-            );
+            let window_ids = AutoCompactWindowIds {
+                first_window_id: first_window_id.unwrap_or(window_id),
+                previous_window_id,
+                window_id,
+            };
+            state.restore_auto_compact_window(window_number, window_ids);
             state.set_previous_turn_settings(previous_turn_settings.clone());
-        }
+            state.set_token_info(token_info.clone());
+            (window_number, window_ids)
+        };
         let prefix_tokens = if matches!(
             turn_context.config.model_auto_compact_token_limit_scope,
             AutoCompactTokenLimitScope::BodyAfterPrefix
@@ -1563,7 +1609,106 @@ impl Session {
             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
                 .await;
         }
-        previous_turn_settings
+        let truncation_policy = turn_context.model_info().truncation_policy.into();
+        Ok(AppliedRolloutReconstruction {
+            previous_turn_settings: previous_turn_settings.clone(),
+            materialized_state: MaterializedResumeState {
+                version: MATERIALIZED_RESUME_STATE_VERSION,
+                history,
+                previous_turn_settings: previous_turn_settings.map(|settings| {
+                    MaterializedPreviousTurnSettings {
+                        model: settings.model,
+                        comp_hash: settings.comp_hash,
+                        realtime_active: settings.realtime_active,
+                    }
+                }),
+                reference_context_item,
+                world_state_baseline: world_state_baseline
+                    .map(|snapshot| WorldStateItem::full(snapshot.into_object())),
+                mcp_resource_origins,
+                auto_compact_window: MaterializedAutoCompactWindow {
+                    window_number,
+                    first_window_id: window_ids.first_window_id.to_string(),
+                    previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+                    window_id: window_ids.window_id.to_string(),
+                },
+                token_info,
+                last_agent_status,
+                truncation_policy,
+                estimated_prefill_input_tokens: prefix_tokens,
+            },
+        })
+    }
+
+    async fn publish_materialized_resume_state(
+        &self,
+        turn_context: &TurnContext,
+        materialized_resume: MaterializedResume,
+        materialized_state: MaterializedResumeState,
+        reducer_elapsed_millis: u64,
+    ) -> anyhow::Result<()> {
+        let model_context_window = turn_context.model_context_window().ok_or_else(|| {
+            anyhow::anyhow!(
+                "codex_resume_state_needs_compaction: active model has no context-window bound"
+            )
+        })?;
+        let context_tokens = usize::try_from(model_context_window).map_err(|_| {
+            anyhow::anyhow!(
+                "codex_resume_state_needs_compaction: active model context-window bound is invalid"
+            )
+        })?;
+        // Six bytes per model-context byte is JSON's worst-case character escaping expansion.
+        // One maximum rollout record covers envelope and non-text structural state.
+        let max_state_bytes = codex_utils_string::approx_bytes_for_tokens(context_tokens)
+            .saturating_mul(6)
+            .saturating_add(codex_rollout::MAX_ROLLOUT_LINE_BYTES);
+        let max_state_bytes = u64::try_from(max_state_bytes).unwrap_or(u64::MAX);
+        let live_thread = self.services.live_thread.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "codex_resume_state_needs_compaction: resumed source has no live persistence handle"
+            )
+        })?;
+        let persist_started = std::time::Instant::now();
+        live_thread
+            .publish_materialized_resume_state(PublishMaterializedResumeParams {
+                thread_id: self.thread_id(),
+                source: materialized_resume.source,
+                state: materialized_state,
+                max_state_bytes,
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to publish materialized resume state: {err}"))?;
+        let persist_elapsed_millis =
+            u64::try_from(persist_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let bootstrap_elapsed_millis =
+            reducer_elapsed_millis.saturating_add(persist_elapsed_millis);
+        tracing::info!(
+            reducer_elapsed_millis,
+            persist_elapsed_millis,
+            bootstrap_elapsed_millis,
+            max_state_bytes,
+            "published materialized resume state"
+        );
+        if let Some(metrics) = codex_otel::global() {
+            let tags = &[];
+            for (name, value) in [
+                (
+                    "codex.resume.reducer_elapsed_millis",
+                    reducer_elapsed_millis,
+                ),
+                (
+                    "codex.resume.persist_elapsed_millis",
+                    persist_elapsed_millis,
+                ),
+                (
+                    "codex.resume.bootstrap_elapsed_millis",
+                    bootstrap_elapsed_millis,
+                ),
+            ] {
+                let _ = metrics.histogram(name, i64::try_from(value).unwrap_or(i64::MAX), tags);
+            }
+        }
+        Ok(())
     }
 
     async fn set_auto_compact_window_estimated_prefill_for_scope(

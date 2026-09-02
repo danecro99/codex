@@ -18,25 +18,37 @@ use codex_protocol::models::is_local_audio_close_tag_text;
 use codex_protocol::models::is_local_audio_open_tag_text;
 use codex_protocol::models::is_local_image_close_tag_text;
 use codex_protocol::models::is_local_image_open_tag_text;
+#[cfg(test)]
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
+#[cfg(test)]
 use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
+#[cfg(test)]
 use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
+#[cfg(test)]
 use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
+#[cfg(test)]
 use codex_protocol::protocol::ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG;
+#[cfg(test)]
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
+#[cfg(test)]
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
+#[cfg(test)]
 use codex_protocol::protocol::REALTIME_CONVERSATION_OPEN_TAG;
+#[cfg(test)]
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
+#[cfg(test)]
 use codex_protocol::protocol::TOOLS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use tracing::warn;
 use uuid::Uuid;
 
+#[cfg(test)]
 use crate::context::APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX;
 use crate::context::is_contextual_user_fragment;
 use crate::context::parse_visible_hook_prompt_message;
 use crate::web_search::web_search_action_detail;
 
+#[cfg(test)]
 const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
     "<permissions instructions>",
     APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX,
@@ -70,18 +82,21 @@ pub(crate) fn is_contextual_user_message_content(message: &[ContentItem]) -> boo
 /// `build_initial_context` can bundle these fragments together with persistent developer text in a
 /// single developer message, so callers that care about invalidating a stored reference baseline
 /// should pair this with `has_non_contextual_dev_message_content`.
+#[cfg(test)]
 pub(crate) fn is_contextual_dev_message_content(message: &[ContentItem]) -> bool {
     message.iter().any(is_contextual_dev_fragment)
 }
 
 /// Returns true when a developer message contains any fragment that is not part of the
 /// rollback-trimmable contextual prefix set.
+#[cfg(test)]
 pub(crate) fn has_non_contextual_dev_message_content(message: &[ContentItem]) -> bool {
     message
         .iter()
         .any(|content_item| !is_contextual_dev_fragment(content_item))
 }
 
+#[cfg(test)]
 fn is_contextual_dev_fragment(content_item: &ContentItem) -> bool {
     let ContentItem::InputText { text } = content_item else {
         return false;

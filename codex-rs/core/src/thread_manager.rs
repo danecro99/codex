@@ -1312,6 +1312,7 @@ impl ThreadManager {
             conversation_id: model_context.thread_id,
             history: Arc::new(model_context.items),
             rollout_path: Some(requested_rollout_path),
+            materialized_resume: model_context.materialized_resume.map(Box::new),
         }))
     }
 
@@ -1359,6 +1360,7 @@ impl ThreadManager {
             conversation_id: prepared.source_thread_id,
             history: Arc::clone(&prepared.model_context),
             rollout_path: None,
+            materialized_resume: None,
         });
         let fork_persistence = ForkPersistence::Referenced {
             history_base: prepared.history_base,
@@ -1552,6 +1554,21 @@ impl ThreadManagerState {
                 err => CodexErr::Fatal(format!(
                     "failed to load model context for thread {thread_id}: {err}"
                 )),
+            })
+    }
+
+    pub(crate) async fn load_latest_model_context_for_replay(
+        &self,
+        params: LoadModelContextParams,
+    ) -> CodexResult<StoredModelContext> {
+        let thread_id = params.thread_id;
+        self.thread_store
+            .load_latest_model_context_for_replay(params)
+            .await
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "failed to load model-context replay for thread {thread_id}: {err}"
+                ))
             })
     }
 
@@ -2171,6 +2188,7 @@ fn stored_thread_to_initial_history(
         conversation_id: thread_id,
         history: Arc::new(history.items),
         rollout_path: rollout_path.or(stored_thread.rollout_path),
+        materialized_resume: None,
     }))
 }
 

@@ -26,6 +26,13 @@ pub mod state_db;
 
 pub use codex_history::CompactedItem;
 pub use codex_history::InitialHistory;
+pub use codex_history::MATERIALIZED_RESUME_STATE_VERSION;
+pub use codex_history::MaterializedAutoCompactWindow;
+pub use codex_history::MaterializedPreviousTurnSettings;
+pub use codex_history::MaterializedResume;
+pub use codex_history::MaterializedResumeLineageSegment;
+pub use codex_history::MaterializedResumeSource;
+pub use codex_history::MaterializedResumeState;
 pub use codex_history::ResponseItemEnvelope;
 pub use codex_history::ResumedHistory;
 pub use codex_history::RolloutItem;

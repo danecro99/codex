@@ -1311,6 +1311,15 @@ impl Session {
                     config.analytics_enabled,
                 )
             });
+            if let InitialHistory::Resumed(resumed) = &initial_history
+                && let Some(checkpoint) = resumed
+                    .materialized_resume
+                    .as_ref()
+                    .and_then(|resume| resume.state.as_ref())
+                    .and_then(|state| state.mcp_resource_origins.as_ref())
+            {
+                mcp_runtime.restore_resource_origin_checkpoint(checkpoint);
+            }
             for item in initial_history.get_rollout_items() {
                 match item {
                     RolloutItem::Compacted(compacted) => {
@@ -1562,7 +1571,7 @@ impl Session {
             };
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
-            Box::pin(sess.record_initial_history(initial_history)).await;
+            Box::pin(sess.record_initial_history(initial_history)).await?;
             if restore_child_window {
                 sess.state.lock().await.restore_auto_compact_window(
                     /*window_number*/ 0,

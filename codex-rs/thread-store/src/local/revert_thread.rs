@@ -116,6 +116,7 @@ pub(super) async fn revert(
     recorder.persist().await.map_err(thread_store_io_error)?;
     recorder.shutdown().await.map_err(thread_store_io_error)?;
 
+    super::materialized_resume::remove(store, thread_id)?;
     let replaced = state_db
         .replace_rollout_path_if_current(
             thread_id,

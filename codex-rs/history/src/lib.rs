@@ -35,7 +35,7 @@ use serde::de::Error as _;
 /// A model-history item with room for history-only metadata.
 ///
 /// Persistence keeps the response item intact and stores its metadata separately.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponseItemEnvelope {
     pub item: ResponseItem,
     pub metadata: Option<CodexHarnessMetadata>,
@@ -216,6 +216,81 @@ pub struct ResumedHistory {
     pub conversation_id: ThreadId,
     pub history: Arc<Vec<RolloutItem>>,
     pub rollout_path: Option<PathBuf>,
+    /// Private derived state used to avoid replaying an unchanged rollout prefix.
+    #[serde(skip)]
+    pub materialized_resume: Option<Box<MaterializedResume>>,
+}
+
+/// Current private on-disk schema for [`MaterializedResumeState`].
+pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 1;
+
+/// Exact post-reconstruction state required to hydrate a resumed session.
+///
+/// This is derived state. It never replaces or truncates the append-only rollout transcript.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaterializedResumeState {
+    pub version: u32,
+    pub history: Arc<Vec<ResponseItemEnvelope>>,
+    pub previous_turn_settings: Option<MaterializedPreviousTurnSettings>,
+    pub reference_context_item: Option<TurnContextItem>,
+    pub world_state_baseline: Option<WorldStateItem>,
+    pub mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
+    pub auto_compact_window: MaterializedAutoCompactWindow,
+    pub token_info: Option<codex_protocol::protocol::TokenUsageInfo>,
+    pub last_agent_status: Option<codex_protocol::protocol::AgentStatus>,
+    pub truncation_policy: codex_protocol::protocol::TruncationPolicy,
+    pub estimated_prefill_input_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedPreviousTurnSettings {
+    pub model: String,
+    pub comp_hash: Option<String>,
+    pub realtime_active: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedAutoCompactWindow {
+    pub window_number: u64,
+    pub first_window_id: String,
+    pub previous_window_id: Option<String>,
+    pub window_id: String,
+}
+
+/// Source generation and optional state returned by a targeted resume read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaterializedResume {
+    pub source: MaterializedResumeSource,
+    /// `None` means this source has not been materialized yet. Core must reconstruct it once and
+    /// publish the exact state against `source`.
+    pub state: Option<MaterializedResumeState>,
+    /// Model-derived maximum serialized state size accepted for this checkpoint.
+    pub max_state_bytes: Option<u64>,
+}
+
+/// Durable append fence for a materialized resume state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedResumeSource {
+    pub thread_id: ThreadId,
+    pub rollout_id: ThreadId,
+    pub canonical_rollout_path: PathBuf,
+    pub history_mode: ThreadHistoryMode,
+    pub end_byte_offset: u64,
+    pub end_ordinal_exclusive: Option<u64>,
+    pub modified_unix_nanos: u64,
+    pub prefix_head_sha256: String,
+    pub prefix_tail_sha256: String,
+    pub lineage: Vec<MaterializedResumeLineageSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedResumeLineageSegment {
+    pub rollout_id: ThreadId,
+    pub canonical_rollout_path: PathBuf,
+    pub end_byte_offset: u64,
+    pub end_ordinal_exclusive: Option<u64>,
+    pub prefix_head_sha256: String,
+    pub prefix_tail_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

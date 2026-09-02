@@ -1087,10 +1087,12 @@ async fn review_input_isolated_from_parent_history() {
     // Seed a parent session history via resume file with both user + assistant items.
     let codex_home = Arc::new(TempDir::new().unwrap());
 
-    let session_file = codex_home.path().join("resume.jsonl");
+    let convo_id = Uuid::new_v4();
+    let session_file = codex_home
+        .path()
+        .join(format!("rollout-2024-01-01T00-00-00-{convo_id}.jsonl"));
     {
         let mut f = tokio::fs::File::create(&session_file).await.unwrap();
-        let convo_id = Uuid::new_v4();
         // Proper session_meta line (enveloped) with a conversation id
         let meta_line = serde_json::json!({
             "timestamp": "2024-01-01T00:00:00.000Z",

@@ -30,6 +30,7 @@ pub struct ReverseJsonlScanner<R> {
     max_record_bytes: Option<usize>,
     fail_on_oversized_record: bool,
     discarding_oversized_record: bool,
+    bytes_read: u64,
 }
 
 impl<R> ReverseJsonlScanner<R>
@@ -62,6 +63,7 @@ where
             max_record_bytes: None,
             fail_on_oversized_record: false,
             discarding_oversized_record: false,
+            bytes_read: 0,
         })
     }
 
@@ -97,6 +99,11 @@ where
         })
     }
 
+    /// Number of source bytes fetched by this scanner.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
     fn scan_next_with<T>(
         &mut self,
         decode: impl Fn(&[u8]) -> serde_json::Result<T>,
@@ -119,6 +126,7 @@ where
                 self.next_chunk_end -= read_size as u64;
                 self.reader.seek(SeekFrom::Start(self.next_chunk_end))?;
                 self.reader.read_exact(&mut self.chunk[..read_size])?;
+                self.bytes_read = self.bytes_read.saturating_add(read_size as u64);
                 self.chunk_position = read_size;
             }
 
