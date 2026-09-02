@@ -99,22 +99,40 @@ fn write_large_legacy_rollout(home: &std::path::Path, uuid: Uuid) -> std::path::
     path
 }
 
-fn rewrite_middle_payload_byte(path: &std::path::Path) {
+fn rewrite_payload_byte_at_or_after(path: &std::path::Path, search_start: usize) -> usize {
     let transcript = std::fs::read(path).expect("read large transcript");
-    let middle = transcript.len() / 2;
-    let relative = transcript[middle..]
+    let relative = transcript[search_start..]
         .iter()
         .position(|byte| *byte == b'x')
-        .expect("middle payload byte");
-    let offset = u64::try_from(middle + relative).expect("middle offset");
+        .expect("payload byte after requested offset");
+    let offset = search_start + relative;
     let mut file = OpenOptions::new()
         .write(true)
         .open(path)
         .expect("open source without truncation");
-    file.seek(SeekFrom::Start(offset))
-        .expect("seek middle byte");
-    file.write_all(b"y").expect("rewrite middle byte");
-    file.sync_all().expect("sync middle rewrite");
+    file.seek(SeekFrom::Start(
+        u64::try_from(offset).expect("payload offset"),
+    ))
+    .expect("seek payload byte");
+    file.write_all(b"y").expect("rewrite payload byte");
+    file.sync_all().expect("sync payload rewrite");
+    offset
+}
+
+fn rewrite_middle_payload_byte(path: &std::path::Path) {
+    let length = usize::try_from(std::fs::metadata(path).expect("source metadata").len())
+        .expect("source length");
+    rewrite_payload_byte_at_or_after(path, length / 2);
+}
+
+fn rewrite_unsampled_payload_byte(path: &std::path::Path) {
+    let length = usize::try_from(std::fs::metadata(path).expect("source metadata").len())
+        .expect("source length");
+    let offset = rewrite_payload_byte_at_or_after(path, length / 4);
+    let middle_start = length.saturating_sub(FENCE_SAMPLE_BYTES) / 2;
+    assert!(offset >= FENCE_SAMPLE_BYTES);
+    assert!(offset < middle_start || offset >= middle_start + FENCE_SAMPLE_BYTES);
+    assert!(offset < length.saturating_sub(FENCE_SAMPLE_BYTES));
 }
 
 async fn publish_loaded_state(
@@ -520,7 +538,7 @@ async fn paginated_checkpoint_follows_a_normal_descendant_segment() {
 }
 
 #[tokio::test]
-async fn append_generation_rejects_large_middle_rewrite_outside_samples() {
+async fn append_generation_rejects_sampled_middle_rewrite() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 4_009);
     let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
@@ -562,7 +580,7 @@ async fn append_generation_rejects_large_middle_rewrite_outside_samples() {
 }
 
 #[tokio::test]
-async fn pending_append_rejects_middle_prefix_rewrite_before_suffix_commit() {
+async fn pending_append_rejects_unsampled_prefix_rewrite_before_suffix_commit() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 4_010);
     let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
@@ -591,7 +609,7 @@ async fn pending_append_rejects_middle_prefix_rewrite_before_suffix_commit() {
         )
         .expect("begin pending append")
     );
-    rewrite_middle_payload_byte(path.as_path());
+    rewrite_unsampled_payload_byte(path.as_path());
     codex_rollout::append_rollout_item_to_path(
         path.as_path(),
         &user_message("legitimate suffix".to_string()),
@@ -608,7 +626,9 @@ async fn pending_append_rejects_middle_prefix_rewrite_before_suffix_commit() {
         "{error}"
     );
     assert!(
-        error.to_string().contains("stored source prefix contract"),
+        error
+            .to_string()
+            .contains("complete stored source prefix digest"),
         "{error}"
     );
 }

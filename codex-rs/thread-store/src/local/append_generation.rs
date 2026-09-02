@@ -25,7 +25,7 @@ use super::LocalThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-const APPEND_GENERATION_VERSION: u32 = 2;
+const APPEND_GENERATION_VERSION: u32 = 3;
 const APPEND_GENERATION_DIRECTORY: &str = "rollout_append_generation_v1";
 const MAX_APPEND_GENERATION_BYTES: u64 = 1024 * 1024;
 const FENCE_SAMPLE_BYTES: usize = 64 * 1024;
@@ -64,6 +64,7 @@ struct SourcePosition {
     modified_unix_nanos: u64,
     file_identity: String,
     change_marker: String,
+    prefix_sha256: String,
     prefix_head_sha256: String,
     prefix_middle_sha256: String,
     prefix_tail_sha256: String,
@@ -176,7 +177,11 @@ pub(super) fn bootstrap_current(
         return Ok(generation);
     }
     let canonical_rollout_path = canonical_existing_path(rollout_path)?;
-    let position = source_position(canonical_rollout_path.as_path(), history_mode)?;
+    let position = source_position(
+        canonical_rollout_path.as_path(),
+        history_mode,
+        SourcePrefixDigest::Calculate,
+    )?;
     let generation_id = ThreadId::new().to_string();
     let chain_sha256 = genesis_chain(&generation_id, rollout_id, &position)?;
     let journal = AppendGenerationJournal {
@@ -299,9 +304,10 @@ fn recover_pending(
     let Some(pending) = journal.pending.clone() else {
         return Ok(());
     };
-    let current = source_position(
+    let mut current = source_position(
         journal.canonical_rollout_path.as_path(),
         pending.history_mode,
+        SourcePrefixDigest::Known(journal.stable.position.prefix_sha256.as_str()),
     )?;
     if positions_equal(&current, &journal.stable.position) {
         journal.pending = None;
@@ -313,7 +319,7 @@ fn recover_pending(
             "source changed without completing its pending append",
         ));
     }
-    validate_stored_prefix(
+    let prefix_hasher = validate_stored_prefix(
         journal.canonical_rollout_path.as_path(),
         &journal.stable.position,
         pending.history_mode,
@@ -325,10 +331,13 @@ fn recover_pending(
         journal.stable.position.end_ordinal_exclusive,
         current.end_ordinal_exclusive,
         pending.history_mode,
+        prefix_hasher,
     )?;
+    current.prefix_sha256 = suffix.source_prefix_sha256.clone();
     let verified_current = source_position(
         journal.canonical_rollout_path.as_path(),
         pending.history_mode,
+        SourcePrefixDigest::Known(current.prefix_sha256.as_str()),
     )?;
     if !positions_equal(&current, &verified_current) {
         return Err(ThreadStoreError::Conflict {
@@ -387,7 +396,11 @@ fn validate_current_position(journal: &AppendGenerationJournal) -> ThreadStoreRe
     } else {
         ThreadHistoryMode::Legacy
     };
-    let current = source_position(journal.canonical_rollout_path.as_path(), history_mode)?;
+    let current = source_position(
+        journal.canonical_rollout_path.as_path(),
+        history_mode,
+        SourcePrefixDigest::Known(journal.stable.position.prefix_sha256.as_str()),
+    )?;
     if !positions_equal(&current, &journal.stable.position) {
         return Err(invalid(
             "source changed outside the canonical append-generation contract",
@@ -400,14 +413,28 @@ fn positions_equal(left: &SourcePosition, right: &SourcePosition) -> bool {
     left == right
 }
 
+enum SourcePrefixDigest<'a> {
+    /// Bootstrap a new generation by hashing the complete source once.
+    Calculate,
+    /// Reuse the digest already fenced by a stable generation on bounded reads.
+    Known(&'a str),
+}
+
 fn source_position(
     path: &Path,
     history_mode: ThreadHistoryMode,
+    prefix_digest: SourcePrefixDigest<'_>,
 ) -> ThreadStoreResult<SourcePosition> {
     let before = std::fs::metadata(path).map_err(source_error)?;
     let (before_file_identity, _) = platform_file_generation(&before);
     let end_byte_offset = before.len();
     let end_ordinal_exclusive = terminal_ordinal_exclusive(path, end_byte_offset, history_mode)?;
+    let prefix_sha256 = match prefix_digest {
+        SourcePrefixDigest::Calculate => {
+            format!("{:x}", hash_prefix_state(path, end_byte_offset)?.finalize())
+        }
+        SourcePrefixDigest::Known(prefix_sha256) => prefix_sha256.to_string(),
+    };
     let (prefix_head_sha256, _) = hash_sample(path, 0, end_byte_offset)?;
     let (prefix_middle_sha256, _) =
         hash_sample(path, middle_sample_start(end_byte_offset), end_byte_offset)?;
@@ -430,6 +457,7 @@ fn source_position(
         modified_unix_nanos: modified_unix_nanos(after.modified().map_err(source_error)?)?,
         file_identity,
         change_marker,
+        prefix_sha256,
         prefix_head_sha256,
         prefix_middle_sha256,
         prefix_tail_sha256,
@@ -440,7 +468,7 @@ fn validate_stored_prefix(
     path: &Path,
     stored: &SourcePosition,
     history_mode: ThreadHistoryMode,
-) -> ThreadStoreResult<()> {
+) -> ThreadStoreResult<Sha256> {
     let before = std::fs::metadata(path).map_err(source_error)?;
     if before.len() < stored.end_byte_offset {
         return Err(invalid("pending append truncated the stored source prefix"));
@@ -451,6 +479,8 @@ fn validate_stored_prefix(
             "pending append replaced the stored source file identity",
         ));
     }
+    let prefix_hasher = hash_prefix_state(path, stored.end_byte_offset)?;
+    let prefix_sha256 = format!("{:x}", prefix_hasher.clone().finalize());
     let (prefix_head_sha256, _) = hash_sample(path, 0, stored.end_byte_offset)?;
     let (prefix_middle_sha256, _) = hash_sample(
         path,
@@ -473,6 +503,11 @@ fn validate_stored_prefix(
             message: "rollout changed while its pending prefix was inspected".to_string(),
         });
     }
+    if prefix_sha256 != stored.prefix_sha256 {
+        return Err(invalid(
+            "pending append changed the complete stored source prefix digest",
+        ));
+    }
     if end_ordinal_exclusive != stored.end_ordinal_exclusive
         || prefix_head_sha256 != stored.prefix_head_sha256
         || prefix_middle_sha256 != stored.prefix_middle_sha256
@@ -482,7 +517,7 @@ fn validate_stored_prefix(
             "pending append changed the stored source prefix contract",
         ));
     }
-    Ok(())
+    Ok(prefix_hasher)
 }
 
 fn terminal_ordinal_exclusive(
@@ -523,6 +558,7 @@ fn middle_sample_start(end_byte_offset: u64) -> u64 {
 struct SuffixSummary {
     item_count: u64,
     sha256: String,
+    source_prefix_sha256: String,
 }
 
 fn summarize_suffix(
@@ -532,6 +568,7 @@ fn summarize_suffix(
     start_ordinal_exclusive: Option<u64>,
     end_ordinal_exclusive: Option<u64>,
     history_mode: ThreadHistoryMode,
+    mut source_prefix_hasher: Sha256,
 ) -> ThreadStoreResult<SuffixSummary> {
     let mut file = File::open(path).map_err(source_error)?;
     file.seek(SeekFrom::Start(start)).map_err(source_error)?;
@@ -572,6 +609,7 @@ fn summarize_suffix(
                     .ok_or_else(|| invalid("pending append ordinal overflow"))?,
             );
         }
+        source_prefix_hasher.update(line.as_slice());
         hasher.update(line);
         item_count = item_count.saturating_add(1);
     }
@@ -581,6 +619,7 @@ fn summarize_suffix(
     Ok(SuffixSummary {
         item_count,
         sha256: format!("{:x}", hasher.finalize()),
+        source_prefix_sha256: format!("{:x}", source_prefix_hasher.finalize()),
     })
 }
 
@@ -691,6 +730,28 @@ fn hash_sample(path: &Path, start: u64, end: u64) -> ThreadStoreResult<(String, 
     file.read_exact(bytes.as_mut_slice())
         .map_err(source_error)?;
     Ok((format!("{:x}", Sha256::digest(bytes)), length))
+}
+
+fn hash_prefix_state(path: &Path, end: u64) -> ThreadStoreResult<Sha256> {
+    let file = File::open(path).map_err(source_error)?;
+    let mut reader = BufReader::new(file.take(end));
+    let mut hasher = Sha256::new();
+    let mut hashed = 0_u64;
+    let mut buffer = vec![0_u8; FENCE_SAMPLE_BYTES];
+    loop {
+        let read = reader.read(buffer.as_mut_slice()).map_err(source_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        hashed = hashed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+    if hashed != end {
+        return Err(invalid(format!(
+            "source prefix ended at byte {hashed}; expected {end}"
+        )));
+    }
+    Ok(hasher)
 }
 
 fn canonical_existing_path(path: &Path) -> ThreadStoreResult<PathBuf> {
