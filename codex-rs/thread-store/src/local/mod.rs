@@ -1,3 +1,4 @@
+mod append_generation;
 mod archive_thread;
 mod create_thread;
 mod delete_thread;

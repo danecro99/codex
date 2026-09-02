@@ -204,6 +204,7 @@ async fn delete_thread_after_reference_check(
     thread_rollouts.rollout_ids.insert(thread_id);
     super::materialized_resume::remove(store, thread_id)?;
     for rollout_id in thread_rollouts.rollout_ids {
+        super::append_generation::remove(store, rollout_id)?;
         super::thread_history::delete_thread(store, rollout_id).await?;
     }
 

@@ -14,6 +14,8 @@ use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::mcp::McpResourceOrigin;
+use codex_protocol::mcp::McpResourceOriginCheckpoint;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -2008,7 +2010,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
 }
 
 #[tokio::test]
-async fn checkpoint_suffix_replay_matches_full_replay_after_rollback() {
+async fn checkpoint_suffix_replay_is_equivalent_and_rollback_crossing_fence_is_loud() {
     let (session, turn_context) = make_session_and_context().await;
     let thread_id = ThreadId::new();
     let first_window_id = Uuid::now_v7();
@@ -2021,6 +2023,43 @@ async fn checkpoint_suffix_replay_matches_full_replay_after_rollback() {
     let mut suffix_context = first_context.clone();
     suffix_context.turn_id = Some("turn-3".to_string());
     suffix_context.model = "suffix-model".to_string();
+    let mut aborted_context = first_context.clone();
+    aborted_context.turn_id = Some("turn-4".to_string());
+    aborted_context.model = "aborted-model".to_string();
+    let mcp_resource_origins = McpResourceOriginCheckpoint {
+        origins: vec![McpResourceOrigin {
+            call_id: "widget-call".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            tool: "_product_search".to_string(),
+            connector_id: "shopping".to_string(),
+            link_id: None,
+            uri: "ui://shopping/widget".to_string(),
+            ambiguous_account: false,
+        }],
+        turns: vec!["turn-1".to_string()],
+        current_turn_id: Some("turn-1".to_string()),
+    };
+    let token_info = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            input_tokens: 1_000,
+            cached_input_tokens: 100,
+            cache_write_input_tokens: 0,
+            output_tokens: 250,
+            reasoning_output_tokens: 25,
+            total_tokens: 1_375,
+            codex_rollout_budget_units: None,
+        },
+        last_token_usage: TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            cache_write_input_tokens: 0,
+            output_tokens: 25,
+            reasoning_output_tokens: 5,
+            total_tokens: 140,
+            codex_rollout_budget_units: None,
+        },
+        model_context_window: Some(128_000),
+    };
     let session_meta = RolloutItem::SessionMeta(SessionMetaLine {
         meta: SessionMeta {
             session_id: thread_id.into(),
@@ -2053,7 +2092,7 @@ async fn checkpoint_suffix_replay_matches_full_replay_after_rollback() {
         RolloutItem::Compacted(CompactedItem {
             message: "summary".to_string(),
             replacement_history: Some(first_history),
-            mcp_resource_origins: None,
+            mcp_resource_origins: Some(mcp_resource_origins.clone()),
             window_number: Some(3),
             first_window_id: Some(first_window_id.to_string()),
             previous_window_id: Some(first_window_id.to_string()),
@@ -2102,6 +2141,32 @@ async fn checkpoint_suffix_replay_matches_full_replay_after_rollback() {
             "repository": {"head": "suffix"}
         }))),
         turn_complete("turn-3"),
+        RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+            info: Some(token_info.clone()),
+            rate_limits: None,
+        })),
+        turn_started("turn-4"),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                client_id: None,
+                message: "aborted".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+                ..Default::default()
+            },
+        )),
+        RolloutItem::ResponseItem(user_message("aborted").into()),
+        RolloutItem::TurnContext(aborted_context),
+        RolloutItem::EventMsg(EventMsg::TurnAborted(
+            codex_protocol::protocol::TurnAbortedEvent {
+                turn_id: Some("turn-4".to_string()),
+                started_at: None,
+                reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+            },
+        )),
     ];
 
     let prefix_state = session
@@ -2137,7 +2202,8 @@ async fn checkpoint_suffix_replay_matches_full_replay_after_rollback() {
         token_info: prefix_state.token_info.clone(),
         last_agent_status: prefix_state.last_agent_status.clone(),
         truncation_policy: TruncationPolicy::from(turn_context.model_info().truncation_policy),
-        estimated_prefill_input_tokens: None,
+        auto_compact_window_prefill_input_tokens: None,
+        has_prior_user_turns: prefix_state.has_prior_user_turns,
     };
     let mut full_items = prefix;
     full_items.extend(suffix.clone());
@@ -2156,11 +2222,28 @@ async fn checkpoint_suffix_replay_matches_full_replay_after_rollback() {
     assert_eq!(checkpoint_suffix, full);
     assert_eq!(checkpoint_suffix.window_number, 3);
     assert_eq!(
+        checkpoint_suffix.mcp_resource_origins,
+        Some(mcp_resource_origins)
+    );
+    assert_eq!(checkpoint_suffix.token_info, Some(token_info));
+    assert_eq!(
+        checkpoint_suffix.last_agent_status,
+        Some(AgentStatus::Interrupted)
+    );
+    assert!(checkpoint_suffix.has_prior_user_turns);
+    assert_eq!(
+        checkpoint_suffix
+            .previous_turn_settings
+            .as_ref()
+            .map(|settings| settings.model.as_str()),
+        Some("aborted-model")
+    );
+    assert_eq!(
         checkpoint_suffix
             .reference_context_item
             .as_ref()
             .map(|context| context.model.as_str()),
-        Some("suffix-model")
+        Some("aborted-model")
     );
     assert_eq!(
         serde_json::to_value(
@@ -2189,5 +2272,61 @@ async fn checkpoint_suffix_replay_matches_full_replay_after_rollback() {
             .to_string()
             .contains("codex_resume_state_needs_compaction"),
         "{error}"
+    );
+}
+
+#[tokio::test]
+async fn materialized_prefill_is_consumed_for_body_after_prefix_scope() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    Arc::make_mut(&mut turn_context.config).model_auto_compact_token_limit_scope =
+        AutoCompactTokenLimitScope::BodyAfterPrefix;
+    let thread_id = ThreadId::new();
+    let window_id = Uuid::now_v7();
+    let state = MaterializedResumeState {
+        version: MATERIALIZED_RESUME_STATE_VERSION,
+        history: Arc::new(Vec::new()),
+        previous_turn_settings: None,
+        reference_context_item: None,
+        world_state_baseline: None,
+        mcp_resource_origins: None,
+        auto_compact_window: MaterializedAutoCompactWindow {
+            window_number: 0,
+            first_window_id: window_id.to_string(),
+            previous_window_id: None,
+            window_id: window_id.to_string(),
+        },
+        token_info: None,
+        last_agent_status: None,
+        truncation_policy: TruncationPolicy::from(turn_context.model_info().truncation_policy),
+        auto_compact_window_prefill_input_tokens: Some(777),
+        has_prior_user_turns: false,
+    };
+    let applied = session
+        .apply_rollout_reconstruction(
+            &turn_context,
+            &[RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    session_id: thread_id.into(),
+                    id: thread_id,
+                    ..SessionMeta::default()
+                },
+                git: None,
+            })],
+            Some(&state),
+        )
+        .await
+        .expect("apply materialized prefill");
+
+    assert_eq!(
+        session.auto_compact_window_snapshot().await,
+        AutoCompactWindowSnapshot {
+            prefill_input_tokens: Some(777)
+        }
+    );
+    assert_eq!(
+        applied
+            .materialized_state
+            .auto_compact_window_prefill_input_tokens,
+        Some(777)
     );
 }

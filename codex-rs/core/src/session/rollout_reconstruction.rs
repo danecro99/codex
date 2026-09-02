@@ -29,6 +29,8 @@ pub(super) struct RolloutReconstruction {
     pub(super) token_info: Option<TokenUsageInfo>,
     pub(super) last_agent_status: Option<AgentStatus>,
     pub(super) mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
+    pub(super) auto_compact_window_prefill_input_tokens: Option<i64>,
+    pub(super) has_prior_user_turns: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +79,8 @@ struct ResumeReplayReducer {
     checkpoint_suffix: bool,
     legacy_compaction_count: u64,
     saw_legacy_window: bool,
+    auto_compact_window_prefill_input_tokens: Option<i64>,
+    has_prior_user_turns: bool,
 }
 
 impl ResumeReplayReducer {
@@ -93,6 +97,8 @@ impl ResumeReplayReducer {
             token_info,
             last_agent_status,
             mcp_resource_origins,
+            auto_compact_window_prefill_input_tokens,
+            has_prior_user_turns,
         ) = if let Some(state) = materialized_state {
             if state.version != MATERIALIZED_RESUME_STATE_VERSION {
                 anyhow::bail!(
@@ -149,9 +155,11 @@ impl ResumeReplayReducer {
                 state.token_info.clone(),
                 state.last_agent_status.clone(),
                 state.mcp_resource_origins.clone(),
+                state.auto_compact_window_prefill_input_tokens,
+                state.has_prior_user_turns,
             )
         } else {
-            (None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None, false)
         };
         Ok(Self {
             history,
@@ -167,6 +175,8 @@ impl ResumeReplayReducer {
             checkpoint_suffix: materialized_state.is_some(),
             legacy_compaction_count: 0,
             saw_legacy_window: false,
+            auto_compact_window_prefill_input_tokens,
+            has_prior_user_turns,
         })
     }
 
@@ -182,8 +192,9 @@ impl ResumeReplayReducer {
                 }
             }
             RolloutItem::ResponseItem(response_item) => {
-                self.active_segment().counts_as_user_turn |=
-                    is_user_turn_boundary(&response_item.item);
+                let is_user_turn = is_user_turn_boundary(&response_item.item);
+                self.active_segment().counts_as_user_turn |= is_user_turn;
+                self.has_prior_user_turns |= is_user_turn;
                 self.history.record_annotated_items(
                     std::slice::from_ref(response_item),
                     self.truncation_policy,
@@ -191,6 +202,7 @@ impl ResumeReplayReducer {
             }
             RolloutItem::InterAgentCommunication(communication) => {
                 self.active_segment().counts_as_user_turn = true;
+                self.has_prior_user_turns = true;
                 let response_item = communication.to_model_input_item();
                 self.history
                     .record_items(std::iter::once(&response_item), self.truncation_policy);
@@ -216,6 +228,7 @@ impl ResumeReplayReducer {
                 }
                 if let Some(replacement_history) = &compacted.replacement_history {
                     self.history.replace_annotated(replacement_history.clone());
+                    self.has_prior_user_turns = true;
                 } else {
                     anyhow::bail!(
                         "{NEEDS_COMPACTION}: rollout contains a legacy compaction without replacement history"
@@ -227,6 +240,7 @@ impl ResumeReplayReducer {
                     self.reference_context_item = None;
                 }
                 self.world_state_baseline = None;
+                self.auto_compact_window_prefill_input_tokens = None;
                 if let Some(window_number) = compacted.window_number {
                     self.window = Some(ReconstructedWindow {
                         number: window_number,
@@ -300,6 +314,7 @@ impl ResumeReplayReducer {
             }
             RolloutItem::EventMsg(EventMsg::UserMessage(event)) => {
                 self.active_segment().counts_as_user_turn = true;
+                self.has_prior_user_turns = true;
                 self.apply_event(&EventMsg::UserMessage(event.clone()));
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => {
@@ -376,6 +391,8 @@ impl ResumeReplayReducer {
             token_info: self.token_info,
             last_agent_status: self.last_agent_status,
             mcp_resource_origins: self.mcp_resource_origins,
+            auto_compact_window_prefill_input_tokens: self.auto_compact_window_prefill_input_tokens,
+            has_prior_user_turns: self.has_prior_user_turns,
         }
     }
 }

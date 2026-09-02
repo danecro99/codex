@@ -228,9 +228,18 @@ pub enum ResumeCheckpointOutcome {
 #[derive(Clone, Debug)]
 pub struct PublishMaterializedResumeParams {
     pub thread_id: ThreadId,
-    pub source: codex_rollout::MaterializedResumeSource,
+    pub fence: MaterializedResumePublicationFence,
     pub state: MaterializedResumeState,
     pub max_state_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum MaterializedResumePublicationFence {
+    Loaded(Box<codex_rollout::MaterializedResumeSource>),
+    Current {
+        rollout_path: PathBuf,
+        history_mode: ThreadHistoryMode,
+    },
 }
 
 /// Requested boundary for inheriting a paginated thread's history.

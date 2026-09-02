@@ -222,7 +222,7 @@ pub struct ResumedHistory {
 }
 
 /// Current private on-disk schema for [`MaterializedResumeState`].
-pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 1;
+pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 2;
 
 /// Exact post-reconstruction state required to hydrate a resumed session.
 ///
@@ -239,7 +239,8 @@ pub struct MaterializedResumeState {
     pub token_info: Option<codex_protocol::protocol::TokenUsageInfo>,
     pub last_agent_status: Option<codex_protocol::protocol::AgentStatus>,
     pub truncation_policy: codex_protocol::protocol::TruncationPolicy,
-    pub estimated_prefill_input_tokens: Option<i64>,
+    pub auto_compact_window_prefill_input_tokens: Option<i64>,
+    pub has_prior_user_turns: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +281,7 @@ pub struct MaterializedResumeSource {
     pub modified_unix_nanos: u64,
     pub prefix_head_sha256: String,
     pub prefix_tail_sha256: String,
+    pub append_generation: Option<MaterializedResumeAppendGeneration>,
     pub lineage: Vec<MaterializedResumeLineageSegment>,
 }
 
@@ -291,6 +293,17 @@ pub struct MaterializedResumeLineageSegment {
     pub end_ordinal_exclusive: Option<u64>,
     pub prefix_head_sha256: String,
     pub prefix_tail_sha256: String,
+    pub append_generation: Option<MaterializedResumeAppendGeneration>,
+}
+
+/// Durable generation attested by the canonical append-only rollout writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedResumeAppendGeneration {
+    pub generation_id: String,
+    pub generation: u64,
+    pub chain_sha256: String,
+    pub checkpoint_generation: u64,
+    pub checkpoint_chain_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

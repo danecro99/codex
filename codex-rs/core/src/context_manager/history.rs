@@ -159,6 +159,10 @@ impl ContextManager {
         self.world_state_baseline = Some(snapshot);
     }
 
+    pub(crate) fn world_state_baseline(&self) -> Option<WorldStateSnapshot> {
+        self.world_state_baseline.clone()
+    }
+
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
         match &mut self.token_info {
             Some(info) => info.fill_to_context_window(context_window),
@@ -239,6 +243,10 @@ impl ContextManager {
     /// Returns annotated history items without cloning their response payloads.
     pub(crate) fn annotated_items(&self) -> &[ResponseItemEnvelope] {
         &self.items
+    }
+
+    pub(crate) fn annotated_items_arc(&self) -> Arc<Vec<ResponseItemEnvelope>> {
+        Arc::clone(&self.items)
     }
 
     /// Returns raw items in the history and consumes the snapshot.

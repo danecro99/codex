@@ -72,6 +72,7 @@ pub use types::ListTimelineParams;
 pub use types::ListTurnsParams;
 pub use types::LoadModelContextParams;
 pub use types::LoadThreadHistoryParams;
+pub use types::MaterializedResumePublicationFence;
 pub use types::MoveThreadToSectionParams;
 pub use types::PrepareForkParams;
 pub use types::PreparedFork;

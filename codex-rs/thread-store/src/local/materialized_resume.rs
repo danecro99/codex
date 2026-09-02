@@ -22,6 +22,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use super::LocalThreadStore;
+use crate::MaterializedResumePublicationFence;
 use crate::PublishMaterializedResumeParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -38,11 +39,17 @@ pub(crate) const MATERIALIZED_RESUME_STATE_HARD_MAX_BYTES: u64 = 512 * 1024 * 10
 
 pub(super) struct LoadedCheckpoint {
     pub(super) materialized_resume: MaterializedResume,
-    pub(super) suffix_start_byte_offset: u64,
+    pub(super) suffix_segments: Vec<SourceSuffixSegment>,
     pub(super) suffix_start_ordinal_exclusive: Option<u64>,
     pub(super) checkpoint_bytes: u64,
     pub(super) checkpoint_items: u64,
     pub(super) source_bytes: u64,
+}
+
+pub(super) struct SourceSuffixSegment {
+    pub(super) path: PathBuf,
+    pub(super) start_byte_offset: u64,
+    pub(super) end_byte_offset: u64,
 }
 
 pub(super) struct CapturedSource {
@@ -95,6 +102,11 @@ pub(super) async fn capture_current_source(
     let mut source_bytes = terminal_scan_bytes
         .saturating_add(head_bytes)
         .saturating_add(tail_bytes);
+    let append_generation = super::append_generation::load_current(
+        store,
+        rollout_id,
+        canonical_rollout_path.as_path(),
+    )?;
     let lineage = match history_mode {
         ThreadHistoryMode::Legacy => Vec::new(),
         ThreadHistoryMode::Paginated => {
@@ -131,7 +143,7 @@ pub(super) async fn capture_current_source(
                 };
                 lineage.push(MaterializedResumeLineageSegment {
                     rollout_id: segment.rollout_id,
-                    canonical_rollout_path: canonical_segment_path,
+                    canonical_rollout_path: canonical_segment_path.clone(),
                     end_byte_offset: segment_end_byte_offset,
                     end_ordinal_exclusive: segment
                         .end
@@ -139,6 +151,11 @@ pub(super) async fn capture_current_source(
                         .or(is_current.then_some(end_ordinal_exclusive).flatten()),
                     prefix_head_sha256: segment_head_sha256,
                     prefix_tail_sha256: segment_tail_sha256,
+                    append_generation: super::append_generation::load_current(
+                        store,
+                        segment.rollout_id,
+                        canonical_segment_path.as_path(),
+                    )?,
                 });
             }
             lineage
@@ -165,6 +182,7 @@ pub(super) async fn capture_current_source(
             modified_unix_nanos: source_modified_unix_nanos,
             prefix_head_sha256,
             prefix_tail_sha256,
+            append_generation,
             lineage,
         },
         source_bytes,
@@ -226,14 +244,14 @@ pub(super) async fn load_checkpoint(
             "materialized state is {state_bytes} bytes, exceeding its {max_state_bytes}-byte model-context bound"
         )));
     }
-    let source_bytes = validate_source_prefix(&artifact.source, &current_source)?;
-    let suffix_start_byte_offset = artifact.source.end_byte_offset;
+    let (source_bytes, suffix_segments) =
+        validate_source_prefix(&artifact.source, &current_source)?;
     let suffix_start_ordinal_exclusive = artifact.source.end_ordinal_exclusive;
     Ok(Some(LoadedCheckpoint {
         checkpoint_items: u64::try_from(state.history.len()).unwrap_or(u64::MAX),
         checkpoint_bytes,
         source_bytes,
-        suffix_start_byte_offset,
+        suffix_segments,
         suffix_start_ordinal_exclusive,
         materialized_resume: MaterializedResume {
             source: current_source,
@@ -247,9 +265,6 @@ pub(super) async fn publish(
     store: &LocalThreadStore,
     params: PublishMaterializedResumeParams,
 ) -> ThreadStoreResult<()> {
-    if params.thread_id != params.source.thread_id {
-        return Err(invalid_checkpoint("publication thread identity mismatch"));
-    }
     if params.state.version != MATERIALIZED_RESUME_STATE_VERSION {
         return Err(invalid_checkpoint(format!(
             "cannot publish materialized state version {}",
@@ -269,15 +284,39 @@ pub(super) async fn publish(
             max = params.max_state_bytes
         )));
     }
-    let current_source = capture_current_source(
-        store,
-        params.thread_id,
-        params.source.canonical_rollout_path.as_path(),
-        params.source.history_mode,
-    )
-    .await?
-    .source;
-    validate_exact_source(&params.source, &current_source)?;
+    let _writer_guard = store.live_writer_locks.lock(params.thread_id).await;
+    let mut current_source = match params.fence {
+        MaterializedResumePublicationFence::Loaded(source) => {
+            let source = *source;
+            if params.thread_id != source.thread_id {
+                return Err(invalid_checkpoint("publication thread identity mismatch"));
+            }
+            let current = capture_current_source(
+                store,
+                params.thread_id,
+                source.canonical_rollout_path.as_path(),
+                source.history_mode,
+            )
+            .await?
+            .source;
+            validate_exact_source(&source, &current)?;
+            current
+        }
+        MaterializedResumePublicationFence::Current {
+            rollout_path,
+            history_mode,
+        } => {
+            capture_current_source(
+                store,
+                params.thread_id,
+                rollout_path.as_path(),
+                history_mode,
+            )
+            .await?
+            .source
+        }
+    };
+    ensure_append_generations(store, &mut current_source)?;
 
     let artifact = MaterializedResume {
         source: current_source,
@@ -298,7 +337,8 @@ pub(super) async fn publish(
     )
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to publish materialized resume state atomically: {err}"),
-    })
+    })?;
+    bind_append_generation_checkpoints(store, &artifact.source)
 }
 
 pub(super) fn remove(store: &LocalThreadStore, thread_id: ThreadId) -> ThreadStoreResult<()> {
@@ -344,15 +384,13 @@ fn stable_position(
                 }
                 None => return Err(invalid_checkpoint("source rollout is empty")),
             };
-            let end_ordinal_exclusive = line
-                .ordinal
-                .map(|ordinal| {
-                    ordinal
-                        .checked_add(1)
-                        .ok_or_else(|| invalid_checkpoint("paginated source ordinal overflow"))
-                })
-                .transpose()?;
-            (end_ordinal_exclusive, scanner.bytes_read(), 1)
+            let ordinal = line.ordinal.ok_or_else(|| {
+                invalid_checkpoint("paginated source terminal record has no ordinal")
+            })?;
+            let end_ordinal_exclusive = ordinal
+                .checked_add(1)
+                .ok_or_else(|| invalid_checkpoint("paginated source ordinal overflow"))?;
+            (Some(end_ordinal_exclusive), scanner.bytes_read(), 1)
         }
     };
     let after = std::fs::metadata(path).map_err(source_metadata_error)?;
@@ -373,42 +411,42 @@ fn stable_position(
 fn validate_source_prefix(
     stored: &MaterializedResumeSource,
     current: &MaterializedResumeSource,
-) -> ThreadStoreResult<u64> {
-    validate_source_identity(stored, current)?;
-    if current.end_byte_offset < stored.end_byte_offset {
-        return Err(invalid_checkpoint("source was truncated before the fence"));
-    }
-    if current
-        .end_ordinal_exclusive
-        .zip(stored.end_ordinal_exclusive)
-        .is_some_and(|(current, stored)| current < stored)
-    {
-        return Err(invalid_checkpoint("source ordinal moved behind the fence"));
-    }
-    if current.end_byte_offset == stored.end_byte_offset
-        && current.modified_unix_nanos != stored.modified_unix_nanos
-    {
+) -> ThreadStoreResult<(u64, Vec<SourceSuffixSegment>)> {
+    if stored.thread_id != current.thread_id || stored.history_mode != current.history_mode {
         return Err(invalid_checkpoint(
-            "source generation changed without an append",
+            "source thread identity or history mode mismatch",
         ));
     }
-    let (head, head_bytes) = hash_sample(
-        current.canonical_rollout_path.as_path(),
-        0,
-        stored.end_byte_offset,
-    )?;
-    let tail_start = stored
-        .end_byte_offset
-        .saturating_sub(FENCE_SAMPLE_BYTES as u64);
-    let (tail, tail_bytes) = hash_sample(
-        current.canonical_rollout_path.as_path(),
-        tail_start,
-        stored.end_byte_offset,
-    )?;
-    if head != stored.prefix_head_sha256 || tail != stored.prefix_tail_sha256 {
-        return Err(invalid_checkpoint("source prefix was rewritten"));
+    match stored.history_mode {
+        ThreadHistoryMode::Legacy => {
+            if stored.rollout_id != current.rollout_id
+                || stored.canonical_rollout_path != current.canonical_rollout_path
+            {
+                return Err(invalid_checkpoint(
+                    "source path or canonical rollout identity mismatch",
+                ));
+            }
+            validate_generation(
+                stored.append_generation.as_ref(),
+                current.append_generation.as_ref(),
+            )?;
+            validate_suffix_bounds(
+                stored.end_byte_offset,
+                stored.end_ordinal_exclusive,
+                current.end_byte_offset,
+                current.end_ordinal_exclusive,
+            )?;
+            Ok((
+                0,
+                vec![SourceSuffixSegment {
+                    path: current.canonical_rollout_path.clone(),
+                    start_byte_offset: stored.end_byte_offset,
+                    end_byte_offset: current.end_byte_offset,
+                }],
+            ))
+        }
+        ThreadHistoryMode::Paginated => validate_paginated_source_prefix(stored, current),
     }
-    Ok(head_bytes.saturating_add(tail_bytes))
 }
 
 fn validate_exact_source(
@@ -421,6 +459,8 @@ fn validate_exact_source(
         || stored.modified_unix_nanos != current.modified_unix_nanos
         || stored.prefix_head_sha256 != current.prefix_head_sha256
         || stored.prefix_tail_sha256 != current.prefix_tail_sha256
+        || stored.append_generation != current.append_generation
+        || stored.lineage != current.lineage
     {
         return Err(ThreadStoreError::Conflict {
             message: "resume source changed before materialized state publication".to_string(),
@@ -442,15 +482,25 @@ fn validate_source_identity(
             "source path or canonical rollout identity mismatch",
         ));
     }
-    if stored.lineage.len() != current.lineage.len() {
-        return Err(invalid_checkpoint("source lineage changed"));
+    Ok(())
+}
+
+fn validate_paginated_source_prefix(
+    stored: &MaterializedResumeSource,
+    current: &MaterializedResumeSource,
+) -> ThreadStoreResult<(u64, Vec<SourceSuffixSegment>)> {
+    if stored.lineage.is_empty() || current.lineage.len() < stored.lineage.len() {
+        return Err(invalid_checkpoint(
+            "source lineage moved behind the checkpoint",
+        ));
     }
+    let stored_last_index = stored.lineage.len().saturating_sub(1);
     for (index, (stored_segment, current_segment)) in
         stored.lineage.iter().zip(&current.lineage).enumerate()
     {
         if stored_segment.rollout_id != current_segment.rollout_id
             || stored_segment.canonical_rollout_path != current_segment.canonical_rollout_path
-            || (index + 1 != stored.lineage.len()
+            || (index != stored_last_index
                 && (stored_segment.end_byte_offset != current_segment.end_byte_offset
                     || stored_segment.end_ordinal_exclusive
                         != current_segment.end_ordinal_exclusive
@@ -458,6 +508,127 @@ fn validate_source_identity(
                     || stored_segment.prefix_tail_sha256 != current_segment.prefix_tail_sha256))
         {
             return Err(invalid_checkpoint("source lineage identity mismatch"));
+        }
+        validate_generation(
+            stored_segment.append_generation.as_ref(),
+            current_segment.append_generation.as_ref(),
+        )?;
+    }
+    let stored_last = &stored.lineage[stored_last_index];
+    if stored.rollout_id != stored_last.rollout_id
+        || stored.canonical_rollout_path != stored_last.canonical_rollout_path
+        || stored.end_byte_offset != stored_last.end_byte_offset
+        || stored.end_ordinal_exclusive != stored_last.end_ordinal_exclusive
+        || stored.append_generation != stored_last.append_generation
+    {
+        return Err(invalid_checkpoint(
+            "checkpoint source does not match its terminal lineage segment",
+        ));
+    }
+    let current_last = current
+        .lineage
+        .last()
+        .ok_or_else(|| invalid_checkpoint("current paginated source has no terminal lineage"))?;
+    if current.rollout_id != current_last.rollout_id
+        || current.canonical_rollout_path != current_last.canonical_rollout_path
+        || current.end_byte_offset != current_last.end_byte_offset
+        || current.end_ordinal_exclusive != current_last.end_ordinal_exclusive
+        || current.append_generation != current_last.append_generation
+    {
+        return Err(invalid_checkpoint(
+            "current source does not match its terminal lineage segment",
+        ));
+    }
+    let current_at_checkpoint = &current.lineage[stored_last_index];
+    validate_suffix_bounds(
+        stored.end_byte_offset,
+        stored.end_ordinal_exclusive,
+        current_at_checkpoint.end_byte_offset,
+        current_at_checkpoint.end_ordinal_exclusive,
+    )?;
+    let mut suffix_segments = vec![SourceSuffixSegment {
+        path: current_at_checkpoint.canonical_rollout_path.clone(),
+        start_byte_offset: stored.end_byte_offset,
+        end_byte_offset: current_at_checkpoint.end_byte_offset,
+    }];
+    suffix_segments.extend(
+        current
+            .lineage
+            .iter()
+            .skip(stored.lineage.len())
+            .map(|segment| SourceSuffixSegment {
+                path: segment.canonical_rollout_path.clone(),
+                start_byte_offset: 0,
+                end_byte_offset: segment.end_byte_offset,
+            }),
+    );
+    Ok((0, suffix_segments))
+}
+
+fn validate_generation(
+    stored: Option<&codex_rollout::MaterializedResumeAppendGeneration>,
+    current: Option<&codex_rollout::MaterializedResumeAppendGeneration>,
+) -> ThreadStoreResult<()> {
+    let stored = stored.ok_or_else(|| invalid_checkpoint("checkpoint has no append generation"))?;
+    let current = current.ok_or_else(|| invalid_checkpoint("source has no append generation"))?;
+    super::append_generation::validate_descendant(stored, current)
+}
+
+fn validate_suffix_bounds(
+    stored_byte_offset: u64,
+    stored_ordinal_exclusive: Option<u64>,
+    current_byte_offset: u64,
+    current_ordinal_exclusive: Option<u64>,
+) -> ThreadStoreResult<()> {
+    if current_byte_offset < stored_byte_offset {
+        return Err(invalid_checkpoint("source was truncated before the fence"));
+    }
+    if current_ordinal_exclusive
+        .zip(stored_ordinal_exclusive)
+        .is_some_and(|(current, stored)| current < stored)
+    {
+        return Err(invalid_checkpoint("source ordinal moved behind the fence"));
+    }
+    Ok(())
+}
+
+fn ensure_append_generations(
+    store: &LocalThreadStore,
+    source: &mut MaterializedResumeSource,
+) -> ThreadStoreResult<()> {
+    source.append_generation = Some(super::append_generation::bootstrap_current(
+        store,
+        source.rollout_id,
+        source.canonical_rollout_path.as_path(),
+        source.history_mode,
+    )?);
+    for segment in &mut source.lineage {
+        segment.append_generation = Some(super::append_generation::bootstrap_current(
+            store,
+            segment.rollout_id,
+            segment.canonical_rollout_path.as_path(),
+            ThreadHistoryMode::Paginated,
+        )?);
+    }
+    Ok(())
+}
+
+fn bind_append_generation_checkpoints(
+    store: &LocalThreadStore,
+    source: &MaterializedResumeSource,
+) -> ThreadStoreResult<()> {
+    super::append_generation::bind_checkpoint(
+        store,
+        source.rollout_id,
+        source.canonical_rollout_path.as_path(),
+    )?;
+    for segment in &source.lineage {
+        if segment.rollout_id != source.rollout_id {
+            super::append_generation::bind_checkpoint(
+                store,
+                segment.rollout_id,
+                segment.canonical_rollout_path.as_path(),
+            )?;
         }
     }
     Ok(())
@@ -507,7 +678,7 @@ fn modified_unix_nanos(modified: SystemTime) -> ThreadStoreResult<u64> {
     u64::try_from(nanos).map_err(|_| invalid_checkpoint("source modified time overflow"))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

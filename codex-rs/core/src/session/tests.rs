@@ -4904,6 +4904,74 @@ async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
     rollout_path
 }
 
+#[tokio::test]
+async fn fresh_long_session_materializes_resume_state_at_turn_completion() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let rollout_path = attach_thread_persistence(&mut session).await;
+    let items = (0..512)
+        .map(|index| ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: format!("{index}:{}", "x".repeat(2_048)),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        })
+        .collect::<Vec<_>>();
+    let _ = session.state.lock().await.take_next_turn_is_first();
+    session
+        .record_conversation_items(&turn_context, items.as_slice())
+        .await;
+    session
+        .send_event(
+            &turn_context,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn_context.sub_id.clone(),
+                last_agent_message: None,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    let config = session.get_config().await;
+    let artifact_path = config
+        .codex_home
+        .join("materialized_resume_state_v1")
+        .join(format!("{}.json", session.thread_id()));
+    let artifact: codex_history::MaterializedResume = serde_json::from_slice(
+        std::fs::read(artifact_path.as_path())
+            .expect("fresh terminal turn must publish resume state")
+            .as_slice(),
+    )
+    .expect("decode proactive materialization");
+    let materialized_state = artifact.state.expect("materialized state");
+    assert_eq!(materialized_state.history.len(), 512);
+    assert!(materialized_state.has_prior_user_turns);
+
+    let resumed = session
+        .services
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadModelContextParams {
+            thread_id: session.thread_id(),
+            include_archived: false,
+            rollout_path: Some(rollout_path),
+        })
+        .await
+        .expect("resume fresh materialized session");
+    assert_eq!(
+        resumed.diagnostics.outcome,
+        codex_thread_store::ResumeCheckpointOutcome::Hit
+    );
+    assert_eq!(resumed.diagnostics.suffix_items, 0);
+    assert!(resumed.diagnostics.source_bytes <= 512 * 1_024);
+    assert_eq!(resumed.items.len(), 1);
+}
+
 fn text_block(s: &str) -> serde_json::Value {
     json!({
         "type": "text",

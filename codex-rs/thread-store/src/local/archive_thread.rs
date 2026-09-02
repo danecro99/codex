@@ -113,6 +113,18 @@ async fn archive_thread_with_paths(
     })?;
 
     materialized_resume::remove(store, thread_id)?;
+    for (source, _) in &rollout_moves {
+        let rollout_id =
+            codex_rollout::rollout_id_from_path(source.as_path()).ok_or_else(|| {
+                ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "archived rollout has no canonical identity: {}",
+                        source.display()
+                    ),
+                }
+            })?;
+        super::append_generation::remove(store, rollout_id)?;
+    }
     for (index, (source, destination)) in rollout_moves.iter().enumerate() {
         if let Err(err) = std::fs::rename(source, destination) {
             if let Err(restore_err) = restore_rollout_moves(&rollout_moves[..index]) {

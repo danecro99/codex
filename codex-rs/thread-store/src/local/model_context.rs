@@ -5,7 +5,6 @@ use std::io::BufReader;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -122,10 +121,8 @@ async fn load_model_context(
             materialized_resume::load_checkpoint(store, current_source.clone()).await?
     {
         let suffix_started = Instant::now();
-        let suffix = read_suffix(
-            path.as_path(),
-            loaded.suffix_start_byte_offset,
-            current_source.end_byte_offset,
+        let suffix = read_suffix_segments(
+            loaded.suffix_segments.as_slice(),
             loaded.suffix_start_ordinal_exclusive,
             current_source.end_ordinal_exclusive,
         )?;
@@ -495,96 +492,97 @@ struct SuffixRead {
     bytes: u64,
 }
 
-fn read_suffix(
-    path: &Path,
-    start: u64,
-    end: u64,
+fn read_suffix_segments(
+    segments: &[materialized_resume::SourceSuffixSegment],
     start_ordinal_exclusive: Option<u64>,
     end_ordinal_exclusive: Option<u64>,
 ) -> ThreadStoreResult<SuffixRead> {
-    if start > end {
-        return Err(materialized_resume::invalid_checkpoint(
-            "checkpoint fence is beyond the source end",
-        ));
-    }
-    if start == end {
-        if start_ordinal_exclusive != end_ordinal_exclusive {
-            return Err(materialized_resume::invalid_checkpoint(format!(
-                "unchanged source ordinal {end_ordinal_exclusive:?} does not match checkpoint {start_ordinal_exclusive:?}"
-            )));
-        }
-        return Ok(SuffixRead {
-            items: Vec::new(),
-            bytes: 0,
-        });
-    }
-    let mut file = File::open(path).map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to open resume suffix {}: {err}", path.display()),
-    })?;
-    file.seek(SeekFrom::Start(start)).map_err(|err| {
-        materialized_resume::invalid_checkpoint(format!("invalid suffix fence: {err}"))
-    })?;
-    let length = end.saturating_sub(start);
-    let mut reader = BufReader::new(file.take(length));
     let mut items = Vec::new();
     let mut consumed = 0_u64;
     let mut next_ordinal = start_ordinal_exclusive;
-    loop {
-        let mut line = Vec::new();
-        let read = Read::by_ref(&mut reader)
-            .take(codex_rollout::MAX_ROLLOUT_LINE_BYTES.saturating_add(1) as u64)
-            .read_until(b'\n', &mut line)
-            .map_err(|err| {
-                materialized_resume::invalid_checkpoint(format!(
-                    "failed to read source suffix: {err}"
-                ))
-            })?;
-        if read == 0 {
-            break;
-        }
-        if read > codex_rollout::MAX_ROLLOUT_LINE_BYTES {
+    for segment in segments {
+        let start = segment.start_byte_offset;
+        let end = segment.end_byte_offset;
+        if start > end {
             return Err(materialized_resume::invalid_checkpoint(format!(
-                "source suffix record exceeds the {}-byte rollout limit",
-                codex_rollout::MAX_ROLLOUT_LINE_BYTES
+                "checkpoint fence is beyond the source segment end: {}",
+                segment.path.display()
             )));
         }
-        consumed = consumed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-        if consumed > length {
-            return Err(materialized_resume::invalid_checkpoint(
-                "source suffix crossed its stable end fence",
-            ));
-        }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        if !line.ends_with(b"\n") {
-            return Err(materialized_resume::invalid_checkpoint(
-                "source suffix ends with a partial rollout record",
-            ));
-        }
-        let value = serde_json::from_slice(line.as_slice()).map_err(|err| {
-            materialized_resume::invalid_checkpoint(format!("source suffix is corrupt: {err}"))
+        let mut file =
+            File::open(segment.path.as_path()).map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to open resume suffix {}: {err}",
+                    segment.path.display()
+                ),
+            })?;
+        file.seek(SeekFrom::Start(start)).map_err(|err| {
+            materialized_resume::invalid_checkpoint(format!("invalid suffix fence: {err}"))
         })?;
-        let rollout_line = codex_rollout::decode_rollout_line(value).map_err(|err| {
-            materialized_resume::invalid_checkpoint(format!("source suffix is invalid: {err}"))
-        })?;
-        if let Some(expected_ordinal) = next_ordinal {
-            if rollout_line.ordinal != Some(expected_ordinal) {
+        let length = end.saturating_sub(start);
+        let mut reader = BufReader::new(file.take(length));
+        let mut segment_consumed = 0_u64;
+        loop {
+            let mut line = Vec::new();
+            let read = Read::by_ref(&mut reader)
+                .take(codex_rollout::MAX_ROLLOUT_LINE_BYTES.saturating_add(1) as u64)
+                .read_until(b'\n', &mut line)
+                .map_err(|err| {
+                    materialized_resume::invalid_checkpoint(format!(
+                        "failed to read source suffix: {err}"
+                    ))
+                })?;
+            if read == 0 {
+                break;
+            }
+            if read > codex_rollout::MAX_ROLLOUT_LINE_BYTES {
                 return Err(materialized_resume::invalid_checkpoint(format!(
-                    "source suffix ordinal {:?} does not match expected {expected_ordinal}",
-                    rollout_line.ordinal
+                    "source suffix record exceeds the {}-byte rollout limit",
+                    codex_rollout::MAX_ROLLOUT_LINE_BYTES
                 )));
             }
-            next_ordinal = Some(expected_ordinal.checked_add(1).ok_or_else(|| {
-                materialized_resume::invalid_checkpoint("source suffix ordinal overflow")
-            })?);
+            segment_consumed =
+                segment_consumed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            if segment_consumed > length {
+                return Err(materialized_resume::invalid_checkpoint(
+                    "source suffix crossed its stable end fence",
+                ));
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            if !line.ends_with(b"\n") {
+                return Err(materialized_resume::invalid_checkpoint(
+                    "source suffix ends with a partial rollout record",
+                ));
+            }
+            let value = serde_json::from_slice(line.as_slice()).map_err(|err| {
+                materialized_resume::invalid_checkpoint(format!("source suffix is corrupt: {err}"))
+            })?;
+            let rollout_line = codex_rollout::decode_rollout_line(value).map_err(|err| {
+                materialized_resume::invalid_checkpoint(format!("source suffix is invalid: {err}"))
+            })?;
+            if let Some(expected_ordinal) = next_ordinal {
+                if rollout_line.ordinal != Some(expected_ordinal) {
+                    return Err(materialized_resume::invalid_checkpoint(format!(
+                        "source suffix ordinal {:?} does not match expected {expected_ordinal}",
+                        rollout_line.ordinal
+                    )));
+                }
+                next_ordinal = Some(expected_ordinal.checked_add(1).ok_or_else(|| {
+                    materialized_resume::invalid_checkpoint("source suffix ordinal overflow")
+                })?);
+            }
+            if !matches!(rollout_line.item, RolloutItem::SessionMeta(_)) {
+                items.push(rollout_line.item);
+            }
         }
-        items.push(rollout_line.item);
-    }
-    if consumed != length {
-        return Err(materialized_resume::invalid_checkpoint(format!(
-            "source suffix length mismatch: read {consumed} of {length} bytes"
-        )));
+        if segment_consumed != length {
+            return Err(materialized_resume::invalid_checkpoint(format!(
+                "source suffix length mismatch: read {segment_consumed} of {length} bytes"
+            )));
+        }
+        consumed = consumed.saturating_add(segment_consumed);
     }
     if next_ordinal != end_ordinal_exclusive {
         return Err(materialized_resume::invalid_checkpoint(format!(
