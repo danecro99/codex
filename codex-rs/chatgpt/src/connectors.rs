@@ -35,7 +35,7 @@ const DEFAULT_APPS_PRODUCT_SKU: &str = "codex";
 async fn apps_enabled(config: &Config) -> anyhow::Result<bool> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
-    let auth = auth_manager.auth().await;
+    let auth = auth_manager.try_auth().await?;
     Ok(config
         .features
         .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend)))
@@ -45,8 +45,8 @@ async fn connector_auth(config: &Config) -> anyhow::Result<CodexAuth> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
     let auth = auth_manager
-        .auth()
-        .await
+        .try_auth()
+        .await?
         .ok_or_else(|| anyhow::anyhow!("ChatGPT auth not available"))?;
     anyhow::ensure!(
         auth.uses_codex_backend(),
@@ -81,18 +81,20 @@ pub async fn list_all_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>
 pub async fn list_cached_all_connectors(
     config: &Config,
     plugin_apps: &[AppConnectorId],
-) -> Option<Vec<AppInfo>> {
-    if !apps_enabled(config).await.ok()? {
-        return Some(Vec::new());
+) -> anyhow::Result<Option<Vec<AppInfo>>> {
+    if !apps_enabled(config).await? {
+        return Ok(Some(Vec::new()));
     }
 
-    let auth = connector_auth(config).await.ok()?;
+    let auth = connector_auth(config).await?;
     let cache_context = connector_directory_cache_context(config, &auth);
-    let connectors = codex_connectors::cached_directory_connectors(&cache_context)?;
-    Some(merge_directory_and_plugin_connectors(
+    let Some(connectors) = codex_connectors::cached_directory_connectors(&cache_context) else {
+        return Ok(None);
+    };
+    Ok(Some(merge_directory_and_plugin_connectors(
         connectors,
         plugin_apps,
-    ))
+    )))
 }
 
 pub async fn list_all_connectors_with_options(

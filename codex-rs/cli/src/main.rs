@@ -76,7 +76,6 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigLoadOptions;
 use codex_core::config::ConfigOverrides;
-use codex_core::config::bootstrap_auth_config;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_toml_with_layer_stack;
@@ -2062,11 +2061,14 @@ async fn load_exec_server_config(
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
     let bootstrap_cli_overrides = cli_kv_overrides.clone();
+    let codex_home = find_codex_home()?;
+    let auth_home = codex_core::config::find_codex_auth_home(&codex_home)?;
     let mut builder = ConfigBuilder::default()
+        .codex_home(codex_home.to_path_buf())
+        .auth_home(auth_home.clone())
         .cli_overrides(cli_kv_overrides)
         .strict_config(strict_config);
     if enable_workload_identity && is_workload_identity_selected() {
-        let codex_home = find_codex_home()?;
         let bootstrap_cwd = AbsolutePathBuf::current_dir()?;
         let bootstrap_config = load_config_toml_with_layer_stack(
             &codex_home,
@@ -2079,7 +2081,11 @@ async fn load_exec_server_config(
             },
         )
         .await?;
-        let bootstrap_auth_config = bootstrap_auth_config(&codex_home, &bootstrap_config)?;
+        let bootstrap_auth_config = codex_core::config::bootstrap_auth_config_with_home(
+            &codex_home,
+            &auth_home,
+            &bootstrap_config,
+        )?;
         let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
             bootstrap_auth_config,
             /*enable_codex_api_key_env*/ false,
@@ -2097,13 +2103,13 @@ async fn load_exec_server_remote_auth(
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await?;
 
-    let auth = match auth_manager.auth().await {
+    let auth = match auth_manager.try_auth().await? {
         Some(auth) => auth,
         None => {
-            auth_manager.reload().await;
+            auth_manager.try_reload().await?;
             auth_manager
-                .auth()
-                .await
+                .try_auth()
+                .await?
                 .ok_or_else(|| anyhow::anyhow!(missing_auth_error))?
         }
     };

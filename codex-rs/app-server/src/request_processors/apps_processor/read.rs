@@ -27,7 +27,11 @@ impl AppsRequestProcessor {
             .filter(|app_id| seen_app_ids.insert(app_id.clone()))
             .collect::<Vec<_>>();
         let config = self.load_apps_config(thread_id.as_deref()).await?;
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .try_auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
         if !config
             .features
             .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))

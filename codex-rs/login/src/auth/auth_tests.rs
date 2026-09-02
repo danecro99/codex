@@ -1273,11 +1273,14 @@ async fn external_bearer_only_auth_manager_disables_auto_refresh_when_interval_i
 }
 
 #[tokio::test]
-async fn external_bearer_only_auth_manager_returns_none_when_command_fails() {
+async fn external_bearer_only_auth_manager_propagates_command_failure() {
     let script = ProviderAuthScript::new_failing().unwrap();
     let manager = AuthManager::external_bearer_only(script.auth_config());
 
-    assert_eq!(manager.auth().await, None);
+    assert!(matches!(
+        manager.try_auth().await,
+        Err(RefreshTokenError::Transient(_))
+    ));
 }
 
 #[tokio::test]
@@ -1287,7 +1290,10 @@ async fn unauthorized_recovery_retries_provider_command_after_initial_failure() 
     let manager = AuthManager::external_bearer_only(script.auth_config());
     let mut recovery = manager.unauthorized_recovery();
 
-    assert_eq!(manager.auth().await, None);
+    assert!(matches!(
+        manager.try_auth().await,
+        Err(RefreshTokenError::Transient(_))
+    ));
     assert_eq!(manager.auth_cached(), None);
     assert!(recovery.has_next());
     assert_eq!(recovery.unavailable_reason(), "ready");
@@ -1435,7 +1441,11 @@ async fn external_auth_keeps_cached_credentials_after_permanent_reload_failure()
 
     assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 1);
 
-    assert_eq!(manager.auth().await, Some(auth.clone()));
+    assert!(matches!(
+        manager.try_auth().await,
+        Err(RefreshTokenError::Permanent(_))
+    ));
+    assert_eq!(manager.auth_cached(), Some(auth.clone()));
     assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 2);
     assert_eq!(
         manager
@@ -1445,7 +1455,11 @@ async fn external_auth_keeps_cached_credentials_after_permanent_reload_failure()
         "external auth failed"
     );
 
-    assert_eq!(manager.auth().await, Some(auth));
+    assert!(matches!(
+        manager.try_auth().await,
+        Err(RefreshTokenError::Permanent(_))
+    ));
+    assert_eq!(manager.auth_cached(), Some(auth));
     assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 2);
 }
 
@@ -1461,7 +1475,11 @@ async fn replacing_external_auth_clears_permanent_failure() {
         .await
         .expect("external auth should install");
 
-    assert_eq!(manager.auth().await, Some(auth.clone()));
+    assert!(matches!(
+        manager.try_auth().await,
+        Err(RefreshTokenError::Permanent(_))
+    ));
+    assert_eq!(manager.auth_cached(), Some(auth.clone()));
     assert!(manager.refresh_failure_for_auth(&auth).is_some());
 
     manager
@@ -1474,6 +1492,64 @@ async fn replacing_external_auth_clears_permanent_failure() {
         .await
         .expect("replacement external auth should refresh");
     assert_eq!(manager.auth_cached(), Some(auth));
+}
+
+#[tokio::test]
+async fn auth_manager_propagates_initial_storage_errors() {
+    let auth_home = tempdir().expect("tempdir");
+    std::fs::write(get_auth_file(auth_home.path()), "{not-json")
+        .expect("write malformed auth file");
+
+    let error = AuthManager::try_new(
+        auth_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await
+    .expect_err("malformed auth storage must fail manager initialization");
+
+    assert!(
+        error.to_string().contains("key must be a string"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn auth_manager_reload_propagates_storage_errors_without_clearing_cache() {
+    let auth_home = tempdir().expect("tempdir");
+    login_with_api_key(
+        auth_home.path(),
+        "sk-cached",
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("seed api key");
+    let manager = AuthManager::try_new(
+        auth_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await
+    .expect("auth manager");
+    let cached = manager.auth_cached();
+    std::fs::write(get_auth_file(auth_home.path()), "{not-json")
+        .expect("write malformed auth file");
+
+    let error = manager
+        .try_reload()
+        .await
+        .expect_err("storage reload error must propagate");
+
+    assert!(matches!(error, RefreshTokenError::Transient(_)));
+    assert_eq!(manager.auth_cached(), cached);
 }
 
 #[tokio::test]
@@ -1834,6 +1910,7 @@ async fn build_config(
 ) -> AuthConfig {
     AuthConfig {
         codex_home: codex_home.to_path_buf(),
+        auth_home: codex_home.to_path_buf(),
         auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         keyring_backend_kind: AuthKeyringBackendKind::Direct,
         forced_login_method,
@@ -1894,6 +1971,10 @@ impl AuthManagerConfig for TestAuthManagerConfig {
         self.0.codex_home.clone()
     }
 
+    fn auth_home(&self) -> PathBuf {
+        self.0.auth_home.clone()
+    }
+
     fn cli_auth_credentials_store_mode(&self) -> AuthCredentialsStoreMode {
         self.0.auth_credentials_store_mode
     }
@@ -1929,6 +2010,7 @@ impl AuthManagerConfig for TestAuthManagerConfig {
 fn test_auth_manager_config(codex_home: &Path) -> TestAuthManagerConfig {
     TestAuthManagerConfig(AuthConfig {
         codex_home: codex_home.to_path_buf(),
+        auth_home: codex_home.to_path_buf(),
         auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         keyring_backend_kind: AuthKeyringBackendKind::Direct,
         forced_login_method: Some(ForcedLoginMethod::Chatgpt),
@@ -2108,7 +2190,7 @@ async fn auth_manager_rejects_env_personal_access_token_workspace_mismatch() {
     let _access_token_guard =
         EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, "at-env-workspace-mismatch");
 
-    let manager = AuthManager::new(
+    let error = AuthManager::try_new(
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
@@ -2117,9 +2199,10 @@ async fn auth_manager_rejects_env_personal_access_token_workspace_mismatch() {
         AuthKeyringBackendKind::default(),
         crate::test_support::transport_default_auth_route_config(),
     )
-    .await;
+    .await
+    .expect_err("workspace mismatch must fail manager initialization");
 
-    assert_eq!(manager.auth().await, None);
+    assert!(error.to_string().contains("Login is restricted"), "{error}");
     server.verify().await;
 }
 
@@ -2160,7 +2243,7 @@ async fn auth_manager_rejects_stored_personal_access_token_workspace_mismatch() 
         .await
         .expect("personal access token login should succeed");
 
-        let manager = AuthManager::new(
+        let error = AuthManager::try_new(
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             auth_credentials_store_mode,
@@ -2169,9 +2252,10 @@ async fn auth_manager_rejects_stored_personal_access_token_workspace_mismatch() 
             AuthKeyringBackendKind::default(),
             crate::test_support::transport_default_auth_route_config(),
         )
-        .await;
+        .await
+        .expect_err("workspace mismatch must fail manager initialization");
 
-        assert_eq!(manager.auth().await, None);
+        assert!(error.to_string().contains("Login is restricted"), "{error}");
     }
     server.verify().await;
 }
@@ -2293,12 +2377,21 @@ async fn auth_manager_rejects_disallowed_stored_and_external_auth() {
     )
     .await;
     config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Chatgpt]);
+    let error = AuthManager::shared_from_auth_config(
+        config.clone(),
+        /*enable_codex_api_key_env*/ false,
+    )
+    .await
+    .expect_err("disallowed stored auth must fail manager initialization");
+    assert_eq!(error.to_string(), "ChatGPT login is required");
+
+    let empty_auth_home = tempdir().unwrap();
+    config.codex_home = empty_auth_home.path().to_path_buf();
+    config.auth_home = empty_auth_home.path().to_path_buf();
     let manager =
         AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
             .await
-            .expect("auth manager");
-
-    assert_eq!(manager.auth().await, None);
+            .expect("empty auth manager");
     assert!(
         manager
             .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
@@ -2312,9 +2405,19 @@ async fn auth_manager_rejects_disallowed_stored_and_external_auth() {
 
 #[tokio::test]
 #[serial(codex_auth_env)]
-async fn api_only_policy_rejects_access_tokens_before_hydration() {
+async fn auth_manager_validates_access_token_policy_after_selection() {
     let codex_home = tempdir().unwrap();
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/user-auth-credential/whoami"))
+        .and(header("authorization", "Bearer at-rejected"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(personal_access_token_whoami(WORKSPACE_ID_ALLOWED)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     let _authapi_guard = EnvVarGuard::set("CODEX_AUTHAPI_BASE_URL", &server.uri());
     let _access_token_guard = EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, "at-rejected");
     let mut config = build_config(
@@ -2324,20 +2427,13 @@ async fn api_only_policy_rejects_access_tokens_before_hydration() {
     )
     .await;
     config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Api]);
-    let manager =
+    let error =
         AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
             .await
-            .expect("auth manager");
+            .expect_err("disallowed access token must fail manager initialization");
 
-    assert_eq!(manager.auth().await, None);
-    assert!(
-        server
-            .received_requests()
-            .await
-            .expect("inspect auth requests")
-            .is_empty(),
-        "rejected access tokens must not call whoami or register Agent Identity"
-    );
+    assert_eq!(error.to_string(), "API key login is required");
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -2359,12 +2455,11 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
     .await;
     config.managed_auth_policy.allowed_chatgpt_workspaces =
         Some(vec![WORKSPACE_ID_ALLOWED.to_string()]);
-    let manager =
+    let error =
         AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
             .await
-            .expect("auth manager");
-
-    assert_eq!(manager.auth().await, None);
+            .expect_err("workspace mismatch must fail manager initialization");
+    assert!(error.to_string().contains("Login is restricted"), "{error}");
     drop(access_token_guard);
 
     for stored_agent_identity in [
@@ -2395,11 +2490,11 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
         .await;
         config.managed_auth_policy.allowed_chatgpt_workspaces =
             Some(vec![WORKSPACE_ID_ALLOWED.to_string()]);
-        let manager =
+        let error =
             AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
                 .await
-                .expect("auth manager");
-        assert_eq!(manager.auth().await, None);
+                .expect_err("workspace mismatch must fail manager initialization");
+        assert!(error.to_string().contains("Login is restricted"), "{error}");
     }
 
     assert!(
@@ -2433,12 +2528,11 @@ async fn workspace_policy_checks_the_selected_request_account() {
         Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
     )
     .await;
-    let manager =
+    let error =
         AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
             .await
-            .expect("auth manager");
-
-    assert_eq!(manager.auth().await, None);
+            .expect_err("selected account mismatch must fail manager initialization");
+    assert!(error.to_string().contains("Login is restricted"), "{error}");
 }
 
 #[tokio::test]
@@ -2506,6 +2600,7 @@ async fn enforce_login_restrictions_logs_out_for_personal_access_token_workspace
 
     let config = AuthConfig {
         codex_home: codex_home.path().to_path_buf(),
+        auth_home: codex_home.path().to_path_buf(),
         auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         keyring_backend_kind: AuthKeyringBackendKind::default(),
         forced_login_method: None,
@@ -2632,6 +2727,7 @@ async fn enforce_login_restrictions_logs_out_for_agent_identity_workspace_mismat
 
     let config = AuthConfig {
         codex_home: codex_home.path().to_path_buf(),
+        auth_home: codex_home.path().to_path_buf(),
         auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         keyring_backend_kind: AuthKeyringBackendKind::Direct,
         forced_login_method: None,

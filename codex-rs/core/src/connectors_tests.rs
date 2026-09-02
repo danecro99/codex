@@ -644,3 +644,39 @@ apps = true
         ))]
     );
 }
+
+#[tokio::test]
+async fn tool_suggest_propagates_connector_auth_load_errors() {
+    let codex_home = tempdir().expect("tempdir should succeed");
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"
+cli_auth_credentials_store = "file"
+
+[features]
+apps = true
+"#,
+    )
+    .expect("write config");
+    std::fs::write(codex_home.path().join("auth.json"), "not-json").expect("write malformed auth");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config should load");
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let plugins_manager =
+        plugins_manager_for_config(&config, AuthManager::from_auth_for_testing(auth));
+
+    let error = list_tool_suggest_discoverable_tools_with_auth(
+        &config,
+        &plugins_manager,
+        /*auth*/ None,
+        &[],
+        &[],
+    )
+    .await
+    .expect_err("connector auth load errors must reach the consumer");
+
+    assert!(error.to_string().contains("expected ident"), "{error:#}");
+}

@@ -394,10 +394,10 @@ async fn build_report(
             let auth_manager = auth_manager_result.as_ref().ok().cloned();
             let reachability_plan = provider_reachability_plan(config);
             #[cfg(target_os = "macos")]
-            let reachability_url = reachability_plan
-                .endpoints
-                .first()
-                .map(|endpoint| endpoint.url.clone());
+            let reachability_url = match &reachability_plan {
+                Ok(plan) => plan.endpoints.first().map(|endpoint| endpoint.url.clone()),
+                Err(_) => None,
+            };
             let (
                 config_check,
                 auth_check,
@@ -470,7 +470,7 @@ async fn build_report(
                 run_async_check(
                     "provider reachability",
                     progress.clone(),
-                    provider_reachability_check(reachability_plan),
+                    provider_reachability_check_result(reachability_plan),
                 ),
             );
             #[cfg(target_os = "macos")]
@@ -1263,7 +1263,7 @@ fn config_toml_details(config: &Config, details: &mut Vec<String>) {
 
 fn auth_check(config: &Config) -> DoctorCheck {
     let mut details = Vec::new();
-    let auth_path = config.codex_home.join("auth.json");
+    let auth_path = config.auth_home.join("auth.json");
     details.push(format!(
         "auth storage mode: {:?}",
         config.cli_auth_credentials_store_mode
@@ -1295,7 +1295,7 @@ fn auth_check(config: &Config) -> DoctorCheck {
     }
 
     match load_auth_dot_json(
-        &config.codex_home,
+        &config.auth_home,
         config.cli_auth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
     ) {
@@ -2614,7 +2614,7 @@ impl ProviderAuthReachabilityMode {
     }
 }
 
-fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
+fn provider_reachability_plan(config: &Config) -> std::io::Result<ReachabilityPlan> {
     let query_params = config.model_provider.query_params.as_ref().map(|params| {
         params
             .iter()
@@ -2622,12 +2622,10 @@ fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
             .collect::<HashMap<_, _>>()
     });
     let stored_auth = load_auth_dot_json(
-        &config.codex_home,
+        &config.auth_home,
         config.cli_auth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
-    )
-    .ok()
-    .flatten();
+    )?;
     let mode = provider_auth_reachability_mode_from_auth(
         config.model_provider.requires_openai_auth,
         config.model_provider.env_key.as_deref(),
@@ -2645,7 +2643,7 @@ fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
         &config.chatgpt_base_url,
     );
     plan.http_client_factory = config.http_client_factory();
-    plan
+    Ok(plan)
 }
 
 fn default_reachability_plan() -> ReachabilityPlan {
@@ -2892,6 +2890,22 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
         check = check.remediation("Check proxy, VPN, firewall, DNS, and custom CA configuration.");
     }
     check
+}
+
+async fn provider_reachability_check_result(
+    plan: std::io::Result<ReachabilityPlan>,
+) -> DoctorCheck {
+    match plan {
+        Ok(plan) => provider_reachability_check(plan).await,
+        Err(error) => DoctorCheck::new(
+            "network.provider_reachability_auth",
+            "reachability",
+            CheckStatus::Fail,
+            "provider authentication could not be loaded",
+        )
+        .detail(error.to_string())
+        .remediation("Fix the reported authentication error, then rerun codex doctor."),
+    }
 }
 
 enum RouteProbeOutcome {
