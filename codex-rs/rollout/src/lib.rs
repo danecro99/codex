@@ -31,6 +31,7 @@ pub use codex_history::MaterializedAutoCompactWindow;
 pub use codex_history::MaterializedPreviousTurnSettings;
 pub use codex_history::MaterializedResume;
 pub use codex_history::MaterializedResumeAppendGeneration;
+pub use codex_history::MaterializedResumeAppendGenerationLink;
 pub use codex_history::MaterializedResumeLineageSegment;
 pub use codex_history::MaterializedResumeSource;
 pub use codex_history::MaterializedResumeState;

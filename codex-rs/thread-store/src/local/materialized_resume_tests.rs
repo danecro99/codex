@@ -1,5 +1,7 @@
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -95,6 +97,24 @@ fn write_large_legacy_rollout(home: &std::path::Path, uuid: Uuid) -> std::path::
     }
     file.sync_all().expect("sync large rollout");
     path
+}
+
+fn rewrite_middle_payload_byte(path: &std::path::Path) {
+    let transcript = std::fs::read(path).expect("read large transcript");
+    let middle = transcript.len() / 2;
+    let relative = transcript[middle..]
+        .iter()
+        .position(|byte| *byte == b'x')
+        .expect("middle payload byte");
+    let offset = u64::try_from(middle + relative).expect("middle offset");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open source without truncation");
+    file.seek(SeekFrom::Start(offset))
+        .expect("seek middle byte");
+    file.write_all(b"y").expect("rewrite middle byte");
+    file.sync_all().expect("sync middle rewrite");
 }
 
 async fn publish_loaded_state(
@@ -285,6 +305,93 @@ async fn append_after_checkpoint_reads_and_republishes_only_the_suffix() {
 }
 
 #[tokio::test]
+async fn append_ancestry_verifies_a_checkpoint_published_before_journal_rebinding() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_012);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-12",
+        uuid,
+        ThreadHistoryMode::Legacy,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let first = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("first resume");
+    publish_loaded_state(&store, thread_id, &first).await;
+
+    append_with_generation(
+        &store,
+        thread_id,
+        path.as_path(),
+        ThreadHistoryMode::Legacy,
+        &user_message("first suffix".to_string()),
+    )
+    .await;
+    let after_first_append = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("first suffix resume");
+    let source = after_first_append
+        .materialized_resume
+        .expect("materialized resume")
+        .source;
+    let artifact = codex_rollout::MaterializedResume {
+        source,
+        state: Some(state()),
+        max_state_bytes: Some(64 * 1024 * 1024),
+    };
+    atomic_write(
+        checkpoint_path(&store, thread_id).as_path(),
+        serde_json::to_vec(&artifact)
+            .expect("encode checkpoint")
+            .as_slice(),
+    )
+    .expect("publish checkpoint without journal rebinding");
+
+    let second_suffix = user_message("second suffix".to_string());
+    append_with_generation(
+        &store,
+        thread_id,
+        path.as_path(),
+        ThreadHistoryMode::Legacy,
+        &second_suffix,
+    )
+    .await;
+    let resumed = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path),
+        },
+    )
+    .await
+    .expect("ancestry must reproduce the published checkpoint chain");
+    assert_eq!(resumed.diagnostics.outcome, ResumeCheckpointOutcome::Hit);
+    assert_eq!(resumed.diagnostics.suffix_items, 1);
+    assert_eq!(
+        serde_json::to_value(&resumed.items[1]).expect("serialize resumed suffix"),
+        serde_json::to_value(second_suffix).expect("serialize expected suffix")
+    );
+}
+
+#[tokio::test]
 async fn paginated_checkpoint_follows_a_normal_descendant_segment() {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
@@ -431,14 +538,7 @@ async fn append_generation_rejects_large_middle_rewrite_outside_samples() {
     .expect("load large source");
     publish_loaded_state(&store, thread_id, &first).await;
 
-    let mut transcript = std::fs::read(path.as_path()).expect("read large transcript");
-    let middle = transcript.len() / 2;
-    let relative = transcript[middle..]
-        .iter()
-        .position(|byte| *byte == b'x')
-        .expect("middle payload byte");
-    transcript[middle + relative] = b'y';
-    std::fs::write(path.as_path(), transcript).expect("rewrite middle of source");
+    rewrite_middle_payload_byte(path.as_path());
     codex_rollout::append_rollout_item_to_path(&path, &user_message("raw append".to_string()))
         .await
         .expect("append outside canonical writer");
@@ -459,6 +559,130 @@ async fn append_generation_rejects_large_middle_rewrite_outside_samples() {
             .contains("outside the canonical append-generation contract"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn pending_append_rejects_middle_prefix_rewrite_before_suffix_commit() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_010);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_large_legacy_rollout(home.path(), uuid);
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let first = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("load large source");
+    publish_loaded_state(&store, thread_id, &first).await;
+
+    assert!(
+        crate::local::append_generation::begin_append(
+            &store,
+            thread_id,
+            thread_id,
+            path.as_path(),
+            ThreadHistoryMode::Legacy,
+            1,
+        )
+        .expect("begin pending append")
+    );
+    rewrite_middle_payload_byte(path.as_path());
+    codex_rollout::append_rollout_item_to_path(
+        path.as_path(),
+        &user_message("legitimate suffix".to_string()),
+    )
+    .await
+    .expect("append legitimate suffix");
+
+    let error = crate::local::append_generation::finish_append(&store, thread_id)
+        .expect_err("rewritten pending prefix must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("codex_resume_state_needs_compaction"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("stored source prefix contract"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn forged_higher_generation_without_checkpoint_ancestry_anchor_is_loud() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_011);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-11",
+        uuid,
+        ThreadHistoryMode::Legacy,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let first = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("load source");
+    publish_loaded_state(&store, thread_id, &first).await;
+
+    let journal_path = crate::local::append_generation::journal_path(&store, thread_id);
+    let mut journal: serde_json::Value = serde_json::from_slice(
+        std::fs::read(journal_path.as_path())
+            .expect("read append generation")
+            .as_slice(),
+    )
+    .expect("decode append generation");
+    let stable = journal
+        .get_mut("stable")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("stable generation");
+    stable.insert("generation".to_string(), serde_json::json!(1));
+    stable.insert(
+        "chain_sha256".to_string(),
+        serde_json::json!("11".repeat(32)),
+    );
+    stable.insert("ancestry_base_generation".to_string(), serde_json::json!(1));
+    stable.insert(
+        "ancestry_base_chain_sha256".to_string(),
+        serde_json::json!("22".repeat(32)),
+    );
+    stable.insert("ancestry".to_string(), serde_json::json!([]));
+    std::fs::write(
+        journal_path,
+        serde_json::to_vec(&journal).expect("encode forged append generation"),
+    )
+    .expect("write forged append generation");
+
+    let error = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path),
+        },
+    )
+    .await
+    .expect_err("higher generation without ancestry anchor must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("codex_resume_state_needs_compaction"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("ancestry anchor"), "{error}");
 }
 
 #[tokio::test]

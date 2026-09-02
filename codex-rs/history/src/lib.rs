@@ -222,7 +222,7 @@ pub struct ResumedHistory {
 }
 
 /// Current private on-disk schema for [`MaterializedResumeState`].
-pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 2;
+pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 3;
 
 /// Exact post-reconstruction state required to hydrate a resumed session.
 ///
@@ -302,8 +302,16 @@ pub struct MaterializedResumeAppendGeneration {
     pub generation_id: String,
     pub generation: u64,
     pub chain_sha256: String,
-    pub checkpoint_generation: u64,
-    pub checkpoint_chain_sha256: String,
+    pub ancestry_base_generation: u64,
+    pub ancestry_base_chain_sha256: String,
+    pub ancestry: Vec<MaterializedResumeAppendGenerationLink>,
+}
+
+/// One canonical append link in a bounded checkpoint ancestry proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedResumeAppendGenerationLink {
+    pub generation: u64,
+    pub suffix_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -13,6 +13,7 @@ use std::time::UNIX_EPOCH;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::MaterializedResumeAppendGeneration;
+use codex_rollout::MaterializedResumeAppendGenerationLink;
 use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::ScanOutcome;
 use serde::Deserialize;
@@ -24,7 +25,7 @@ use super::LocalThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-const APPEND_GENERATION_VERSION: u32 = 1;
+const APPEND_GENERATION_VERSION: u32 = 2;
 const APPEND_GENERATION_DIRECTORY: &str = "rollout_append_generation_v1";
 const MAX_APPEND_GENERATION_BYTES: u64 = 1024 * 1024;
 const FENCE_SAMPLE_BYTES: usize = 64 * 1024;
@@ -43,8 +44,9 @@ struct AppendGenerationJournal {
 struct StableGeneration {
     generation: u64,
     chain_sha256: String,
-    checkpoint_generation: u64,
-    checkpoint_chain_sha256: String,
+    ancestry_base_generation: u64,
+    ancestry_base_chain_sha256: String,
+    ancestry: Vec<MaterializedResumeAppendGenerationLink>,
     position: SourcePosition,
 }
 
@@ -55,7 +57,7 @@ struct PendingAppend {
     history_mode: ThreadHistoryMode,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct SourcePosition {
     end_byte_offset: u64,
     end_ordinal_exclusive: Option<u64>,
@@ -63,6 +65,7 @@ struct SourcePosition {
     file_identity: String,
     change_marker: String,
     prefix_head_sha256: String,
+    prefix_middle_sha256: String,
     prefix_tail_sha256: String,
 }
 
@@ -184,8 +187,9 @@ pub(super) fn bootstrap_current(
         stable: StableGeneration {
             generation: 0,
             chain_sha256: chain_sha256.clone(),
-            checkpoint_generation: 0,
-            checkpoint_chain_sha256: chain_sha256,
+            ancestry_base_generation: 0,
+            ancestry_base_chain_sha256: chain_sha256,
+            ancestry: Vec::new(),
             position,
         },
         pending: None,
@@ -204,14 +208,58 @@ pub(super) fn validate_descendant(
         ));
     }
     if current.generation == stored.generation {
-        if current.chain_sha256 != stored.chain_sha256 {
-            return Err(invalid("rollout append generation chain was rewritten"));
-        }
-    } else if current.checkpoint_generation != stored.generation
-        || current.checkpoint_chain_sha256 != stored.chain_sha256
-    {
+        return if current.chain_sha256 == stored.chain_sha256 {
+            Ok(())
+        } else {
+            Err(invalid("rollout append generation chain was rewritten"))
+        };
+    }
+    if current.ancestry_base_generation > stored.generation {
         return Err(invalid(
-            "rollout append generation does not prove the checkpoint as its base",
+            "rollout append generation is missing the checkpoint ancestry anchor",
+        ));
+    }
+    let expected_link_count = current
+        .generation
+        .checked_sub(current.ancestry_base_generation)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| invalid("rollout append generation ancestry length overflow"))?;
+    if current.ancestry.len() != expected_link_count {
+        return Err(invalid(format!(
+            "rollout append generation ancestry has {} links; expected {expected_link_count}",
+            current.ancestry.len()
+        )));
+    }
+    let mut generation = current.ancestry_base_generation;
+    let mut chain_sha256 = current.ancestry_base_chain_sha256.clone();
+    let mut checkpoint_chain_verified = if generation == stored.generation {
+        chain_sha256 == stored.chain_sha256
+    } else {
+        false
+    };
+    for link in &current.ancestry {
+        generation = generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("rollout append generation ancestry overflow"))?;
+        if link.generation != generation {
+            return Err(invalid(format!(
+                "rollout append generation ancestry link {} does not match expected {generation}",
+                link.generation
+            )));
+        }
+        chain_sha256 = advance_chain(chain_sha256.as_str(), link.suffix_sha256.as_str());
+        if generation == stored.generation {
+            checkpoint_chain_verified = chain_sha256 == stored.chain_sha256;
+        }
+    }
+    if !checkpoint_chain_verified {
+        return Err(invalid(
+            "rollout append generation ancestry does not reproduce the checkpoint chain",
+        ));
+    }
+    if chain_sha256 != current.chain_sha256 {
+        return Err(invalid(
+            "rollout append generation ancestry does not produce the current chain",
         ));
     }
     Ok(())
@@ -227,8 +275,9 @@ pub(super) fn bind_checkpoint(
     recover_pending(store, &mut journal)?;
     validate_journal_identity(&journal, rollout_id, rollout_path)?;
     validate_current_position(&journal)?;
-    journal.stable.checkpoint_generation = journal.stable.generation;
-    journal.stable.checkpoint_chain_sha256 = journal.stable.chain_sha256.clone();
+    journal.stable.ancestry_base_generation = journal.stable.generation;
+    journal.stable.ancestry_base_chain_sha256 = journal.stable.chain_sha256.clone();
+    journal.stable.ancestry.clear();
     write_journal(store, &journal)
 }
 
@@ -264,6 +313,11 @@ fn recover_pending(
             "source changed without completing its pending append",
         ));
     }
+    validate_stored_prefix(
+        journal.canonical_rollout_path.as_path(),
+        &journal.stable.position,
+        pending.history_mode,
+    )?;
     let suffix = summarize_suffix(
         journal.canonical_rollout_path.as_path(),
         journal.stable.position.end_byte_offset,
@@ -272,6 +326,15 @@ fn recover_pending(
         current.end_ordinal_exclusive,
         pending.history_mode,
     )?;
+    let verified_current = source_position(
+        journal.canonical_rollout_path.as_path(),
+        pending.history_mode,
+    )?;
+    if !positions_equal(&current, &verified_current) {
+        return Err(ThreadStoreError::Conflict {
+            message: "rollout changed while its pending suffix was inspected".to_string(),
+        });
+    }
     if let Some(expected_item_count) = pending.expected_item_count
         && suffix.item_count != expected_item_count
     {
@@ -280,14 +343,23 @@ fn recover_pending(
             suffix.item_count, expected_item_count
         )));
     }
-    let mut hasher = Sha256::new();
-    hasher.update(journal.stable.chain_sha256.as_bytes());
-    hasher.update(suffix.sha256.as_bytes());
+    let chain_sha256 = advance_chain(journal.stable.chain_sha256.as_str(), suffix.sha256.as_str());
+    journal
+        .stable
+        .ancestry
+        .push(MaterializedResumeAppendGenerationLink {
+            generation: pending.generation,
+            suffix_sha256: suffix.sha256,
+        });
+    let ancestry_base_generation = journal.stable.ancestry_base_generation;
+    let ancestry_base_chain_sha256 = journal.stable.ancestry_base_chain_sha256.clone();
+    let ancestry = std::mem::take(&mut journal.stable.ancestry);
     journal.stable = StableGeneration {
         generation: pending.generation,
-        chain_sha256: format!("{:x}", hasher.finalize()),
-        checkpoint_generation: journal.stable.checkpoint_generation,
-        checkpoint_chain_sha256: journal.stable.checkpoint_chain_sha256.clone(),
+        chain_sha256,
+        ancestry_base_generation,
+        ancestry_base_chain_sha256,
+        ancestry,
         position: current,
     };
     journal.pending = None;
@@ -325,13 +397,7 @@ fn validate_current_position(journal: &AppendGenerationJournal) -> ThreadStoreRe
 }
 
 fn positions_equal(left: &SourcePosition, right: &SourcePosition) -> bool {
-    left.end_byte_offset == right.end_byte_offset
-        && left.end_ordinal_exclusive == right.end_ordinal_exclusive
-        && left.modified_unix_nanos == right.modified_unix_nanos
-        && left.file_identity == right.file_identity
-        && left.change_marker == right.change_marker
-        && left.prefix_head_sha256 == right.prefix_head_sha256
-        && left.prefix_tail_sha256 == right.prefix_tail_sha256
+    left == right
 }
 
 fn source_position(
@@ -339,36 +405,20 @@ fn source_position(
     history_mode: ThreadHistoryMode,
 ) -> ThreadStoreResult<SourcePosition> {
     let before = std::fs::metadata(path).map_err(source_error)?;
+    let (before_file_identity, _) = platform_file_generation(&before);
     let end_byte_offset = before.len();
-    let end_ordinal_exclusive = match history_mode {
-        ThreadHistoryMode::Legacy => None,
-        ThreadHistoryMode::Paginated => {
-            let file = File::open(path).map_err(source_error)?;
-            let mut scanner = ReverseJsonlScanner::new(file)
-                .map_err(source_error)?
-                .with_strict_max_record_bytes(codex_rollout::MAX_ROLLOUT_LINE_BYTES);
-            let line = match scanner.scan_next_rollout_line().map_err(source_error)? {
-                Some(ScanOutcome::Parsed(line)) => line,
-                Some(ScanOutcome::Rejected(err)) => {
-                    return Err(invalid(format!("source terminal record is corrupt: {err}")));
-                }
-                None => return Err(invalid("source rollout is empty")),
-            };
-            let ordinal = line
-                .ordinal
-                .ok_or_else(|| invalid("paginated source terminal record has no ordinal"))?;
-            Some(
-                ordinal
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("source ordinal overflow"))?,
-            )
-        }
-    };
+    let end_ordinal_exclusive = terminal_ordinal_exclusive(path, end_byte_offset, history_mode)?;
     let (prefix_head_sha256, _) = hash_sample(path, 0, end_byte_offset)?;
+    let (prefix_middle_sha256, _) =
+        hash_sample(path, middle_sample_start(end_byte_offset), end_byte_offset)?;
     let tail_start = end_byte_offset.saturating_sub(FENCE_SAMPLE_BYTES as u64);
     let (prefix_tail_sha256, _) = hash_sample(path, tail_start, end_byte_offset)?;
     let after = std::fs::metadata(path).map_err(source_error)?;
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+    let (after_file_identity, _) = platform_file_generation(&after);
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || before_file_identity != after_file_identity
+    {
         return Err(ThreadStoreError::Conflict {
             message: "rollout changed while its append generation was inspected".to_string(),
         });
@@ -381,8 +431,93 @@ fn source_position(
         file_identity,
         change_marker,
         prefix_head_sha256,
+        prefix_middle_sha256,
         prefix_tail_sha256,
     })
+}
+
+fn validate_stored_prefix(
+    path: &Path,
+    stored: &SourcePosition,
+    history_mode: ThreadHistoryMode,
+) -> ThreadStoreResult<()> {
+    let before = std::fs::metadata(path).map_err(source_error)?;
+    if before.len() < stored.end_byte_offset {
+        return Err(invalid("pending append truncated the stored source prefix"));
+    }
+    let (file_identity, _) = platform_file_generation(&before);
+    if file_identity != stored.file_identity {
+        return Err(invalid(
+            "pending append replaced the stored source file identity",
+        ));
+    }
+    let (prefix_head_sha256, _) = hash_sample(path, 0, stored.end_byte_offset)?;
+    let (prefix_middle_sha256, _) = hash_sample(
+        path,
+        middle_sample_start(stored.end_byte_offset),
+        stored.end_byte_offset,
+    )?;
+    let tail_start = stored
+        .end_byte_offset
+        .saturating_sub(FENCE_SAMPLE_BYTES as u64);
+    let (prefix_tail_sha256, _) = hash_sample(path, tail_start, stored.end_byte_offset)?;
+    let end_ordinal_exclusive =
+        terminal_ordinal_exclusive(path, stored.end_byte_offset, history_mode)?;
+    let after = std::fs::metadata(path).map_err(source_error)?;
+    let (after_file_identity, _) = platform_file_generation(&after);
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || file_identity != after_file_identity
+    {
+        return Err(ThreadStoreError::Conflict {
+            message: "rollout changed while its pending prefix was inspected".to_string(),
+        });
+    }
+    if end_ordinal_exclusive != stored.end_ordinal_exclusive
+        || prefix_head_sha256 != stored.prefix_head_sha256
+        || prefix_middle_sha256 != stored.prefix_middle_sha256
+        || prefix_tail_sha256 != stored.prefix_tail_sha256
+    {
+        return Err(invalid(
+            "pending append changed the stored source prefix contract",
+        ));
+    }
+    Ok(())
+}
+
+fn terminal_ordinal_exclusive(
+    path: &Path,
+    end_byte_offset: u64,
+    history_mode: ThreadHistoryMode,
+) -> ThreadStoreResult<Option<u64>> {
+    match history_mode {
+        ThreadHistoryMode::Legacy => Ok(None),
+        ThreadHistoryMode::Paginated => {
+            let file = File::open(path).map_err(source_error)?;
+            let mut scanner = ReverseJsonlScanner::new_at(file, end_byte_offset)
+                .map_err(source_error)?
+                .with_strict_max_record_bytes(codex_rollout::MAX_ROLLOUT_LINE_BYTES);
+            let line = match scanner.scan_next_rollout_line().map_err(source_error)? {
+                Some(ScanOutcome::Parsed(line)) => line,
+                Some(ScanOutcome::Rejected(err)) => {
+                    return Err(invalid(format!("source terminal record is corrupt: {err}")));
+                }
+                None => return Err(invalid("source rollout is empty")),
+            };
+            let ordinal = line
+                .ordinal
+                .ok_or_else(|| invalid("paginated source terminal record has no ordinal"))?;
+            Ok(Some(
+                ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("source ordinal overflow"))?,
+            ))
+        }
+    }
+}
+
+fn middle_sample_start(end_byte_offset: u64) -> u64 {
+    end_byte_offset.saturating_sub(FENCE_SAMPLE_BYTES as u64) / 2
 }
 
 struct SuffixSummary {
@@ -509,9 +644,17 @@ fn materialized_generation(
         generation_id: journal.generation_id.clone(),
         generation: journal.stable.generation,
         chain_sha256: journal.stable.chain_sha256.clone(),
-        checkpoint_generation: journal.stable.checkpoint_generation,
-        checkpoint_chain_sha256: journal.stable.checkpoint_chain_sha256.clone(),
+        ancestry_base_generation: journal.stable.ancestry_base_generation,
+        ancestry_base_chain_sha256: journal.stable.ancestry_base_chain_sha256.clone(),
+        ancestry: journal.stable.ancestry.clone(),
     }
+}
+
+fn advance_chain(previous_chain_sha256: &str, suffix_sha256: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(previous_chain_sha256.as_bytes());
+    hasher.update(suffix_sha256.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn genesis_chain(
