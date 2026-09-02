@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::ConfigBuilder;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
@@ -10,8 +11,10 @@ use codex_config::config_toml::ForcedChatgptWorkspaceIds;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_features::FeaturesToml;
 use codex_protocol::config_types::ForcedLoginMethod;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
+use tempfile::TempDir;
 
 #[test]
 fn resolve_bootstrap_auth_keyring_backend_kind_uses_secret_auth_storage_feature()
@@ -94,8 +97,9 @@ fn managed_auth_restrictions_intersect_workspaces_and_fail_closed() {
         )
         .expect("requirements should stack"),
     };
-    let auth_config = bootstrap_auth_config(Path::new("codex-home"), &bootstrap_config)
-        .expect("policy should resolve");
+    let auth_config =
+        bootstrap_auth_config(&std::env::temp_dir().join("codex-home"), &bootstrap_config)
+            .expect("policy should resolve");
     assert_eq!(auth_config.forced_login_method, None);
     assert!(auth_config.is_login_method_allowed(ForcedLoginMethod::Chatgpt));
     assert!(!auth_config.is_login_method_allowed(ForcedLoginMethod::Api));
@@ -120,7 +124,7 @@ fn managed_auth_restrictions_intersect_workspaces_and_fail_closed() {
         .expect("requirements should stack"),
     };
     assert_eq!(
-        bootstrap_auth_config(Path::new("codex-home"), &bootstrap_config)
+        bootstrap_auth_config(&std::env::temp_dir().join("codex-home"), &bootstrap_config,)
             .expect_err("ChatGPT-only policy without an allowed workspace must fail")
             .kind(),
         std::io::ErrorKind::PermissionDenied
@@ -156,11 +160,51 @@ fn bootstrap_auth_config_applies_managed_store_and_chatgpt_base_url() {
         .expect("requirements should stack"),
     };
 
-    let auth_config = bootstrap_auth_config(Path::new("codex-home"), &bootstrap_config)
-        .expect("managed authentication settings should resolve");
+    let auth_config =
+        bootstrap_auth_config(&std::env::temp_dir().join("codex-home"), &bootstrap_config)
+            .expect("managed authentication settings should resolve");
 
     assert_eq!(auth_config.auth_credentials_store_mode, managed_store);
     assert_eq!(auth_config.chatgpt_base_url.as_deref(), Some(managed_url));
+}
+
+#[tokio::test]
+async fn config_builder_preserves_pre_resolved_auth_home() -> std::io::Result<()> {
+    let (_codex_home_dir, codex_home) = absolute_temp_home();
+    let (_auth_home_dir, auth_home) = absolute_temp_home();
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.to_path_buf())
+        .auth_home(auth_home.clone())
+        .build()
+        .await?;
+
+    assert_eq!(config.codex_home, codex_home);
+    assert_eq!(config.auth_home, auth_home);
+    Ok(())
+}
+
+#[test]
+fn bootstrap_auth_config_preserves_distinct_auth_home() {
+    let (_codex_home_dir, codex_home) = absolute_temp_home();
+    let (_auth_home_dir, auth_home) = absolute_temp_home();
+    let bootstrap_config = config_toml_load_result(ConfigToml::default(), None)
+        .expect("bootstrap config should resolve");
+
+    let auth_config = bootstrap_auth_config_with_home(&codex_home, &auth_home, &bootstrap_config)
+        .expect("auth config should resolve");
+
+    assert_eq!(auth_config.codex_home, codex_home.to_path_buf());
+    assert_eq!(auth_config.auth_home, auth_home.to_path_buf());
+}
+
+fn absolute_temp_home() -> (TempDir, AbsolutePathBuf) {
+    let home = tempfile::tempdir().expect("temp home");
+    let absolute_home = AbsolutePathBuf::from_absolute_path(
+        home.path().canonicalize().expect("canonicalize temp home"),
+    )
+    .expect("absolute temp home");
+    (home, absolute_home)
 }
 
 fn config_toml_load_result(

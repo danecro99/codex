@@ -257,9 +257,9 @@ pub struct ConfigToml {
     pub forced_login_method: Option<ForcedLoginMethod>,
 
     /// Preferred backend for storing CLI auth credentials.
-    /// file (default): Use a file in the Codex home directory.
+    /// file (default): Use auth.json in the resolved authentication home.
     /// keyring: Use an OS-specific keyring service.
-    /// auto: Use the keyring if available, otherwise use a file.
+    /// auto: Use the configured keyring backend and fail if unavailable.
     #[serde(default)]
     pub cli_auth_credentials_store: Option<AuthCredentialsStoreMode>,
 

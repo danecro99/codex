@@ -3591,6 +3591,9 @@ impl Session {
         }
         .or_cancel(cancellation_token)
         .await?;
+        let prepared_recommendations = prepared_recommendations
+            .map_err(std::io::Error::from)
+            .map_err(CodexErr::from)?;
         let mut selected_plugins = self
             .services
             .thread_extension_data

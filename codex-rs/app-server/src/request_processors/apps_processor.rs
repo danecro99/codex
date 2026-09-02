@@ -70,7 +70,11 @@ impl AppsRequestProcessor {
                 .set_enabled(Feature::Apps, thread.enabled(Feature::Apps));
         }
 
-        let auth = self.auth_manager.auth().await;
+        let auth = self
+            .auth_manager
+            .try_auth()
+            .await
+            .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
         if !config
             .features
             .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
@@ -195,10 +199,15 @@ impl AppsRequestProcessor {
                 loaded_plugins.capability_summaries(),
             );
         let plugin_apps = connector_snapshot.connector_ids().to_vec();
-        let (mut accessible_connectors, mut all_connectors) = tokio::join!(
+        let (accessible_connectors, all_connectors) = tokio::join!(
             connectors::list_cached_accessible_connectors_from_mcp_tools(&config),
             connectors::list_cached_all_connectors(&config, &plugin_apps)
         );
+        let mut accessible_connectors = accessible_connectors.map_err(|err| {
+            internal_error(format!("failed to load cached accessible apps: {err}"))
+        })?;
+        let mut all_connectors = all_connectors
+            .map_err(|err| internal_error(format!("failed to load cached apps: {err}")))?;
         let cached_all_connectors = all_connectors.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

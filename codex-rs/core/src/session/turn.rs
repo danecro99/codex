@@ -197,7 +197,12 @@ pub(crate) async fn run_turn(
             .or_cancel(&cancellation_token)
             .await
         {
-            Ok(requirements) => requirements,
+            Ok(Ok(requirements)) => requirements,
+            Ok(Err(err)) => {
+                run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
+                    .await;
+                return Err(err);
+            }
             Err(err) => {
                 run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
                     .await;
@@ -356,7 +361,7 @@ pub(crate) async fn run_turn(
                     &pending_user_input,
                 )
                 .or_cancel(&cancellation_token)
-                .await?;
+                .await??;
                 sess.capture_step_context_with_required_mcp_servers(
                     Arc::clone(&turn_context),
                     &cancellation_token,
@@ -682,9 +687,9 @@ async fn required_mcp_servers_for_input(
     sess: &Arc<Session>,
     turn_context: &TurnContext,
     user_input: &[UserInput],
-) -> (Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>) {
+) -> CodexResult<(Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>)> {
     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     // Plugin capabilities depend on authentication, so project them only after
@@ -727,17 +732,14 @@ async fn required_mcp_servers_for_input(
     let connector_slug_counts = if turn_context.apps_enabled() && !mentions.plain_names.is_empty() {
         let cached_connectors =
             connectors::list_cached_accessible_connectors_from_mcp_tools(&turn_context.config)
-                .await;
-        let accessible_connectors = match cached_connectors {
-            Some(connectors) => connectors,
-            None => sess
-                .services
-                .mcp_runtime
-                .current_binding()
                 .await
-                .map(|binding| connectors::accessible_connectors_from_mcp_tools(binding.tools()))
-                .unwrap_or_default(),
-        };
+                .map_err(std::io::Error::other)?;
+        let accessible_connectors = cached_connectors.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cached accessible connectors are unavailable for explicit app mentions",
+            )
+        })?;
         let connector_ids = current_config
             .iter()
             .flat_map(|config| config.connector_snapshot.connector_ids())
@@ -775,7 +777,7 @@ async fn required_mcp_servers_for_input(
         }
     }
 
-    (required_servers.into_iter().collect(), mentioned_plugins)
+    Ok((required_servers.into_iter().collect(), mentioned_plugins))
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1490,7 +1492,7 @@ pub(crate) struct PreparedToolRecommendations {
 pub(crate) async fn prepare_tool_recommendations(
     sess: &Session,
     turn_context: &TurnContext,
-) -> PreparedToolRecommendations {
+) -> Result<PreparedToolRecommendations, codex_login::RefreshTokenError> {
     let loaded_plugins = sess
         .services
         .plugins_manager
@@ -1499,7 +1501,7 @@ pub(crate) async fn prepare_tool_recommendations(
         .await;
     let tool_suggest_is_enabled = tool_suggest_enabled(turn_context);
     let auth = if tool_suggest_is_enabled {
-        sess.services.auth_manager.auth().await
+        sess.services.auth_manager.try_auth().await?
     } else {
         None
     };
@@ -1519,10 +1521,10 @@ pub(crate) async fn prepare_tool_recommendations(
         None
     };
 
-    PreparedToolRecommendations {
+    Ok(PreparedToolRecommendations {
         auth,
         endpoint_candidates,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1570,39 +1572,38 @@ pub(crate) async fn built_tools(
             async {
                 if apps_enabled && tool_suggest_is_enabled {
                     if let Some(accessible_connectors) = accessible_connectors.as_ref() {
-                        match connectors::list_tool_suggest_discoverable_tools_with_auth(
-                            &turn_context.config,
-                            sess.services.plugins_manager.as_ref(),
-                            auth.as_ref(),
-                            accessible_connectors.as_slice(),
-                            &loaded_plugin_app_connector_ids,
-                        )
-                        .await
-                        .map(|discoverable_tools| {
+                        let discoverable_tools =
+                            connectors::list_tool_suggest_discoverable_tools_with_auth(
+                                &turn_context.config,
+                                sess.services.plugins_manager.as_ref(),
+                                auth.as_ref(),
+                                accessible_connectors.as_slice(),
+                                &loaded_plugin_app_connector_ids,
+                            )
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        let discoverable_tools =
                             filter_request_plugin_install_discoverable_tools_for_client(
                                 discoverable_tools,
                                 turn_context.app_server_client_name.as_deref(),
-                            )
-                        }) {
-                            Ok(discoverable_tools) if discoverable_tools.is_empty() => None,
-                            Ok(discoverable_tools) => Some(ToolSuggestCandidates {
+                            );
+                        if discoverable_tools.is_empty() {
+                            Ok::<Option<ToolSuggestCandidates>, std::io::Error>(None)
+                        } else {
+                            Ok(Some(ToolSuggestCandidates {
                                 tools: discoverable_tools,
                                 presentation: ToolSuggestPresentation::ListTool,
-                            }),
-                            Err(err) => {
-                                warn!("failed to load discoverable tool suggestions: {err:#}");
-                                None
-                            }
+                            }))
                         }
                     } else {
-                        None
+                        Ok(None)
                     }
                 } else {
-                    None
+                    Ok(None)
                 }
             }
             .instrument(trace_span!("built_tools.load_discoverable_tools"))
-            .await
+            .await?
         };
     Ok(Arc::new(build_tool_router(
         sess,
