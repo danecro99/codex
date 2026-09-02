@@ -772,11 +772,7 @@ fn write_paginated_rollout<const N: usize>(
     uuid: Uuid,
     items: [RolloutItem; N],
 ) -> PathBuf {
-    let path =
-        write_session_file_with_history_mode(home, timestamp, uuid, ThreadHistoryMode::Paginated)
-            .expect("write session file");
-    append_items(path.as_path(), items);
-    path
+    write_ordinaled_paginated_rollout(home, timestamp, uuid, items)
 }
 
 fn write_legacy_rollout<const N: usize>(
