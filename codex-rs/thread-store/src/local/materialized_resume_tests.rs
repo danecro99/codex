@@ -163,8 +163,11 @@ async fn append_with_generation(
     path: &std::path::Path,
     history_mode: ThreadHistoryMode,
     item: &RolloutItem,
+) -> (
+    crate::local::append_generation::AppendGenerationIo,
+    crate::local::append_generation::AppendGenerationIo,
 ) {
-    let started = crate::local::append_generation::begin_append(
+    let start = crate::local::append_generation::begin_append(
         store,
         thread_id,
         thread_id,
@@ -174,14 +177,15 @@ async fn append_with_generation(
     )
     .expect("begin canonical append");
     assert!(
-        started,
+        start.started,
         "published checkpoint must own an append generation"
     );
     codex_rollout::append_rollout_item_to_path(path, item)
         .await
         .expect("append rollout item");
-    crate::local::append_generation::finish_append(store, thread_id)
+    let finish_io = crate::local::append_generation::finish_append(store, thread_id)
         .expect("finish canonical append");
+    (start.io, finish_io)
 }
 
 #[tokio::test]
@@ -580,7 +584,7 @@ async fn append_generation_rejects_sampled_middle_rewrite() {
 }
 
 #[tokio::test]
-async fn pending_append_rejects_unsampled_prefix_rewrite_before_suffix_commit() {
+async fn unsampled_rewrite_between_canonical_appends_is_loud() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 4_010);
     let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
@@ -598,27 +602,25 @@ async fn pending_append_rejects_unsampled_prefix_rewrite_before_suffix_commit() 
     .expect("load large source");
     publish_loaded_state(&store, thread_id, &first).await;
 
-    assert!(
-        crate::local::append_generation::begin_append(
-            &store,
-            thread_id,
-            thread_id,
-            path.as_path(),
-            ThreadHistoryMode::Legacy,
-            1,
-        )
-        .expect("begin pending append")
-    );
-    rewrite_unsampled_payload_byte(path.as_path());
-    codex_rollout::append_rollout_item_to_path(
+    append_with_generation(
+        &store,
+        thread_id,
         path.as_path(),
-        &user_message("legitimate suffix".to_string()),
+        ThreadHistoryMode::Legacy,
+        &user_message("first canonical suffix".to_string()),
     )
-    .await
-    .expect("append legitimate suffix");
+    .await;
+    rewrite_unsampled_payload_byte(path.as_path());
 
-    let error = crate::local::append_generation::finish_append(&store, thread_id)
-        .expect_err("rewritten pending prefix must fail");
+    let error = crate::local::append_generation::begin_append(
+        &store,
+        thread_id,
+        thread_id,
+        path.as_path(),
+        ThreadHistoryMode::Legacy,
+        1,
+    )
+    .expect_err("out-of-band rewrite before the next canonical append must fail");
     assert!(
         error
             .to_string()
@@ -628,8 +630,55 @@ async fn pending_append_rejects_unsampled_prefix_rewrite_before_suffix_commit() 
     assert!(
         error
             .to_string()
-            .contains("complete stored source prefix digest"),
+            .contains("outside the canonical append-generation contract"),
         "{error}"
+    );
+}
+
+#[tokio::test]
+async fn canonical_append_reads_only_suffix_plus_bounded_fences() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_012);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_large_legacy_rollout(home.path(), uuid);
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let first = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("load large source");
+    publish_loaded_state(&store, thread_id, &first).await;
+
+    let prefix_bytes = std::fs::metadata(path.as_path())
+        .expect("large source metadata")
+        .len();
+    let (begin_io, finish_io) = append_with_generation(
+        &store,
+        thread_id,
+        path.as_path(),
+        ThreadHistoryMode::Legacy,
+        &user_message("bounded canonical suffix".to_string()),
+    )
+    .await;
+    let appended_bytes = std::fs::metadata(path.as_path())
+        .expect("extended source metadata")
+        .len()
+        .saturating_sub(prefix_bytes);
+    let source_bytes = begin_io.source_bytes.saturating_add(finish_io.source_bytes);
+
+    assert_eq!(finish_io.suffix_bytes, appended_bytes);
+    assert!(
+        source_bytes <= appended_bytes.saturating_add(12 * FENCE_SAMPLE_BYTES as u64),
+        "append inspected {source_bytes} bytes for a {appended_bytes}-byte suffix"
+    );
+    assert!(
+        prefix_bytes > source_bytes.saturating_mul(4),
+        "large {prefix_bytes}-byte prefix must not be replayed by a {source_bytes}-byte append inspection"
     );
 }
 
@@ -759,6 +808,7 @@ async fn paginated_suffix_ordinal_gap_is_loud() {
             1,
         )
         .expect("begin malformed canonical append")
+        .started
     );
     serde_json::to_writer(
         &mut file,

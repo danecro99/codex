@@ -328,7 +328,7 @@ async fn write_and_project(
         RolloutWriteOp::Persist => RolloutWriteOp::Persist,
         RolloutWriteOp::Flush => RolloutWriteOp::Flush,
     };
-    let append_generation_started = match &write_op {
+    let append_generation_start = match &write_op {
         RolloutWriteOp::AppendItems(items) => super::append_generation::begin_append(
             store,
             thread_id,
@@ -346,7 +346,7 @@ async fn write_and_project(
         )?,
     };
     durable_write(&recorder, write_op).await?;
-    if append_generation_started {
+    if append_generation_start.started {
         super::append_generation::finish_append(store, rollout_id)?;
     }
     if matches!(history_mode, ThreadHistoryMode::Paginated) {

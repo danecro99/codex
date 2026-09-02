@@ -25,10 +25,38 @@ use super::LocalThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-const APPEND_GENERATION_VERSION: u32 = 3;
+const APPEND_GENERATION_VERSION: u32 = 4;
 const APPEND_GENERATION_DIRECTORY: &str = "rollout_append_generation_v1";
 const MAX_APPEND_GENERATION_BYTES: u64 = 1024 * 1024;
 const FENCE_SAMPLE_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct AppendGenerationIo {
+    pub(super) source_bytes: u64,
+    pub(super) suffix_bytes: u64,
+}
+
+impl AppendGenerationIo {
+    fn add_source_bytes(&mut self, source_bytes: u64) {
+        self.source_bytes = self.source_bytes.saturating_add(source_bytes);
+    }
+
+    fn add_suffix_bytes(&mut self, suffix_bytes: u64) {
+        self.source_bytes = self.source_bytes.saturating_add(suffix_bytes);
+        self.suffix_bytes = self.suffix_bytes.saturating_add(suffix_bytes);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.source_bytes = self.source_bytes.saturating_add(other.source_bytes);
+        self.suffix_bytes = self.suffix_bytes.saturating_add(other.suffix_bytes);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct AppendGenerationStart {
+    pub(super) started: bool,
+    pub(super) io: AppendGenerationIo,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AppendGenerationJournal {
@@ -64,7 +92,6 @@ struct SourcePosition {
     modified_unix_nanos: u64,
     file_identity: String,
     change_marker: String,
-    prefix_sha256: String,
     prefix_head_sha256: String,
     prefix_middle_sha256: String,
     prefix_tail_sha256: String,
@@ -77,7 +104,7 @@ pub(super) fn begin_append(
     rollout_path: &Path,
     history_mode: ThreadHistoryMode,
     expected_item_count: usize,
-) -> ThreadStoreResult<bool> {
+) -> ThreadStoreResult<AppendGenerationStart> {
     let Some(mut journal) = load_journal(store, rollout_id)? else {
         if super::materialized_resume::checkpoint_path(store, checkpoint_thread_id)
             .try_exists()
@@ -87,17 +114,18 @@ pub(super) fn begin_append(
                 "append generation is missing for rollout {rollout_id} while a materialized resume artifact exists"
             )));
         }
-        return Ok(false);
+        return Ok(AppendGenerationStart::default());
     };
-    recover_pending(store, &mut journal)?;
+    let mut io = recover_pending(store, &mut journal)?;
     validate_journal_identity(&journal, rollout_id, rollout_path)?;
-    validate_current_position(&journal)?;
-    begin_pending_append(
+    io.merge(validate_current_position(&journal)?);
+    let started = begin_pending_append(
         store,
         &mut journal,
         history_mode,
         Some(u64::try_from(expected_item_count).unwrap_or(u64::MAX)),
-    )
+    )?;
+    Ok(AppendGenerationStart { started, io })
 }
 
 pub(super) fn begin_sync(
@@ -106,7 +134,7 @@ pub(super) fn begin_sync(
     rollout_id: ThreadId,
     rollout_path: &Path,
     history_mode: ThreadHistoryMode,
-) -> ThreadStoreResult<bool> {
+) -> ThreadStoreResult<AppendGenerationStart> {
     let Some(mut journal) = load_journal(store, rollout_id)? else {
         if super::materialized_resume::checkpoint_path(store, checkpoint_thread_id)
             .try_exists()
@@ -116,12 +144,13 @@ pub(super) fn begin_sync(
                 "append generation is missing for rollout {rollout_id} while a materialized resume artifact exists"
             )));
         }
-        return Ok(false);
+        return Ok(AppendGenerationStart::default());
     };
-    recover_pending(store, &mut journal)?;
+    let mut io = recover_pending(store, &mut journal)?;
     validate_journal_identity(&journal, rollout_id, rollout_path)?;
-    validate_current_position(&journal)?;
-    begin_pending_append(store, &mut journal, history_mode, None)
+    io.merge(validate_current_position(&journal)?);
+    let started = begin_pending_append(store, &mut journal, history_mode, None)?;
+    Ok(AppendGenerationStart { started, io })
 }
 
 fn begin_pending_append(
@@ -147,7 +176,7 @@ fn begin_pending_append(
 pub(super) fn finish_append(
     store: &LocalThreadStore,
     rollout_id: ThreadId,
-) -> ThreadStoreResult<()> {
+) -> ThreadStoreResult<AppendGenerationIo> {
     let mut journal = load_journal(store, rollout_id)?
         .ok_or_else(|| invalid("append generation disappeared during canonical append"))?;
     recover_pending(store, &mut journal)
@@ -177,11 +206,7 @@ pub(super) fn bootstrap_current(
         return Ok(generation);
     }
     let canonical_rollout_path = canonical_existing_path(rollout_path)?;
-    let position = source_position(
-        canonical_rollout_path.as_path(),
-        history_mode,
-        SourcePrefixDigest::Calculate,
-    )?;
+    let position = source_position(canonical_rollout_path.as_path(), history_mode)?.position;
     let generation_id = ThreadId::new().to_string();
     let chain_sha256 = genesis_chain(&generation_id, rollout_id, &position)?;
     let journal = AppendGenerationJournal {
@@ -300,30 +325,32 @@ pub(super) fn remove(store: &LocalThreadStore, rollout_id: ThreadId) -> ThreadSt
 fn recover_pending(
     store: &LocalThreadStore,
     journal: &mut AppendGenerationJournal,
-) -> ThreadStoreResult<()> {
+) -> ThreadStoreResult<AppendGenerationIo> {
     let Some(pending) = journal.pending.clone() else {
-        return Ok(());
+        return Ok(AppendGenerationIo::default());
     };
-    let mut current = source_position(
+    let current_inspection = source_position(
         journal.canonical_rollout_path.as_path(),
         pending.history_mode,
-        SourcePrefixDigest::Known(journal.stable.position.prefix_sha256.as_str()),
     )?;
+    let current = current_inspection.position;
+    let mut io = AppendGenerationIo::default();
+    io.add_source_bytes(current_inspection.source_bytes);
     if positions_equal(&current, &journal.stable.position) {
         journal.pending = None;
         write_journal(store, journal)?;
-        return Ok(());
+        return Ok(io);
     }
     if current.end_byte_offset <= journal.stable.position.end_byte_offset {
         return Err(invalid(
             "source changed without completing its pending append",
         ));
     }
-    let prefix_hasher = validate_stored_prefix(
+    io.add_source_bytes(validate_stored_prefix(
         journal.canonical_rollout_path.as_path(),
         &journal.stable.position,
         pending.history_mode,
-    )?;
+    )?);
     let suffix = summarize_suffix(
         journal.canonical_rollout_path.as_path(),
         journal.stable.position.end_byte_offset,
@@ -331,15 +358,14 @@ fn recover_pending(
         journal.stable.position.end_ordinal_exclusive,
         current.end_ordinal_exclusive,
         pending.history_mode,
-        prefix_hasher,
     )?;
-    current.prefix_sha256 = suffix.source_prefix_sha256.clone();
+    io.add_suffix_bytes(suffix.bytes_read);
     let verified_current = source_position(
         journal.canonical_rollout_path.as_path(),
         pending.history_mode,
-        SourcePrefixDigest::Known(current.prefix_sha256.as_str()),
     )?;
-    if !positions_equal(&current, &verified_current) {
+    io.add_source_bytes(verified_current.source_bytes);
+    if !positions_equal(&current, &verified_current.position) {
         return Err(ThreadStoreError::Conflict {
             message: "rollout changed while its pending suffix was inspected".to_string(),
         });
@@ -372,7 +398,8 @@ fn recover_pending(
         position: current,
     };
     journal.pending = None;
-    write_journal(store, journal)
+    write_journal(store, journal)?;
+    Ok(io)
 }
 
 fn validate_journal_identity(
@@ -390,58 +417,55 @@ fn validate_journal_identity(
     Ok(())
 }
 
-fn validate_current_position(journal: &AppendGenerationJournal) -> ThreadStoreResult<()> {
+fn validate_current_position(
+    journal: &AppendGenerationJournal,
+) -> ThreadStoreResult<AppendGenerationIo> {
     let history_mode = if journal.stable.position.end_ordinal_exclusive.is_some() {
         ThreadHistoryMode::Paginated
     } else {
         ThreadHistoryMode::Legacy
     };
-    let current = source_position(
-        journal.canonical_rollout_path.as_path(),
-        history_mode,
-        SourcePrefixDigest::Known(journal.stable.position.prefix_sha256.as_str()),
-    )?;
-    if !positions_equal(&current, &journal.stable.position) {
+    let current = source_position(journal.canonical_rollout_path.as_path(), history_mode)?;
+    // This is a generation-bound OS metadata fence, not a cryptographic proof of every source
+    // byte. Canonical writes are serialized and use O_APPEND; an out-of-band mutation between
+    // canonical operations changes the durable file identity/change marker and is rejected here.
+    // Concurrent writers that can also forge OS metadata are outside this one-writer contract.
+    if !positions_equal(&current.position, &journal.stable.position) {
         return Err(invalid(
             "source changed outside the canonical append-generation contract",
         ));
     }
-    Ok(())
+    Ok(AppendGenerationIo {
+        source_bytes: current.source_bytes,
+        suffix_bytes: 0,
+    })
 }
 
 fn positions_equal(left: &SourcePosition, right: &SourcePosition) -> bool {
     left == right
 }
 
-enum SourcePrefixDigest<'a> {
-    /// Bootstrap a new generation by hashing the complete source once.
-    Calculate,
-    /// Reuse the digest already fenced by a stable generation on bounded reads.
-    Known(&'a str),
+struct SourceInspection {
+    position: SourcePosition,
+    source_bytes: u64,
 }
 
 fn source_position(
     path: &Path,
     history_mode: ThreadHistoryMode,
-    prefix_digest: SourcePrefixDigest<'_>,
-) -> ThreadStoreResult<SourcePosition> {
+) -> ThreadStoreResult<SourceInspection> {
     let before = std::fs::metadata(path).map_err(source_error)?;
-    let (before_file_identity, _) = platform_file_generation(&before);
+    let (before_file_identity, _) = platform_file_generation(&before)?;
     let end_byte_offset = before.len();
-    let end_ordinal_exclusive = terminal_ordinal_exclusive(path, end_byte_offset, history_mode)?;
-    let prefix_sha256 = match prefix_digest {
-        SourcePrefixDigest::Calculate => {
-            format!("{:x}", hash_prefix_state(path, end_byte_offset)?.finalize())
-        }
-        SourcePrefixDigest::Known(prefix_sha256) => prefix_sha256.to_string(),
-    };
-    let (prefix_head_sha256, _) = hash_sample(path, 0, end_byte_offset)?;
-    let (prefix_middle_sha256, _) =
+    let (end_ordinal_exclusive, terminal_bytes) =
+        terminal_ordinal_exclusive(path, end_byte_offset, history_mode)?;
+    let (prefix_head_sha256, head_bytes) = hash_sample(path, 0, end_byte_offset)?;
+    let (prefix_middle_sha256, middle_bytes) =
         hash_sample(path, middle_sample_start(end_byte_offset), end_byte_offset)?;
     let tail_start = end_byte_offset.saturating_sub(FENCE_SAMPLE_BYTES as u64);
-    let (prefix_tail_sha256, _) = hash_sample(path, tail_start, end_byte_offset)?;
+    let (prefix_tail_sha256, tail_bytes) = hash_sample(path, tail_start, end_byte_offset)?;
     let after = std::fs::metadata(path).map_err(source_error)?;
-    let (after_file_identity, _) = platform_file_generation(&after);
+    let (after_file_identity, _) = platform_file_generation(&after)?;
     if before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
         || before_file_identity != after_file_identity
@@ -450,17 +474,22 @@ fn source_position(
             message: "rollout changed while its append generation was inspected".to_string(),
         });
     }
-    let (file_identity, change_marker) = platform_file_generation(&after);
-    Ok(SourcePosition {
-        end_byte_offset,
-        end_ordinal_exclusive,
-        modified_unix_nanos: modified_unix_nanos(after.modified().map_err(source_error)?)?,
-        file_identity,
-        change_marker,
-        prefix_sha256,
-        prefix_head_sha256,
-        prefix_middle_sha256,
-        prefix_tail_sha256,
+    let (file_identity, change_marker) = platform_file_generation(&after)?;
+    Ok(SourceInspection {
+        position: SourcePosition {
+            end_byte_offset,
+            end_ordinal_exclusive,
+            modified_unix_nanos: modified_unix_nanos(after.modified().map_err(source_error)?)?,
+            file_identity,
+            change_marker,
+            prefix_head_sha256,
+            prefix_middle_sha256,
+            prefix_tail_sha256,
+        },
+        source_bytes: terminal_bytes
+            .saturating_add(head_bytes)
+            .saturating_add(middle_bytes)
+            .saturating_add(tail_bytes),
     })
 }
 
@@ -468,21 +497,23 @@ fn validate_stored_prefix(
     path: &Path,
     stored: &SourcePosition,
     history_mode: ThreadHistoryMode,
-) -> ThreadStoreResult<Sha256> {
+) -> ThreadStoreResult<u64> {
     let before = std::fs::metadata(path).map_err(source_error)?;
     if before.len() < stored.end_byte_offset {
         return Err(invalid("pending append truncated the stored source prefix"));
     }
-    let (file_identity, _) = platform_file_generation(&before);
+    let (file_identity, _) = platform_file_generation(&before)?;
     if file_identity != stored.file_identity {
         return Err(invalid(
             "pending append replaced the stored source file identity",
         ));
     }
-    let prefix_hasher = hash_prefix_state(path, stored.end_byte_offset)?;
-    let prefix_sha256 = format!("{:x}", prefix_hasher.clone().finalize());
-    let (prefix_head_sha256, _) = hash_sample(path, 0, stored.end_byte_offset)?;
-    let (prefix_middle_sha256, _) = hash_sample(
+    // The stable metadata fence was checked immediately before begin_append. During the pending
+    // generation the serialized canonical writer owns this path and appends only at EOF. These
+    // bounded samples guard accidental prefix writes; they deliberately do not claim to prove an
+    // arbitrary concurrent rewrite without rereading the complete prefix.
+    let (prefix_head_sha256, head_bytes) = hash_sample(path, 0, stored.end_byte_offset)?;
+    let (prefix_middle_sha256, middle_bytes) = hash_sample(
         path,
         middle_sample_start(stored.end_byte_offset),
         stored.end_byte_offset,
@@ -490,11 +521,11 @@ fn validate_stored_prefix(
     let tail_start = stored
         .end_byte_offset
         .saturating_sub(FENCE_SAMPLE_BYTES as u64);
-    let (prefix_tail_sha256, _) = hash_sample(path, tail_start, stored.end_byte_offset)?;
-    let end_ordinal_exclusive =
+    let (prefix_tail_sha256, tail_bytes) = hash_sample(path, tail_start, stored.end_byte_offset)?;
+    let (end_ordinal_exclusive, terminal_bytes) =
         terminal_ordinal_exclusive(path, stored.end_byte_offset, history_mode)?;
     let after = std::fs::metadata(path).map_err(source_error)?;
-    let (after_file_identity, _) = platform_file_generation(&after);
+    let (after_file_identity, _) = platform_file_generation(&after)?;
     if before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
         || file_identity != after_file_identity
@@ -502,11 +533,6 @@ fn validate_stored_prefix(
         return Err(ThreadStoreError::Conflict {
             message: "rollout changed while its pending prefix was inspected".to_string(),
         });
-    }
-    if prefix_sha256 != stored.prefix_sha256 {
-        return Err(invalid(
-            "pending append changed the complete stored source prefix digest",
-        ));
     }
     if end_ordinal_exclusive != stored.end_ordinal_exclusive
         || prefix_head_sha256 != stored.prefix_head_sha256
@@ -517,16 +543,19 @@ fn validate_stored_prefix(
             "pending append changed the stored source prefix contract",
         ));
     }
-    Ok(prefix_hasher)
+    Ok(terminal_bytes
+        .saturating_add(head_bytes)
+        .saturating_add(middle_bytes)
+        .saturating_add(tail_bytes))
 }
 
 fn terminal_ordinal_exclusive(
     path: &Path,
     end_byte_offset: u64,
     history_mode: ThreadHistoryMode,
-) -> ThreadStoreResult<Option<u64>> {
+) -> ThreadStoreResult<(Option<u64>, u64)> {
     match history_mode {
-        ThreadHistoryMode::Legacy => Ok(None),
+        ThreadHistoryMode::Legacy => Ok((None, 0)),
         ThreadHistoryMode::Paginated => {
             let file = File::open(path).map_err(source_error)?;
             let mut scanner = ReverseJsonlScanner::new_at(file, end_byte_offset)
@@ -542,10 +571,14 @@ fn terminal_ordinal_exclusive(
             let ordinal = line
                 .ordinal
                 .ok_or_else(|| invalid("paginated source terminal record has no ordinal"))?;
-            Ok(Some(
-                ordinal
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("source ordinal overflow"))?,
+            let source_bytes = scanner.bytes_read();
+            Ok((
+                Some(
+                    ordinal
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("source ordinal overflow"))?,
+                ),
+                source_bytes,
             ))
         }
     }
@@ -558,7 +591,7 @@ fn middle_sample_start(end_byte_offset: u64) -> u64 {
 struct SuffixSummary {
     item_count: u64,
     sha256: String,
-    source_prefix_sha256: String,
+    bytes_read: u64,
 }
 
 fn summarize_suffix(
@@ -568,7 +601,6 @@ fn summarize_suffix(
     start_ordinal_exclusive: Option<u64>,
     end_ordinal_exclusive: Option<u64>,
     history_mode: ThreadHistoryMode,
-    mut source_prefix_hasher: Sha256,
 ) -> ThreadStoreResult<SuffixSummary> {
     let mut file = File::open(path).map_err(source_error)?;
     file.seek(SeekFrom::Start(start)).map_err(source_error)?;
@@ -576,6 +608,7 @@ fn summarize_suffix(
     let mut item_count = 0_u64;
     let mut next_ordinal = start_ordinal_exclusive;
     let mut hasher = Sha256::new();
+    let mut bytes_read = 0_u64;
     loop {
         let mut line = Vec::new();
         let read = Read::by_ref(&mut reader)
@@ -609,7 +642,7 @@ fn summarize_suffix(
                     .ok_or_else(|| invalid("pending append ordinal overflow"))?,
             );
         }
-        source_prefix_hasher.update(line.as_slice());
+        bytes_read = bytes_read.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
         hasher.update(line);
         item_count = item_count.saturating_add(1);
     }
@@ -619,7 +652,7 @@ fn summarize_suffix(
     Ok(SuffixSummary {
         item_count,
         sha256: format!("{:x}", hasher.finalize()),
-        source_prefix_sha256: format!("{:x}", source_prefix_hasher.finalize()),
+        bytes_read,
     })
 }
 
@@ -732,28 +765,6 @@ fn hash_sample(path: &Path, start: u64, end: u64) -> ThreadStoreResult<(String, 
     Ok((format!("{:x}", Sha256::digest(bytes)), length))
 }
 
-fn hash_prefix_state(path: &Path, end: u64) -> ThreadStoreResult<Sha256> {
-    let file = File::open(path).map_err(source_error)?;
-    let mut reader = BufReader::new(file.take(end));
-    let mut hasher = Sha256::new();
-    let mut hashed = 0_u64;
-    let mut buffer = vec![0_u8; FENCE_SAMPLE_BYTES];
-    loop {
-        let read = reader.read(buffer.as_mut_slice()).map_err(source_error)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        hashed = hashed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-    }
-    if hashed != end {
-        return Err(invalid(format!(
-            "source prefix ended at byte {hashed}; expected {end}"
-        )));
-    }
-    Ok(hasher)
-}
-
 fn canonical_existing_path(path: &Path) -> ThreadStoreResult<PathBuf> {
     std::fs::canonicalize(path).map_err(|err| ThreadStoreError::Internal {
         message: format!(
@@ -772,26 +783,26 @@ fn modified_unix_nanos(modified: SystemTime) -> ThreadStoreResult<u64> {
 }
 
 #[cfg(unix)]
-fn platform_file_generation(metadata: &std::fs::Metadata) -> (String, String) {
+fn platform_file_generation(metadata: &std::fs::Metadata) -> ThreadStoreResult<(String, String)> {
     use std::os::unix::fs::MetadataExt;
-    (
+    Ok((
         format!("{}:{}", metadata.dev(), metadata.ino()),
         format!("{}:{}", metadata.ctime(), metadata.ctime_nsec()),
-    )
+    ))
 }
 
 #[cfg(windows)]
-fn platform_file_generation(metadata: &std::fs::Metadata) -> (String, String) {
-    use std::os::windows::fs::MetadataExt;
-    (
-        format!("creation:{}", metadata.creation_time()),
-        format!("last_write:{}", metadata.last_write_time()),
-    )
+fn platform_file_generation(_metadata: &std::fs::Metadata) -> ThreadStoreResult<(String, String)> {
+    Err(invalid(
+        "codex_resume_state_needs_platform_integrity: stable Rust does not expose the Windows file identity and change-time pair required by the append-generation fence",
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn platform_file_generation(metadata: &std::fs::Metadata) -> (String, String) {
-    (format!("len:{}", metadata.len()), String::new())
+fn platform_file_generation(_metadata: &std::fs::Metadata) -> ThreadStoreResult<(String, String)> {
+    Err(invalid(
+        "codex_resume_state_needs_platform_integrity: this platform has no supported append-generation OS metadata fence",
+    ))
 }
 
 fn source_error(err: io::Error) -> ThreadStoreError {

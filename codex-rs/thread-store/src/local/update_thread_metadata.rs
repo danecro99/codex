@@ -867,7 +867,7 @@ async fn append_item_with_generation(
     item: RolloutItem,
 ) -> ThreadStoreResult<()> {
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let generation_started = super::append_generation::begin_append(
+    let generation_start = super::append_generation::begin_append(
         store,
         thread_id,
         rollout_id,
@@ -880,7 +880,7 @@ async fn append_item_with_generation(
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to append thread metadata: {err}"),
         })?;
-    if generation_started {
+    if generation_start.started {
         super::append_generation::finish_append(store, rollout_id)?;
     }
     Ok(())
