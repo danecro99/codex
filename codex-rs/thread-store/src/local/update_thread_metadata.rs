@@ -873,7 +873,7 @@ async fn append_item_with_generation(
         rollout_id,
         rollout_path,
         ThreadHistoryMode::Legacy,
-        1,
+        std::slice::from_ref(&item),
     )?;
     append_rollout_item_to_path(rollout_path, &item)
         .await

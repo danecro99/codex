@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -13,8 +14,8 @@ use std::time::UNIX_EPOCH;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::MaterializedResumeAppendGeneration;
-use codex_rollout::MaterializedResumeAppendGenerationLink;
 use codex_rollout::ReverseJsonlScanner;
+use codex_rollout::RolloutItem;
 use codex_rollout::ScanOutcome;
 use serde::Deserialize;
 use serde::Serialize;
@@ -25,15 +26,24 @@ use super::LocalThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-const APPEND_GENERATION_VERSION: u32 = 4;
-const APPEND_GENERATION_DIRECTORY: &str = "rollout_append_generation_v1";
+#[cfg(windows)]
+compile_error!(
+    "codex_resume_state_needs_platform_integrity: this release cannot create sessions on Windows until the rollout fence has native file identity and change-time support"
+);
+
+const APPEND_GENERATION_VERSION: u32 = 5;
+const APPEND_GENERATION_DIRECTORY: &str = "rollout_append_generation_v5";
 const MAX_APPEND_GENERATION_BYTES: u64 = 1024 * 1024;
+const MAX_CHECKPOINT_ANCHORS: usize = 4_096;
 const FENCE_SAMPLE_BYTES: usize = 64 * 1024;
+
+pub(super) type PlatformFileGeneration = (String, String);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct AppendGenerationIo {
     pub(super) source_bytes: u64,
     pub(super) suffix_bytes: u64,
+    pub(super) suffix_items: u64,
 }
 
 impl AppendGenerationIo {
@@ -41,14 +51,16 @@ impl AppendGenerationIo {
         self.source_bytes = self.source_bytes.saturating_add(source_bytes);
     }
 
-    fn add_suffix_bytes(&mut self, suffix_bytes: u64) {
+    fn add_suffix(&mut self, suffix_bytes: u64, suffix_items: u64) {
         self.source_bytes = self.source_bytes.saturating_add(suffix_bytes);
         self.suffix_bytes = self.suffix_bytes.saturating_add(suffix_bytes);
+        self.suffix_items = self.suffix_items.saturating_add(suffix_items);
     }
 
     fn merge(&mut self, other: Self) {
         self.source_bytes = self.source_bytes.saturating_add(other.source_bytes);
         self.suffix_bytes = self.suffix_bytes.saturating_add(other.suffix_bytes);
+        self.suffix_items = self.suffix_items.saturating_add(other.suffix_items);
     }
 }
 
@@ -58,6 +70,17 @@ pub(super) struct AppendGenerationStart {
     pub(super) io: AppendGenerationIo,
 }
 
+pub(super) struct LoadedAppendGeneration {
+    pub(super) generation: Option<MaterializedResumeAppendGeneration>,
+    pub(super) io: AppendGenerationIo,
+}
+
+#[derive(Clone, Copy)]
+enum PendingRecoveryContext {
+    Continue,
+    FinishCurrentAppend,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AppendGenerationJournal {
     version: u32,
@@ -65,6 +88,7 @@ struct AppendGenerationJournal {
     canonical_rollout_path: PathBuf,
     generation_id: String,
     stable: StableGeneration,
+    checkpoint_anchors: Vec<CheckpointAnchor>,
     pending: Option<PendingAppend>,
 }
 
@@ -72,17 +96,34 @@ struct AppendGenerationJournal {
 struct StableGeneration {
     generation: u64,
     chain_sha256: String,
-    ancestry_base_generation: u64,
-    ancestry_base_chain_sha256: String,
-    ancestry: Vec<MaterializedResumeAppendGenerationLink>,
     position: SourcePosition,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CheckpointAnchor {
+    anchor_id: String,
+    checkpoint_thread_id: ThreadId,
+    generation: u64,
+    chain_sha256: String,
+    descendant_generation: u64,
+    descendant_chain_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PendingAppend {
     generation: u64,
-    expected_item_count: Option<u64>,
+    evidence: PendingAppendEvidence,
     history_mode: ThreadHistoryMode,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PendingAppendEvidence {
+    ExactItems {
+        item_count: u64,
+        items_sha256: String,
+    },
+    Sync,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -103,7 +144,7 @@ pub(super) fn begin_append(
     rollout_id: ThreadId,
     rollout_path: &Path,
     history_mode: ThreadHistoryMode,
-    expected_item_count: usize,
+    items: &[RolloutItem],
 ) -> ThreadStoreResult<AppendGenerationStart> {
     let Some(mut journal) = load_journal(store, rollout_id)? else {
         if super::materialized_resume::checkpoint_path(store, checkpoint_thread_id)
@@ -116,14 +157,17 @@ pub(super) fn begin_append(
         }
         return Ok(AppendGenerationStart::default());
     };
-    let mut io = recover_pending(store, &mut journal)?;
+    let mut io = recover_pending(store, &mut journal, PendingRecoveryContext::Continue)?;
     validate_journal_identity(&journal, rollout_id, rollout_path)?;
     io.merge(validate_current_position(&journal)?);
     let started = begin_pending_append(
         store,
         &mut journal,
         history_mode,
-        Some(u64::try_from(expected_item_count).unwrap_or(u64::MAX)),
+        PendingAppendEvidence::ExactItems {
+            item_count: u64::try_from(items.len()).unwrap_or(u64::MAX),
+            items_sha256: hash_items(items)?,
+        },
     )?;
     Ok(AppendGenerationStart { started, io })
 }
@@ -146,10 +190,15 @@ pub(super) fn begin_sync(
         }
         return Ok(AppendGenerationStart::default());
     };
-    let mut io = recover_pending(store, &mut journal)?;
+    let mut io = recover_pending(store, &mut journal, PendingRecoveryContext::Continue)?;
     validate_journal_identity(&journal, rollout_id, rollout_path)?;
     io.merge(validate_current_position(&journal)?);
-    let started = begin_pending_append(store, &mut journal, history_mode, None)?;
+    let started = begin_pending_append(
+        store,
+        &mut journal,
+        history_mode,
+        PendingAppendEvidence::Sync,
+    )?;
     Ok(AppendGenerationStart { started, io })
 }
 
@@ -157,7 +206,7 @@ fn begin_pending_append(
     store: &LocalThreadStore,
     journal: &mut AppendGenerationJournal,
     history_mode: ThreadHistoryMode,
-    expected_item_count: Option<u64>,
+    evidence: PendingAppendEvidence,
 ) -> ThreadStoreResult<bool> {
     let generation = journal
         .stable
@@ -166,7 +215,7 @@ fn begin_pending_append(
         .ok_or_else(|| invalid("append generation overflow"))?;
     journal.pending = Some(PendingAppend {
         generation,
-        expected_item_count,
+        evidence,
         history_mode,
     });
     write_journal(store, journal)?;
@@ -179,7 +228,11 @@ pub(super) fn finish_append(
 ) -> ThreadStoreResult<AppendGenerationIo> {
     let mut journal = load_journal(store, rollout_id)?
         .ok_or_else(|| invalid("append generation disappeared during canonical append"))?;
-    recover_pending(store, &mut journal)
+    recover_pending(
+        store,
+        &mut journal,
+        PendingRecoveryContext::FinishCurrentAppend,
+    )
 }
 
 pub(super) fn load_current(
@@ -187,13 +240,27 @@ pub(super) fn load_current(
     rollout_id: ThreadId,
     rollout_path: &Path,
 ) -> ThreadStoreResult<Option<MaterializedResumeAppendGeneration>> {
+    Ok(load_current_with_io(store, rollout_id, rollout_path)?.generation)
+}
+
+pub(super) fn load_current_with_io(
+    store: &LocalThreadStore,
+    rollout_id: ThreadId,
+    rollout_path: &Path,
+) -> ThreadStoreResult<LoadedAppendGeneration> {
     let Some(mut journal) = load_journal(store, rollout_id)? else {
-        return Ok(None);
+        return Ok(LoadedAppendGeneration {
+            generation: None,
+            io: AppendGenerationIo::default(),
+        });
     };
-    recover_pending(store, &mut journal)?;
+    let mut io = recover_pending(store, &mut journal, PendingRecoveryContext::Continue)?;
     validate_journal_identity(&journal, rollout_id, rollout_path)?;
-    validate_current_position(&journal)?;
-    Ok(Some(materialized_generation(&journal)))
+    io.merge(validate_current_position(&journal)?);
+    Ok(LoadedAppendGeneration {
+        generation: Some(materialized_generation(&journal, None)),
+        io,
+    })
 }
 
 pub(super) fn bootstrap_current(
@@ -216,99 +283,117 @@ pub(super) fn bootstrap_current(
         generation_id,
         stable: StableGeneration {
             generation: 0,
-            chain_sha256: chain_sha256.clone(),
-            ancestry_base_generation: 0,
-            ancestry_base_chain_sha256: chain_sha256,
-            ancestry: Vec::new(),
+            chain_sha256,
             position,
         },
+        checkpoint_anchors: Vec::new(),
         pending: None,
     };
     write_journal(store, &journal)?;
-    Ok(materialized_generation(&journal))
+    Ok(materialized_generation(&journal, None))
 }
 
-pub(super) fn validate_descendant(
+pub(super) fn validate_checkpoint_descendant(
+    store: &LocalThreadStore,
+    checkpoint_thread_id: ThreadId,
+    rollout_id: ThreadId,
+    rollout_path: &Path,
     stored: &MaterializedResumeAppendGeneration,
-    current: &MaterializedResumeAppendGeneration,
 ) -> ThreadStoreResult<()> {
-    if stored.generation_id != current.generation_id || current.generation < stored.generation {
+    let mut journal = load_journal(store, rollout_id)?
+        .ok_or_else(|| invalid("source has no append generation"))?;
+    recover_pending(store, &mut journal, PendingRecoveryContext::Continue)?;
+    validate_journal_identity(&journal, rollout_id, rollout_path)?;
+    validate_current_position(&journal)?;
+    if stored.generation_id != journal.generation_id
+        || journal.stable.generation < stored.generation
+    {
         return Err(invalid(
             "rollout append generation is not a descendant of the checkpoint",
         ));
     }
-    if current.generation == stored.generation {
-        return if current.chain_sha256 == stored.chain_sha256 {
-            Ok(())
-        } else {
-            Err(invalid("rollout append generation chain was rewritten"))
-        };
-    }
-    if current.ancestry_base_generation > stored.generation {
+    let anchor_id = stored
+        .checkpoint_anchor_id
+        .as_deref()
+        .ok_or_else(|| invalid("checkpoint append generation has no ancestry anchor"))?;
+    let anchor = journal
+        .checkpoint_anchors
+        .iter()
+        .find(|anchor| anchor.anchor_id == anchor_id)
+        .ok_or_else(|| {
+            invalid("rollout append generation is missing the checkpoint ancestry anchor")
+        })?;
+    if anchor.checkpoint_thread_id != checkpoint_thread_id
+        || anchor.generation != stored.generation
+        || anchor.chain_sha256 != stored.chain_sha256
+        || anchor.descendant_generation != journal.stable.generation
+        || anchor.descendant_chain_sha256 != journal.stable.chain_sha256
+    {
         return Err(invalid(
-            "rollout append generation is missing the checkpoint ancestry anchor",
-        ));
-    }
-    let expected_link_count = current
-        .generation
-        .checked_sub(current.ancestry_base_generation)
-        .and_then(|count| usize::try_from(count).ok())
-        .ok_or_else(|| invalid("rollout append generation ancestry length overflow"))?;
-    if current.ancestry.len() != expected_link_count {
-        return Err(invalid(format!(
-            "rollout append generation ancestry has {} links; expected {expected_link_count}",
-            current.ancestry.len()
-        )));
-    }
-    let mut generation = current.ancestry_base_generation;
-    let mut chain_sha256 = current.ancestry_base_chain_sha256.clone();
-    let mut checkpoint_chain_verified = if generation == stored.generation {
-        chain_sha256 == stored.chain_sha256
-    } else {
-        false
-    };
-    for link in &current.ancestry {
-        generation = generation
-            .checked_add(1)
-            .ok_or_else(|| invalid("rollout append generation ancestry overflow"))?;
-        if link.generation != generation {
-            return Err(invalid(format!(
-                "rollout append generation ancestry link {} does not match expected {generation}",
-                link.generation
-            )));
-        }
-        chain_sha256 = advance_chain(chain_sha256.as_str(), link.suffix_sha256.as_str());
-        if generation == stored.generation {
-            checkpoint_chain_verified = chain_sha256 == stored.chain_sha256;
-        }
-    }
-    if !checkpoint_chain_verified {
-        return Err(invalid(
-            "rollout append generation ancestry does not reproduce the checkpoint chain",
-        ));
-    }
-    if chain_sha256 != current.chain_sha256 {
-        return Err(invalid(
-            "rollout append generation ancestry does not produce the current chain",
+            "rollout append generation ancestry anchor does not reproduce the current chain",
         ));
     }
     Ok(())
 }
 
-pub(super) fn bind_checkpoint(
+pub(super) fn prepare_checkpoint_anchor(
     store: &LocalThreadStore,
+    checkpoint_thread_id: ThreadId,
     rollout_id: ThreadId,
     rollout_path: &Path,
-) -> ThreadStoreResult<()> {
+    retained_anchor_id: Option<&str>,
+) -> ThreadStoreResult<MaterializedResumeAppendGeneration> {
     let mut journal = load_journal(store, rollout_id)?
-        .ok_or_else(|| invalid("append generation disappeared after checkpoint publication"))?;
-    recover_pending(store, &mut journal)?;
+        .ok_or_else(|| invalid("append generation disappeared before checkpoint publication"))?;
+    recover_pending(store, &mut journal, PendingRecoveryContext::Continue)?;
     validate_journal_identity(&journal, rollout_id, rollout_path)?;
     validate_current_position(&journal)?;
-    journal.stable.ancestry_base_generation = journal.stable.generation;
-    journal.stable.ancestry_base_chain_sha256 = journal.stable.chain_sha256.clone();
-    journal.stable.ancestry.clear();
-    write_journal(store, &journal)
+    journal.checkpoint_anchors.retain(|anchor| {
+        anchor.checkpoint_thread_id != checkpoint_thread_id
+            || retained_anchor_id == Some(anchor.anchor_id.as_str())
+    });
+    if journal.checkpoint_anchors.len() >= MAX_CHECKPOINT_ANCHORS {
+        return Err(invalid(format!(
+            "rollout append generation reached its explicit {MAX_CHECKPOINT_ANCHORS}-checkpoint anchor limit"
+        )));
+    }
+    let anchor_id = ThreadId::new().to_string();
+    journal.checkpoint_anchors.push(CheckpointAnchor {
+        anchor_id: anchor_id.clone(),
+        checkpoint_thread_id,
+        generation: journal.stable.generation,
+        chain_sha256: journal.stable.chain_sha256.clone(),
+        descendant_generation: journal.stable.generation,
+        descendant_chain_sha256: journal.stable.chain_sha256.clone(),
+    });
+    write_journal(store, &journal)?;
+    Ok(materialized_generation(&journal, Some(anchor_id)))
+}
+
+pub(super) fn discard_stale_checkpoint_anchors(
+    store: &LocalThreadStore,
+    checkpoint_thread_id: ThreadId,
+    rollout_id: ThreadId,
+    rollout_path: &Path,
+    retained_anchor_id: Option<&str>,
+) -> ThreadStoreResult<()> {
+    let Some(mut journal) = load_journal(store, rollout_id)? else {
+        return Ok(());
+    };
+    if journal.rollout_id != rollout_id || journal.canonical_rollout_path != rollout_path {
+        return Err(invalid(
+            "rollout append generation identity mismatch during checkpoint cleanup",
+        ));
+    }
+    let original_len = journal.checkpoint_anchors.len();
+    journal.checkpoint_anchors.retain(|anchor| {
+        anchor.checkpoint_thread_id != checkpoint_thread_id
+            || retained_anchor_id == Some(anchor.anchor_id.as_str())
+    });
+    if journal.checkpoint_anchors.len() != original_len {
+        write_journal(store, &journal)?;
+    }
+    Ok(())
 }
 
 pub(super) fn remove(store: &LocalThreadStore, rollout_id: ThreadId) -> ThreadStoreResult<()> {
@@ -325,81 +410,150 @@ pub(super) fn remove(store: &LocalThreadStore, rollout_id: ThreadId) -> ThreadSt
 fn recover_pending(
     store: &LocalThreadStore,
     journal: &mut AppendGenerationJournal,
+    context: PendingRecoveryContext,
 ) -> ThreadStoreResult<AppendGenerationIo> {
     let Some(pending) = journal.pending.clone() else {
         return Ok(AppendGenerationIo::default());
     };
-    let current_inspection = source_position(
-        journal.canonical_rollout_path.as_path(),
-        pending.history_mode,
-    )?;
-    let current = current_inspection.position;
+    let current_end = std::fs::metadata(journal.canonical_rollout_path.as_path())
+        .map_err(source_error)?
+        .len();
     let mut io = AppendGenerationIo::default();
-    io.add_source_bytes(current_inspection.source_bytes);
-    if positions_equal(&current, &journal.stable.position) {
+    if current_end < journal.stable.position.end_byte_offset {
+        return Err(invalid("pending append truncated the stored source prefix"));
+    }
+    if current_end == journal.stable.position.end_byte_offset {
+        let current = source_position(
+            journal.canonical_rollout_path.as_path(),
+            pending.history_mode,
+        )?;
+        io.add_source_bytes(current.source_bytes);
+        if !positions_equal(&current.position, &journal.stable.position) {
+            return Err(invalid(
+                "source changed without completing its pending append",
+            ));
+        }
         journal.pending = None;
         write_journal(store, journal)?;
         return Ok(io);
-    }
-    if current.end_byte_offset <= journal.stable.position.end_byte_offset {
-        return Err(invalid(
-            "source changed without completing its pending append",
-        ));
     }
     io.add_source_bytes(validate_stored_prefix(
         journal.canonical_rollout_path.as_path(),
         &journal.stable.position,
         pending.history_mode,
     )?);
-    let suffix = summarize_suffix(
+    let suffix = match summarize_suffix(
         journal.canonical_rollout_path.as_path(),
         journal.stable.position.end_byte_offset,
-        current.end_byte_offset,
+        current_end,
         journal.stable.position.end_ordinal_exclusive,
-        current.end_ordinal_exclusive,
         pending.history_mode,
-    )?;
-    io.add_suffix_bytes(suffix.bytes_read);
+    ) {
+        Ok(suffix) => suffix,
+        Err(err) => {
+            rollback_pending_suffix(store, journal, pending.history_mode, &mut io)?;
+            return pending_rollback_result(context, io, err.to_string());
+        }
+    };
+    io.add_suffix(suffix.bytes_read, suffix.item_count);
+    let evidence_error = match &pending.evidence {
+        PendingAppendEvidence::ExactItems { item_count, .. }
+            if suffix.item_count != *item_count =>
+        {
+            Some(format!(
+                "pending append wrote {} items; expected {item_count}",
+                suffix.item_count
+            ))
+        }
+        PendingAppendEvidence::ExactItems { items_sha256, .. }
+            if suffix.items_sha256 != *items_sha256 =>
+        {
+            Some("pending append items do not match the canonical write intent".to_string())
+        }
+        PendingAppendEvidence::Sync
+            if suffix.item_count != 0 && matches!(context, PendingRecoveryContext::Continue) =>
+        {
+            Some("interrupted sync left an unverified durable suffix".to_string())
+        }
+        PendingAppendEvidence::ExactItems { .. } | PendingAppendEvidence::Sync => None,
+    };
+    if let Some(reason) = evidence_error {
+        rollback_pending_suffix(store, journal, pending.history_mode, &mut io)?;
+        return pending_rollback_result(context, io, reason);
+    }
     let verified_current = source_position(
         journal.canonical_rollout_path.as_path(),
         pending.history_mode,
     )?;
     io.add_source_bytes(verified_current.source_bytes);
-    if !positions_equal(&current, &verified_current.position) {
+    if verified_current.position.end_byte_offset != current_end
+        || verified_current.position.end_ordinal_exclusive != suffix.end_ordinal_exclusive
+    {
         return Err(ThreadStoreError::Conflict {
             message: "rollout changed while its pending suffix was inspected".to_string(),
         });
     }
-    if let Some(expected_item_count) = pending.expected_item_count
-        && suffix.item_count != expected_item_count
-    {
-        return Err(invalid(format!(
-            "pending append wrote {} items; expected {}",
-            suffix.item_count, expected_item_count
-        )));
-    }
     let chain_sha256 = advance_chain(journal.stable.chain_sha256.as_str(), suffix.sha256.as_str());
-    journal
-        .stable
-        .ancestry
-        .push(MaterializedResumeAppendGenerationLink {
-            generation: pending.generation,
-            suffix_sha256: suffix.sha256,
-        });
-    let ancestry_base_generation = journal.stable.ancestry_base_generation;
-    let ancestry_base_chain_sha256 = journal.stable.ancestry_base_chain_sha256.clone();
-    let ancestry = std::mem::take(&mut journal.stable.ancestry);
+    for anchor in &mut journal.checkpoint_anchors {
+        anchor.descendant_generation = pending.generation;
+        anchor.descendant_chain_sha256 = advance_chain(
+            anchor.descendant_chain_sha256.as_str(),
+            suffix.sha256.as_str(),
+        );
+    }
     journal.stable = StableGeneration {
         generation: pending.generation,
         chain_sha256,
-        ancestry_base_generation,
-        ancestry_base_chain_sha256,
-        ancestry,
-        position: current,
+        position: verified_current.position,
     };
     journal.pending = None;
     write_journal(store, journal)?;
     Ok(io)
+}
+
+fn rollback_pending_suffix(
+    store: &LocalThreadStore,
+    journal: &mut AppendGenerationJournal,
+    history_mode: ThreadHistoryMode,
+    io: &mut AppendGenerationIo,
+) -> ThreadStoreResult<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(journal.canonical_rollout_path.as_path())
+        .map_err(source_error)?;
+    file.set_len(journal.stable.position.end_byte_offset)
+        .map_err(source_error)?;
+    file.sync_all().map_err(source_error)?;
+    let recovered = source_position(journal.canonical_rollout_path.as_path(), history_mode)?;
+    io.add_source_bytes(recovered.source_bytes);
+    if recovered.position.end_byte_offset != journal.stable.position.end_byte_offset
+        || recovered.position.end_ordinal_exclusive != journal.stable.position.end_ordinal_exclusive
+        || recovered.position.file_identity != journal.stable.position.file_identity
+        || recovered.position.prefix_head_sha256 != journal.stable.position.prefix_head_sha256
+        || recovered.position.prefix_middle_sha256 != journal.stable.position.prefix_middle_sha256
+        || recovered.position.prefix_tail_sha256 != journal.stable.position.prefix_tail_sha256
+    {
+        return Err(invalid(
+            "failed to restore the exact stable prefix after a torn append",
+        ));
+    }
+    journal.stable.position = recovered.position;
+    journal.pending = None;
+    write_journal(store, journal)
+}
+
+fn pending_rollback_result(
+    context: PendingRecoveryContext,
+    io: AppendGenerationIo,
+    reason: String,
+) -> ThreadStoreResult<AppendGenerationIo> {
+    tracing::warn!(reason, "rolled back an incomplete canonical rollout append");
+    match context {
+        PendingRecoveryContext::Continue => Ok(io),
+        PendingRecoveryContext::FinishCurrentAppend => Err(ThreadStoreError::Internal {
+            message: format!("canonical rollout append was rolled back: {reason}"),
+        }),
+    }
 }
 
 fn validate_journal_identity(
@@ -438,6 +592,7 @@ fn validate_current_position(
     Ok(AppendGenerationIo {
         source_bytes: current.source_bytes,
         suffix_bytes: 0,
+        suffix_items: 0,
     })
 }
 
@@ -455,7 +610,7 @@ fn source_position(
     history_mode: ThreadHistoryMode,
 ) -> ThreadStoreResult<SourceInspection> {
     let before = std::fs::metadata(path).map_err(source_error)?;
-    let (before_file_identity, _) = platform_file_generation(&before)?;
+    let before_generation = platform_file_generation(&before)?;
     let end_byte_offset = before.len();
     let (end_ordinal_exclusive, terminal_bytes) =
         terminal_ordinal_exclusive(path, end_byte_offset, history_mode)?;
@@ -465,10 +620,10 @@ fn source_position(
     let tail_start = end_byte_offset.saturating_sub(FENCE_SAMPLE_BYTES as u64);
     let (prefix_tail_sha256, tail_bytes) = hash_sample(path, tail_start, end_byte_offset)?;
     let after = std::fs::metadata(path).map_err(source_error)?;
-    let (after_file_identity, _) = platform_file_generation(&after)?;
+    let after_generation = platform_file_generation(&after)?;
     if before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
-        || before_file_identity != after_file_identity
+        || before_generation != after_generation
     {
         return Err(ThreadStoreError::Conflict {
             message: "rollout changed while its append generation was inspected".to_string(),
@@ -502,7 +657,8 @@ fn validate_stored_prefix(
     if before.len() < stored.end_byte_offset {
         return Err(invalid("pending append truncated the stored source prefix"));
     }
-    let (file_identity, _) = platform_file_generation(&before)?;
+    let before_generation = platform_file_generation(&before)?;
+    let file_identity = before_generation.0.as_str();
     if file_identity != stored.file_identity {
         return Err(invalid(
             "pending append replaced the stored source file identity",
@@ -525,10 +681,10 @@ fn validate_stored_prefix(
     let (end_ordinal_exclusive, terminal_bytes) =
         terminal_ordinal_exclusive(path, stored.end_byte_offset, history_mode)?;
     let after = std::fs::metadata(path).map_err(source_error)?;
-    let (after_file_identity, _) = platform_file_generation(&after)?;
+    let after_generation = platform_file_generation(&after)?;
     if before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
-        || file_identity != after_file_identity
+        || before_generation != after_generation
     {
         return Err(ThreadStoreError::Conflict {
             message: "rollout changed while its pending prefix was inspected".to_string(),
@@ -591,7 +747,9 @@ fn middle_sample_start(end_byte_offset: u64) -> u64 {
 struct SuffixSummary {
     item_count: u64,
     sha256: String,
+    items_sha256: String,
     bytes_read: u64,
+    end_ordinal_exclusive: Option<u64>,
 }
 
 fn summarize_suffix(
@@ -599,7 +757,6 @@ fn summarize_suffix(
     start: u64,
     end: u64,
     start_ordinal_exclusive: Option<u64>,
-    end_ordinal_exclusive: Option<u64>,
     history_mode: ThreadHistoryMode,
 ) -> ThreadStoreResult<SuffixSummary> {
     let mut file = File::open(path).map_err(source_error)?;
@@ -608,6 +765,7 @@ fn summarize_suffix(
     let mut item_count = 0_u64;
     let mut next_ordinal = start_ordinal_exclusive;
     let mut hasher = Sha256::new();
+    let mut items_hasher = Sha256::new();
     let mut bytes_read = 0_u64;
     loop {
         let mut line = Vec::new();
@@ -627,6 +785,7 @@ fn summarize_suffix(
             .map_err(|err| invalid(format!("pending append is corrupt: {err}")))?;
         let rollout_line = codex_rollout::decode_rollout_line(value)
             .map_err(|err| invalid(format!("pending append is invalid: {err}")))?;
+        hash_item(&mut items_hasher, &rollout_line.item)?;
         if history_mode == ThreadHistoryMode::Paginated {
             let expected =
                 next_ordinal.ok_or_else(|| invalid("missing paginated append ordinal"))?;
@@ -646,14 +805,30 @@ fn summarize_suffix(
         hasher.update(line);
         item_count = item_count.saturating_add(1);
     }
-    if next_ordinal != end_ordinal_exclusive {
-        return Err(invalid("pending append terminal ordinal mismatch"));
-    }
     Ok(SuffixSummary {
         item_count,
         sha256: format!("{:x}", hasher.finalize()),
+        items_sha256: format!("{:x}", items_hasher.finalize()),
         bytes_read,
+        end_ordinal_exclusive: next_ordinal,
     })
+}
+
+fn hash_items(items: &[RolloutItem]) -> ThreadStoreResult<String> {
+    let mut hasher = Sha256::new();
+    for item in items {
+        hash_item(&mut hasher, item)?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_item(hasher: &mut Sha256, item: &RolloutItem) -> ThreadStoreResult<()> {
+    let bytes = serde_json::to_vec(item).map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to fingerprint canonical rollout append items: {err}"),
+    })?;
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
 }
 
 fn load_journal(
@@ -711,14 +886,13 @@ pub(super) fn journal_path(store: &LocalThreadStore, rollout_id: ThreadId) -> Pa
 
 fn materialized_generation(
     journal: &AppendGenerationJournal,
+    checkpoint_anchor_id: Option<String>,
 ) -> MaterializedResumeAppendGeneration {
     MaterializedResumeAppendGeneration {
         generation_id: journal.generation_id.clone(),
         generation: journal.stable.generation,
         chain_sha256: journal.stable.chain_sha256.clone(),
-        ancestry_base_generation: journal.stable.ancestry_base_generation,
-        ancestry_base_chain_sha256: journal.stable.ancestry_base_chain_sha256.clone(),
-        ancestry: journal.stable.ancestry.clone(),
+        checkpoint_anchor_id,
     }
 }
 
@@ -783,7 +957,9 @@ fn modified_unix_nanos(modified: SystemTime) -> ThreadStoreResult<u64> {
 }
 
 #[cfg(unix)]
-fn platform_file_generation(metadata: &std::fs::Metadata) -> ThreadStoreResult<(String, String)> {
+pub(super) fn platform_file_generation(
+    metadata: &std::fs::Metadata,
+) -> ThreadStoreResult<PlatformFileGeneration> {
     use std::os::unix::fs::MetadataExt;
     Ok((
         format!("{}:{}", metadata.dev(), metadata.ino()),
@@ -791,15 +967,10 @@ fn platform_file_generation(metadata: &std::fs::Metadata) -> ThreadStoreResult<(
     ))
 }
 
-#[cfg(windows)]
-fn platform_file_generation(_metadata: &std::fs::Metadata) -> ThreadStoreResult<(String, String)> {
-    Err(invalid(
-        "codex_resume_state_needs_platform_integrity: stable Rust does not expose the Windows file identity and change-time pair required by the append-generation fence",
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_file_generation(_metadata: &std::fs::Metadata) -> ThreadStoreResult<(String, String)> {
+#[cfg(not(unix))]
+pub(super) fn platform_file_generation(
+    _metadata: &std::fs::Metadata,
+) -> ThreadStoreResult<PlatformFileGeneration> {
     Err(invalid(
         "codex_resume_state_needs_platform_integrity: this platform has no supported append-generation OS metadata fence",
     ))

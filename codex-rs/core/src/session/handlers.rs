@@ -315,6 +315,23 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             return;
         }
     };
+    if let Err(err) = live_thread
+        .prepare_materialized_resume_state_rebuild()
+        .await
+    {
+        sess.send_event_raw(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
+                message: format!(
+                    "failed to invalidate derived resume state before rollback: {err}"
+                ),
+                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+            }),
+        })
+        .await;
+        return;
+    }
 
     let rollback_event = ThreadRolledBackEvent { num_turns };
     let rollback_msg = EventMsg::ThreadRolledBack(rollback_event.clone());

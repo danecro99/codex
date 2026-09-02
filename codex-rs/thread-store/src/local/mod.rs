@@ -520,6 +520,16 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { materialized_resume::publish(self, params).await })
     }
 
+    fn prepare_materialized_resume_state_rebuild(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let _writer_guard = self.live_writer_locks.lock(thread_id).await;
+            materialized_resume::remove(self, thread_id)
+        })
+    }
+
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move { paginated_fork::prepare(self, params).await })
     }

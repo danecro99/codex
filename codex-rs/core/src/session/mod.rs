@@ -142,6 +142,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnContextNetworkItem;
@@ -1387,6 +1388,36 @@ impl Session {
                 let turn_context = self.new_default_turn().await;
                 let rollout_items = resumed_history.history;
                 let materialized_resume = resumed_history.materialized_resume;
+                if let Some(materialized_state) = materialized_resume
+                    .as_ref()
+                    .and_then(|resume| resume.state.as_ref())
+                {
+                    let active_model = turn_context.model_info();
+                    let active_truncation_policy: TruncationPolicy =
+                        active_model.truncation_policy.into();
+                    if materialized_state.materialized_model != active_model.slug
+                        || materialized_state.truncation_policy != active_truncation_policy
+                    {
+                        let live_thread = self.services.live_thread.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "codex_resume_state_needs_rebuild: incompatible materialized state has no live persistence handle"
+                            )
+                        })?;
+                        live_thread
+                            .prepare_materialized_resume_state_rebuild()
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "codex_resume_state_needs_rebuild: failed to establish the clean rebuild boundary: {err}"
+                                )
+                            })?;
+                        anyhow::bail!(
+                            "codex_resume_state_needs_rebuild: materialized state was built for model {} with a different truncation contract; retry Resume to rebuild it from the canonical transcript for {}",
+                            materialized_state.materialized_model,
+                            active_model.slug
+                        );
+                    }
+                }
                 let reducer_started = std::time::Instant::now();
                 let applied = self
                     .apply_rollout_reconstruction(
@@ -1625,6 +1656,7 @@ impl Session {
             previous_turn_settings: previous_turn_settings.clone(),
             materialized_state: MaterializedResumeState {
                 version: MATERIALIZED_RESUME_STATE_VERSION,
+                materialized_model: turn_context.model_info().slug.clone(),
                 history,
                 previous_turn_settings: previous_turn_settings.map(|settings| {
                     MaterializedPreviousTurnSettings {
@@ -1729,6 +1761,7 @@ impl Session {
             let window = state.auto_compact_window_snapshot();
             let materialized_state = MaterializedResumeState {
                 version: MATERIALIZED_RESUME_STATE_VERSION,
+                materialized_model: turn_context.model_info().slug.clone(),
                 history,
                 previous_turn_settings: state.previous_turn_settings().map(|settings| {
                     MaterializedPreviousTurnSettings {

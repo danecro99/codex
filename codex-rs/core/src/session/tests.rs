@@ -3816,6 +3816,16 @@ async fn thread_rollback_drops_last_turn_from_history() {
         let mut state = sess.state.lock().await;
         state.set_reference_context_item(Some(tc.to_turn_context_item()));
     }
+    sess.publish_current_materialized_resume_state(AgentStatus::Completed(None))
+        .await
+        .expect("publish pre-rollback checkpoint");
+    let checkpoint_path = sess
+        .get_config()
+        .await
+        .codex_home
+        .join("materialized_resume_state_v4")
+        .join(format!("{}.json", sess.thread_id()));
+    assert!(checkpoint_path.exists());
 
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 1).await;
 
@@ -3830,6 +3840,10 @@ async fn thread_rollback_drops_last_turn_from_history() {
     assert_eq!(expected, raw_history_items(&history));
     assert_eq!(sess.previous_turn_settings().await, None);
     assert!(sess.reference_context_item().await.is_none());
+    assert!(
+        !checkpoint_path.exists(),
+        "rollback must invalidate a checkpoint before its durable marker crosses the fence"
+    );
 
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
         .await
@@ -4941,7 +4955,7 @@ async fn fresh_long_session_materializes_resume_state_at_turn_completion() {
     let config = session.get_config().await;
     let artifact_path = config
         .codex_home
-        .join("materialized_resume_state_v1")
+        .join("materialized_resume_state_v4")
         .join(format!("{}.json", session.thread_id()));
     let artifact: codex_history::MaterializedResume = serde_json::from_slice(
         std::fs::read(artifact_path.as_path())
@@ -4970,6 +4984,74 @@ async fn fresh_long_session_materializes_resume_state_at_turn_completion() {
     assert_eq!(resumed.diagnostics.suffix_items, 0);
     assert!(resumed.diagnostics.source_bytes <= 512 * 1_024);
     assert_eq!(resumed.items.len(), 1);
+}
+
+#[tokio::test]
+async fn incompatible_model_checkpoint_establishes_a_loud_clean_rebuild_boundary() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let rollout_path = attach_thread_persistence(&mut session).await;
+    session
+        .record_conversation_items(&turn_context, &[user_message("persisted user turn")])
+        .await;
+    session
+        .publish_current_materialized_resume_state(AgentStatus::Completed(None))
+        .await
+        .expect("publish model-bound checkpoint");
+    let checkpoint_path = session
+        .get_config()
+        .await
+        .codex_home
+        .join("materialized_resume_state_v4")
+        .join(format!("{}.json", session.thread_id()));
+    let mut loaded = session
+        .services
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadModelContextParams {
+            thread_id: session.thread_id(),
+            include_archived: false,
+            rollout_path: Some(rollout_path.clone()),
+        })
+        .await
+        .expect("load model-bound checkpoint");
+    loaded
+        .materialized_resume
+        .as_mut()
+        .and_then(|resume| resume.state.as_mut())
+        .expect("materialized state")
+        .materialized_model = "incompatible-model".to_string();
+
+    let error = session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: session.thread_id(),
+            history: Arc::new(loaded.items),
+            rollout_path: Some(rollout_path.clone()),
+            materialized_resume: loaded.materialized_resume.map(Box::new),
+        }))
+        .await
+        .expect_err("incompatible model state must require an explicit retry");
+    assert!(
+        error
+            .to_string()
+            .contains("codex_resume_state_needs_rebuild"),
+        "{error:#}"
+    );
+    assert!(!checkpoint_path.exists());
+
+    let rebuild = session
+        .services
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadModelContextParams {
+            thread_id: session.thread_id(),
+            include_archived: false,
+            rollout_path: Some(rollout_path),
+        })
+        .await
+        .expect("next explicit resume can reconstruct the canonical transcript");
+    assert_eq!(
+        rebuild.diagnostics.outcome,
+        codex_thread_store::ResumeCheckpointOutcome::Miss
+    );
+    assert!(rebuild.materialized_resume.is_some());
 }
 
 fn text_block(s: &str) -> serde_json::Value {

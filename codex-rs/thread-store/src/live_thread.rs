@@ -321,6 +321,13 @@ impl LiveThread {
             .await
     }
 
+    /// Establishes an explicit clean-rebuild boundary for this thread's private resume state.
+    pub async fn prepare_materialized_resume_state_rebuild(&self) -> ThreadStoreResult<()> {
+        self.thread_store
+            .prepare_materialized_resume_state_rebuild(self.thread_id)
+            .await
+    }
+
     pub async fn read_thread(
         &self,
         include_archived: bool,

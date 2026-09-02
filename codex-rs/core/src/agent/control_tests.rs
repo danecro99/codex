@@ -2154,10 +2154,10 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
         .expect("parent shutdown should submit");
 }
 
-/// A fork cannot reconstruct exact model state from a legacy compaction that omitted its
-/// replacement history.
+/// A full-history fork uses the canonical legacy-compaction reducer when replacement history was
+/// not persisted.
 #[tokio::test]
-async fn spawn_agent_full_fork_rejects_legacy_compaction_without_replacement_history() {
+async fn spawn_agent_full_fork_rebuilds_legacy_compaction_without_replacement_history() {
     let managed_policy = "Managed policy for every agent.";
     let stale_managed_fragment =
         "<managed_developer_instructions>\nOld managed policy.\n</managed_developer_instructions>";
@@ -2216,7 +2216,8 @@ async fn spawn_agent_full_fork_rejects_legacy_compaction_without_replacement_his
             internal_chat_message_metadata_passthrough: None,
         };
 
-        // A live parent baseline cannot repair the missing durable model-state boundary.
+        // The live parent baseline is deliberately irrelevant; the fork reconstructs from the
+        // canonical rollout using the same reducer as Resume.
         parent_thread
             .session
             .replace_history(
@@ -2276,7 +2277,7 @@ async fn spawn_agent_full_fork_rejects_legacy_compaction_without_replacement_his
             .await
             .expect("parent rollout should flush");
 
-        let error = harness
+        let child_thread_id = harness
             .control
             .spawn_agent_with_metadata(
                 child_config,
@@ -2295,14 +2296,32 @@ async fn spawn_agent_full_fork_rejects_legacy_compaction_without_replacement_his
                 },
             )
             .await
-            .expect_err("legacy compaction without replacement history must be loud");
+            .expect("legacy compaction should rebuild through the canonical full replay reducer")
+            .thread_id;
+        let child_thread = harness
+            .manager
+            .get_thread(child_thread_id)
+            .await
+            .expect("child thread should be registered");
+        let history = child_thread.session.clone_history().await;
         assert!(
-            error
-                .to_string()
-                .contains("codex_resume_state_needs_compaction"),
-            "{case}: unexpected error: {error}"
+            history_contains_text(history.raw_items(), "legacy compacted summary"),
+            "{case}: rebuilt history should retain the legacy summary"
+        );
+        assert!(
+            !history_contains_text(history.raw_items(), stale_managed_fragment),
+            "{case}: rebuilt history should not retain stale managed instructions"
+        );
+        assert!(
+            history_contains_text(history.raw_items(), "parent task before legacy compaction"),
+            "{case}: rebuilt history should retain pre-compaction user input"
         );
 
+        let _ = harness
+            .control
+            .shutdown_live_agent(child_thread_id)
+            .await
+            .expect("child shutdown should submit");
         let _ = parent_thread
             .submit(Op::Shutdown {})
             .await

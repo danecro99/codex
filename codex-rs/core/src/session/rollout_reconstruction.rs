@@ -229,10 +229,21 @@ impl ResumeReplayReducer {
                 if let Some(replacement_history) = &compacted.replacement_history {
                     self.history.replace_annotated(replacement_history.clone());
                     self.has_prior_user_turns = true;
-                } else {
+                } else if self.checkpoint_suffix {
                     anyhow::bail!(
-                        "{NEEDS_COMPACTION}: rollout contains a legacy compaction without replacement history"
+                        "{NEEDS_COMPACTION}: suffix contains a legacy compaction without replacement history"
                     );
+                } else {
+                    let user_messages = crate::compact::collect_annotated_user_messages(
+                        self.history.annotated_items(),
+                    );
+                    let rebuilt = crate::compact::build_compacted_history(
+                        Vec::new(),
+                        &user_messages,
+                        &compacted.message,
+                    );
+                    self.history.replace_annotated(rebuilt);
+                    self.has_prior_user_turns = true;
                 }
                 if let Some(active_segment) = self.active_segment.as_mut() {
                     active_segment.reference_context_item = TurnReferenceContextItem::Cleared;
@@ -351,6 +362,8 @@ impl ResumeReplayReducer {
     }
 
     fn apply_event(&mut self, event: &EventMsg) {
+        self.mcp_resource_origins =
+            codex_mcp::reduce_resource_origin_checkpoint(self.mcp_resource_origins.as_ref(), event);
         if let EventMsg::TokenCount(event) = event
             && let Some(info) = &event.info
         {

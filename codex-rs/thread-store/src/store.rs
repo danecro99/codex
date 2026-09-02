@@ -182,6 +182,19 @@ pub trait ThreadStore: Any + Send + Sync {
         })
     }
 
+    /// Removes only private derived resume state so the next explicit resume can rebuild it from
+    /// the canonical transcript. Corrupt artifacts must not use this operation as a cache miss.
+    fn prepare_materialized_resume_state_rebuild(
+        &self,
+        _thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "prepare_materialized_resume_state_rebuild",
+            })
+        })
+    }
+
     /// Freezes source history and model context used to initialize a referenced fork.
     ///
     /// Stores without reference-backed fork support can retain this default implementation.

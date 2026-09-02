@@ -235,6 +235,22 @@ impl ResourceOrigins {
     }
 }
 
+/// Applies one durable protocol event to a bounded MCP resource-origin checkpoint.
+///
+/// Resume reconstruction uses this pure boundary so full replay and checkpoint-suffix replay
+/// follow the same provenance reducer as a live [`crate::McpRuntime`].
+pub fn reduce_resource_origin_checkpoint(
+    checkpoint: Option<&McpResourceOriginCheckpoint>,
+    event: &EventMsg,
+) -> Option<McpResourceOriginCheckpoint> {
+    let mut origins = ResourceOrigins::default();
+    if let Some(checkpoint) = checkpoint {
+        origins.restore_checkpoint(checkpoint);
+    }
+    origins.observe(event);
+    origins.checkpoint()
+}
+
 impl ResourceOrigin {
     fn byte_len(&self) -> usize {
         self.call_id.len()

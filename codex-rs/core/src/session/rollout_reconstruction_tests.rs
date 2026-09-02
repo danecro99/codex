@@ -14,11 +14,15 @@ use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::items::McpToolCallItem;
+use codex_protocol::items::McpToolCallStatus;
+use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::McpResourceOrigin;
 use codex_protocol::mcp::McpResourceOriginCheckpoint;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
@@ -1267,7 +1271,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
 }
 
 #[tokio::test]
-async fn reconstruct_history_rejects_legacy_compaction_without_replacement_history() {
+async fn full_replay_rebuilds_legacy_compaction_without_replacement_history() {
     let (session, turn_context) = make_session_and_context().await;
     let thread_id = ThreadId::default();
     let initial_window_id = Uuid::now_v7();
@@ -1283,6 +1287,7 @@ async fn reconstruct_history_rejects_legacy_compaction_without_replacement_histo
             },
             git: None,
         }),
+        RolloutItem::ResponseItem(user_message("legacy user").into()),
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
@@ -1294,17 +1299,14 @@ async fn reconstruct_history_rejects_legacy_compaction_without_replacement_histo
         }),
     ];
 
-    let error = session
+    let reconstructed = session
         .reconstruct_resume_state(&turn_context, &rollout_items, None)
         .await
-        .expect_err("legacy compaction must be loud");
+        .expect("full replay must preserve legacy compaction semantics");
 
-    assert!(
-        error
-            .to_string()
-            .contains("codex_resume_state_needs_compaction"),
-        "{error}"
-    );
+    assert_eq!(reconstructed.window_number, 1);
+    assert!(reconstructed.has_prior_user_turns);
+    assert!(!reconstructed.history.is_empty());
 }
 
 #[tokio::test]
@@ -2136,6 +2138,29 @@ async fn checkpoint_suffix_replay_is_equivalent_and_rollback_crossing_fence_is_l
             },
         )),
         RolloutItem::ResponseItem(user_message("suffix").into()),
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id,
+            turn_id: "turn-3".to_string(),
+            item: TurnItem::McpToolCall(McpToolCallItem {
+                id: "suffix-widget-call".to_string(),
+                server: "codex_apps".to_string(),
+                tool: "_product_search".to_string(),
+                arguments: json!({}),
+                connector_id: Some("shopping".to_string()),
+                mcp_app_resource_uri: Some("ui://shopping/suffix-widget".to_string()),
+                link_id: None,
+                app_name: None,
+                action_name: None,
+                plugin_id: None,
+                read_only_hint: None,
+                status: McpToolCallStatus::Completed,
+                result: None,
+                error: None,
+                duration: None,
+            }),
+            started_at_ms: None,
+            completed_at_ms: 0,
+        })),
         RolloutItem::TurnContext(suffix_context),
         RolloutItem::WorldState(WorldStateItem::patch(object!({
             "repository": {"head": "suffix"}
@@ -2175,6 +2200,7 @@ async fn checkpoint_suffix_replay_is_equivalent_and_rollback_crossing_fence_is_l
         .expect("reconstruct checkpoint prefix");
     let materialized_state = MaterializedResumeState {
         version: MATERIALIZED_RESUME_STATE_VERSION,
+        materialized_model: "test-model".to_string(),
         history: Arc::clone(&prefix_state.history),
         previous_turn_settings: prefix_state
             .previous_turn_settings
@@ -2221,9 +2247,25 @@ async fn checkpoint_suffix_replay_is_equivalent_and_rollback_crossing_fence_is_l
 
     assert_eq!(checkpoint_suffix, full);
     assert_eq!(checkpoint_suffix.window_number, 3);
+    let mut expected_mcp_resource_origins = mcp_resource_origins;
+    expected_mcp_resource_origins
+        .origins
+        .push(McpResourceOrigin {
+            call_id: "suffix-widget-call".to_string(),
+            turn_id: Some("turn-3".to_string()),
+            tool: "_product_search".to_string(),
+            connector_id: "shopping".to_string(),
+            link_id: None,
+            uri: "ui://shopping/suffix-widget".to_string(),
+            ambiguous_account: false,
+        });
+    expected_mcp_resource_origins
+        .turns
+        .extend(["turn-3".to_string(), "turn-4".to_string()]);
+    expected_mcp_resource_origins.current_turn_id = Some("turn-4".to_string());
     assert_eq!(
         checkpoint_suffix.mcp_resource_origins,
-        Some(mcp_resource_origins)
+        Some(expected_mcp_resource_origins)
     );
     assert_eq!(checkpoint_suffix.token_info, Some(token_info));
     assert_eq!(
@@ -2284,6 +2326,7 @@ async fn materialized_prefill_is_consumed_for_body_after_prefix_scope() {
     let window_id = Uuid::now_v7();
     let state = MaterializedResumeState {
         version: MATERIALIZED_RESUME_STATE_VERSION,
+        materialized_model: "test-model".to_string(),
         history: Arc::new(Vec::new()),
         previous_turn_settings: None,
         reference_context_item: None,

@@ -221,8 +221,8 @@ pub struct ResumedHistory {
     pub materialized_resume: Option<Box<MaterializedResume>>,
 }
 
-/// Current private on-disk schema for [`MaterializedResumeState`].
-pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 3;
+/// Current private on-disk schema for [`MaterializedResumeState`] and its source fence.
+pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 4;
 
 /// Exact post-reconstruction state required to hydrate a resumed session.
 ///
@@ -230,6 +230,8 @@ pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 3;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MaterializedResumeState {
     pub version: u32,
+    /// Model contract used to apply truncation and token-prefix semantics while materializing.
+    pub materialized_model: String,
     pub history: Arc<Vec<ResponseItemEnvelope>>,
     pub previous_turn_settings: Option<MaterializedPreviousTurnSettings>,
     pub reference_context_item: Option<TurnContextItem>,
@@ -302,16 +304,8 @@ pub struct MaterializedResumeAppendGeneration {
     pub generation_id: String,
     pub generation: u64,
     pub chain_sha256: String,
-    pub ancestry_base_generation: u64,
-    pub ancestry_base_chain_sha256: String,
-    pub ancestry: Vec<MaterializedResumeAppendGenerationLink>,
-}
-
-/// One canonical append link in a bounded checkpoint ancestry proof.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaterializedResumeAppendGenerationLink {
-    pub generation: u64,
-    pub suffix_sha256: String,
+    /// Journal-owned anchor proving that this exact generation remains an ancestor of the source.
+    pub checkpoint_anchor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -364,6 +358,16 @@ impl InitialHistory {
     pub fn get_event_msgs(&self) -> Option<Vec<EventMsg>> {
         match self {
             Self::New | Self::Cleared => None,
+            Self::Resumed(resumed)
+                if resumed
+                    .materialized_resume
+                    .as_ref()
+                    .is_some_and(|resume| resume.state.is_some()) =>
+            {
+                // A checkpoint hit intentionally loads only the model-state suffix. Returning its
+                // events here would falsely advertise a complete canonical initial history.
+                None
+            }
             Self::Resumed(resumed) => Some(
                 resumed
                     .history
