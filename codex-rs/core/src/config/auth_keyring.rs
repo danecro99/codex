@@ -8,6 +8,7 @@ use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
 use codex_features::Features;
 use codex_login::AuthConfig;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::Path;
 
 impl Config {
@@ -20,6 +21,7 @@ impl Config {
     pub fn auth_config(&self) -> AuthConfig {
         AuthConfig {
             codex_home: self.codex_home.to_path_buf(),
+            auth_home: self.auth_home.to_path_buf(),
             auth_credentials_store_mode: self.cli_auth_credentials_store_mode,
             keyring_backend_kind: self.auth_keyring_backend_kind(),
             forced_login_method: self.forced_login_method,
@@ -40,6 +42,17 @@ pub fn bootstrap_auth_config(
     codex_home: &Path,
     bootstrap_config: &ConfigTomlLoadResult,
 ) -> std::io::Result<AuthConfig> {
+    let codex_home = AbsolutePathBuf::from_absolute_path(codex_home)?;
+    let auth_home = codex_utils_home_dir::find_codex_auth_home(&codex_home)?;
+    bootstrap_auth_config_with_home(&codex_home, &auth_home, bootstrap_config)
+}
+
+/// Builds bootstrap authentication settings from explicitly resolved state and auth homes.
+pub fn bootstrap_auth_config_with_home(
+    codex_home: &AbsolutePathBuf,
+    auth_home: &AbsolutePathBuf,
+    bootstrap_config: &ConfigTomlLoadResult,
+) -> std::io::Result<AuthConfig> {
     let config = &bootstrap_config.config_toml;
     let requirements = bootstrap_config.config_layer_stack.requirements();
     // Empty legacy workspace settings mean unrestricted, not an empty allowlist.
@@ -57,6 +70,7 @@ pub fn bootstrap_auth_config(
         .filter(|workspaces| !workspaces.is_empty());
     let mut auth_config = AuthConfig {
         codex_home: codex_home.to_path_buf(),
+        auth_home: auth_home.to_path_buf(),
         auth_credentials_store_mode: config.cli_auth_credentials_store.unwrap_or_default(),
         keyring_backend_kind: resolve_bootstrap_auth_keyring_backend_kind(bootstrap_config)?,
         forced_login_method: config.forced_login_method,

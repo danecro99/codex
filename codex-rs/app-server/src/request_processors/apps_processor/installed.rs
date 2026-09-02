@@ -50,7 +50,11 @@ impl AppsRequestProcessor {
             let config = self
                 .load_apps_config(params.thread_id.as_deref())
                 .await?;
-            let auth = self.auth_manager.auth().await;
+            let auth = self
+                .auth_manager
+                .try_auth()
+                .await
+                .map_err(|err| internal_error(format!("failed to load auth: {err}")))?;
             let runtime_enabled = config
                 .features
                 .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend));

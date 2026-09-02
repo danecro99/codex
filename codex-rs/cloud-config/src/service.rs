@@ -64,6 +64,14 @@ fn optional_bundle(bundle: CloudConfigBundle) -> Option<CloudConfigBundle> {
     }
 }
 
+fn auth_load_error(error: RefreshTokenError) -> CloudConfigBundleLoadError {
+    CloudConfigBundleLoadError::new(
+        CloudConfigBundleLoadErrorCode::Auth,
+        /*status_code*/ None,
+        format!("failed to load auth: {error}"),
+    )
+}
+
 enum CachedBundleLookup {
     Hit(Option<CloudConfigBundle>),
     Miss,
@@ -175,7 +183,12 @@ where
     async fn load_startup_bundle(
         &self,
     ) -> Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self
+            .auth_manager
+            .try_auth()
+            .await
+            .map_err(auth_load_error)?
+        else {
             return Ok(None);
         };
         if !cloud_config_eligible_auth(&auth) {
@@ -384,7 +397,12 @@ where
             );
             match auth_recovery.next().await {
                 Ok(_) => {
-                    let Some(refreshed_auth) = self.auth_manager.auth().await else {
+                    let Some(refreshed_auth) = self
+                        .auth_manager
+                        .try_auth()
+                        .await
+                        .map_err(auth_load_error)?
+                    else {
                         tracing::error!(
                             "Auth recovery succeeded but no auth is available for cloud config bundle"
                         );
@@ -473,8 +491,13 @@ where
             }
             sleep(refresh_interval).await;
             match timeout(self.timeout, self.refresh_cache_once()).await {
-                Ok(true) => {}
-                Ok(false) => break,
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => break,
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "Failed to load auth while refreshing cloud config");
+                    emit_load_metric("refresh", "error", /*bundle*/ None);
+                    break;
+                }
                 Err(_) => {
                     tracing::error!(
                         "Timed out refreshing cloud config bundle cache from remote; keeping existing cache"
@@ -485,12 +508,17 @@ where
         }
     }
 
-    async fn refresh_cache_once(&self) -> bool {
-        let Some(auth) = self.auth_manager.auth().await else {
-            return false;
+    async fn refresh_cache_once(&self) -> Result<bool, CloudConfigBundleLoadError> {
+        let Some(auth) = self
+            .auth_manager
+            .try_auth()
+            .await
+            .map_err(auth_load_error)?
+        else {
+            return Ok(false);
         };
         if !cloud_config_eligible_auth(&auth) {
-            return false;
+            return Ok(false);
         }
 
         match self
@@ -518,7 +546,7 @@ where
                 }
             }
         }
-        true
+        Ok(true)
     }
 }
 

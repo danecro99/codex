@@ -109,3 +109,7 @@ fn cloud_config_bundle_loader_from_auth_config(
         auth_config.auth_route_config.http_client_factory().clone(),
     )
 }
+
+#[cfg(test)]
+#[path = "bundle_loader_tests.rs"]
+mod tests;
