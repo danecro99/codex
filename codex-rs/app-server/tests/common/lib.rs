@@ -22,6 +22,7 @@ pub use config::MockResponsesConfig;
 pub use config::write_mock_responses_config_toml;
 pub use config::write_mock_responses_config_toml_with_chatgpt_base_url;
 pub use core_test_support::PathBufExt;
+pub use core_test_support::discard_derived_resume_state;
 pub use core_test_support::format_with_current_shell;
 pub use core_test_support::format_with_current_shell_display;
 pub use core_test_support::format_with_current_shell_display_non_login;

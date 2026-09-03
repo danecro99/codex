@@ -1055,6 +1055,7 @@ async fn cold_resume_refreshes_legacy_collaboration_snapshot_once(
         "initial rollout should record collaboration mode"
     );
     std::fs::write(&rollout_path, format!("{legacy_rollout}\n"))?;
+    core_test_support::discard_derived_resume_state(&rollout_path);
 
     let resumed = builder_with_instructions(CURRENT)
         .resume(&server, home, rollout_path)

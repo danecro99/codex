@@ -116,6 +116,7 @@ fn remove_agents_md_world_state_section(rollout_path: &Path) -> Result<()> {
         "rollout did not contain a persisted AGENTS.md WorldState section"
     );
     std::fs::write(rollout_path, format!("{retained}\n"))?;
+    core_test_support::discard_derived_resume_state(rollout_path);
     Ok(())
 }
 

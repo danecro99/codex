@@ -354,6 +354,7 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
         .collect::<serde_json::Result<Vec<_>>>()?
         .join("\n");
     fs::write(&rollout_path, format!("{rollout}\n"))?;
+    core_test_support::discard_derived_resume_state(&rollout_path);
 
     let mut resume_builder = test_codex().with_config(|config| {
         config
@@ -468,6 +469,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join("\n");
             fs::write(&rollout_path, format!("{jsonl}\n")).expect("should write rollout file");
+            core_test_support::discard_derived_resume_state(&rollout_path);
         })
         .with_config(|config| {
             config

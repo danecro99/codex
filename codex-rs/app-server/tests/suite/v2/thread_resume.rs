@@ -5374,6 +5374,9 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
     } = start_materialized_thread_and_restart(codex_home.path(), "materialize").await?;
     let expected_updated_at_rfc3339 = "2025-01-07T00:00:00Z";
     set_rollout_mtime(rollout_file_path.as_path(), expected_updated_at_rfc3339)?;
+    // Rewriting the rollout's durable timestamp is an out-of-band mutation, so the derived resume
+    // state recorded for the previous bytes no longer describes this file.
+    app_test_support::discard_derived_resume_state(rollout_file_path.as_path());
     let before_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
 
     let resume_id = mcp

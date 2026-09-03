@@ -10,7 +10,6 @@ use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
-use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
@@ -2296,14 +2295,11 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
         .expect("parent shutdown should submit");
 }
 
-/// A legacy compaction clears the child's baseline, so its first turn must
-/// rebuild configured developer instructions exactly once.
+/// A full-history fork uses the canonical legacy-compaction reducer when replacement history was
+/// not persisted.
 #[tokio::test]
-async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_once() {
+async fn spawn_agent_full_fork_rebuilds_legacy_compaction_without_replacement_history() {
     let managed_policy = "Managed policy for every agent.";
-    let current_managed_fragment = format!(
-        "<managed_developer_instructions>\n{managed_policy}\n</managed_developer_instructions>"
-    );
     let stale_managed_fragment =
         "<managed_developer_instructions>\nOld managed policy.\n</managed_developer_instructions>";
     for (case, parent_developer_instructions) in [
@@ -2361,8 +2357,8 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
             internal_chat_message_metadata_passthrough: None,
         };
 
-        // A live parent can reestablish its baseline after resuming a rollout
-        // whose older compaction record cannot restore that baseline to a child.
+        // The live parent baseline is deliberately irrelevant; the fork reconstructs from the
+        // canonical rollout using the same reducer as Resume.
         parent_thread
             .session
             .replace_history(
@@ -2444,44 +2440,25 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                 },
             )
             .await
-            .expect("forked spawn should preserve legacy compacted history")
+            .expect("legacy compaction should rebuild through the canonical full replay reducer")
             .thread_id;
         let child_thread = harness
             .manager
             .get_thread(child_thread_id)
             .await
             .expect("child thread should be registered");
-        while child_thread
-            .session
-            .reference_context_item()
-            .await
-            .is_none()
-        {
-            tokio::task::yield_now().await;
-        }
         let history = child_thread.session.clone_history().await;
-        let mut instruction_count = 0;
-        let mut managed_instructions = Vec::new();
-        for item in history.raw_items() {
-            let ResponseItem::Message { role, content, .. } = item else {
-                continue;
-            };
-            if role != "developer" {
-                continue;
-            }
-            for content_item in content {
-                if let ContentItem::InputText { text } = content_item {
-                    instruction_count += usize::from(text == "Child developer instructions.");
-                    if ManagedDeveloperInstructions::matches_text(text) {
-                        managed_instructions.push(text.as_str());
-                    }
-                }
-            }
-        }
-        assert_eq!(
-            (instruction_count, managed_instructions),
-            (1, vec![current_managed_fragment.as_str()]),
-            "{case}: canonical context reconstruction must keep only the current child and managed developer instructions"
+        assert!(
+            history_contains_text(history.raw_items(), "legacy compacted summary"),
+            "{case}: rebuilt history should retain the legacy summary"
+        );
+        assert!(
+            !history_contains_text(history.raw_items(), stale_managed_fragment),
+            "{case}: rebuilt history should not retain stale managed instructions"
+        );
+        assert!(
+            history_contains_text(history.raw_items(), "parent task before legacy compaction"),
+            "{case}: rebuilt history should retain pre-compaction user input"
         );
 
         let _ = harness

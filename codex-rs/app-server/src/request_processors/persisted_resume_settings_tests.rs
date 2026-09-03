@@ -1,5 +1,6 @@
 use super::PersistedResumeSettings;
 use super::latest_persisted_resume_settings;
+use super::latest_persisted_resume_settings_with_checkpoint;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -157,6 +158,42 @@ fn older_reviewer_is_used_when_latest_turn_context_omits_it() {
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
             active_permission_profile: None,
+        })
+    );
+}
+
+#[test]
+fn checkpoint_context_supplies_settings_until_the_suffix_overrides_it() {
+    let RolloutItem::TurnContext(checkpoint_context) = turn_context_item(
+        "checkpoint-turn",
+        AskForApproval::UnlessTrusted,
+        Some(ApprovalsReviewer::User),
+        Some(ActivePermissionProfile::read_only()),
+    ) else {
+        unreachable!("turn_context_item must return a turn context");
+    };
+
+    assert_eq!(
+        latest_persisted_resume_settings_with_checkpoint(&[], Some(&checkpoint_context)),
+        Some(PersistedResumeSettings {
+            approval_policy: AskForApproval::UnlessTrusted,
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            active_permission_profile: Some(ActivePermissionProfile::read_only()),
+        })
+    );
+
+    let suffix = vec![turn_context_item(
+        "suffix-turn",
+        AskForApproval::Never,
+        Some(ApprovalsReviewer::AutoReview),
+        Some(ActivePermissionProfile::new("dev")),
+    )];
+    assert_eq!(
+        latest_persisted_resume_settings_with_checkpoint(&suffix, Some(&checkpoint_context)),
+        Some(PersistedResumeSettings {
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+            active_permission_profile: Some(ActivePermissionProfile::new("dev")),
         })
     );
 }

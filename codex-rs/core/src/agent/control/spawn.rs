@@ -129,7 +129,8 @@ async fn load_agent_model_context(
     state: &ThreadManagerState,
     thread_id: ThreadId,
     history_mode: ThreadHistoryMode,
-) -> CodexResult<Option<Vec<RolloutItem>>> {
+    purpose: AgentModelContextPurpose,
+) -> CodexResult<Option<(Vec<RolloutItem>, Option<codex_history::MaterializedResume>)>> {
     match history_mode {
         ThreadHistoryMode::Legacy => Ok(state
             .read_stored_thread(ReadThreadParams {
@@ -139,17 +140,31 @@ async fn load_agent_model_context(
             })
             .await?
             .history
-            .map(|history| history.items)),
-        ThreadHistoryMode::Paginated => Ok(Some(
-            state
-                .load_latest_model_context(LoadThreadHistoryParams {
-                    thread_id,
-                    include_archived: true,
-                })
-                .await?
-                .items,
-        )),
+            .map(|history| (history.items, None))),
+        ThreadHistoryMode::Paginated => {
+            let params = LoadModelContextParams {
+                thread_id,
+                include_archived: true,
+                rollout_path: None,
+            };
+            let model_context = match purpose {
+                AgentModelContextPurpose::Resume => state.load_latest_model_context(params).await?,
+                AgentModelContextPurpose::Fork => {
+                    state.load_latest_model_context_for_replay(params).await?
+                }
+            };
+            Ok(Some((
+                model_context.items,
+                model_context.materialized_resume,
+            )))
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum AgentModelContextPurpose {
+    Resume,
+    Fork,
 }
 
 impl AgentControl {
@@ -348,13 +363,19 @@ impl AgentControl {
         let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
         let stored_source = stored_thread.source.clone();
         let stored_parent_thread_id = stored_thread.parent_thread_id;
-        let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
-            .await?
-            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        let (history, materialized_resume) = load_agent_model_context(
+            &state,
+            thread_id,
+            stored_thread.history_mode,
+            AgentModelContextPurpose::Resume,
+        )
+        .await?
+        .ok_or(CodexErr::ThreadNotFound(thread_id))?;
         let initial_history = InitialHistory::Resumed(ResumedHistory {
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: stored_thread.rollout_path,
+            materialized_resume: materialized_resume.map(Box::new),
         });
         if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
             return Err(CodexErr::ThreadNotFound(thread_id));
@@ -859,14 +880,18 @@ impl AgentControl {
 
         let destination_history_mode = matches!(parent_history_mode, ThreadHistoryMode::Paginated)
             .then_some(ThreadHistoryMode::Paginated);
-        let mut forked_rollout_items =
-            load_agent_model_context(state, parent_thread_id, parent_history_mode)
-                .await?
-                .ok_or_else(|| {
-                    CodexErr::Fatal(format!(
-                        "parent thread history unavailable for fork: {parent_thread_id}"
-                    ))
-                })?;
+        let (mut forked_rollout_items, _) = load_agent_model_context(
+            state,
+            parent_thread_id,
+            parent_history_mode,
+            AgentModelContextPurpose::Fork,
+        )
+        .await?
+        .ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "parent thread history unavailable for fork: {parent_thread_id}"
+            ))
+        })?;
 
         let selected_capability_roots = forked_rollout_items
             .iter()
@@ -1183,13 +1208,19 @@ impl AgentControl {
             .map_err(|err| CodexErr::InvalidRequest(format!("invalid stored agent path: {err}")))?;
         let resumed_agent_nickname = stored_thread.agent_nickname.clone();
         let resumed_agent_role = stored_thread.agent_role.clone();
-        let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
-            .await?
-            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        let (history, materialized_resume) = load_agent_model_context(
+            &state,
+            thread_id,
+            stored_thread.history_mode,
+            AgentModelContextPurpose::Resume,
+        )
+        .await?
+        .ok_or(CodexErr::ThreadNotFound(thread_id))?;
         let initial_history = InitialHistory::Resumed(ResumedHistory {
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: stored_thread.rollout_path,
+            materialized_resume: materialized_resume.map(Box::new),
         });
         let parent_thread_id = stored_thread.parent_thread_id;
         let multi_agent_version = state

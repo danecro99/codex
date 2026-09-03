@@ -372,7 +372,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
     let request_log = mount_second_compact_sequence(&server).await;
 
     // 2. Drive the conversation through compact -> resume -> fork -> compact -> resume.
-    let (_home, config, manager, base) = start_test_conversation(&server, /*model*/ None).await;
+    let (home, config, manager, base) = start_test_conversation(&server, /*model*/ None).await;
 
     user_turn(&base, "hello world").await;
     compact_conversation(&base).await;
@@ -385,6 +385,23 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
 
     shutdown_conversation(&base).await;
     seed_first_checkpoint_harness_metadata(&base_path, "hello world")?;
+    let base_rollout_id = codex_rollout::rollout_id_from_path(base_path.as_path())
+        .context("base rollout path has no rollout id")?;
+    for derived_path in [
+        home.path()
+            .join("materialized_resume_state_v5")
+            .join(format!("{base_rollout_id}.json")),
+        home.path()
+            .join("rollout_append_generation_v5")
+            .join(format!("{base_rollout_id}.json")),
+    ] {
+        std::fs::remove_file(&derived_path).with_context(|| {
+            format!(
+                "fixture rewrite must explicitly clear derived state {}",
+                derived_path.display()
+            )
+        })?;
+    }
     let resumed = resume_conversation(&manager, &config, base_path).await;
     user_turn(&resumed, "AFTER_RESUME").await;
     let resumed_path = fetch_conversation_path(&resumed);

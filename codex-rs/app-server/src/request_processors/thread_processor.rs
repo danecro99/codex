@@ -1,5 +1,6 @@
 use super::persisted_resume_settings::PersistedResumeSettings;
 use super::persisted_resume_settings::latest_persisted_resume_settings;
+use super::persisted_resume_settings::latest_persisted_resume_settings_with_checkpoint;
 use super::thread_enrichment::enrich_loaded_threads;
 use super::thread_fork_goal::inherit_thread_goal_snapshot;
 use super::thread_input::can_accept_direct_input;
@@ -3745,14 +3746,32 @@ impl ThreadRequestProcessor {
         // Copied or referenced history can contain another thread's settings. Only snapshots
         // explicitly owned by this thread can override its startup cwd.
         let history_cwd = if let InitialHistory::Resumed(resumed) = &thread_history {
-            resumed.history.iter().rev().find_map(|item| match item {
-                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
-                    if event.thread_id == Some(resumed.conversation_id) =>
-                {
-                    Some(event.thread_settings.cwd.to_path_buf())
-                }
-                _ => None,
-            })
+            resumed
+                .history
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                        if event.thread_id == Some(resumed.conversation_id) =>
+                    {
+                        Some(event.thread_settings.cwd.to_path_buf())
+                    }
+                    _ => None,
+                })
+                // A checkpoint hit replays only the appended suffix, so an older thread-owned
+                // snapshot survives in the reconstructed resume state instead. An explicit path
+                // remains path-addressed replay: it preserves the bounded source semantics and
+                // must not acquire an older settings snapshot hidden outside that replay window.
+                .or_else(|| {
+                    if path.is_some() {
+                        return None;
+                    }
+                    resumed
+                        .materialized_resume
+                        .as_ref()
+                        .and_then(|resume| resume.state.as_ref())
+                        .and_then(|state| state.owned_startup_cwd.clone())
+                })
         } else {
             None
         };
@@ -4068,8 +4087,15 @@ impl ThreadRequestProcessor {
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return None;
         };
-        if let Some(persisted_settings) = latest_persisted_resume_settings(&resumed_history.history)
-        {
+        let checkpoint_context = resumed_history
+            .materialized_resume
+            .as_ref()
+            .and_then(|resume| resume.state.as_ref())
+            .and_then(|state| state.reference_context_item.as_ref());
+        if let Some(persisted_settings) = latest_persisted_resume_settings_with_checkpoint(
+            &resumed_history.history,
+            checkpoint_context,
+        ) {
             if typesafe_overrides.approval_policy.is_none() {
                 typesafe_overrides.approval_policy = Some(persisted_settings.approval_policy);
             }
@@ -4408,9 +4434,10 @@ impl ThreadRequestProcessor {
         if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
             let model_context = self
                 .thread_store
-                .load_latest_model_context(StoreLoadThreadHistoryParams {
+                .load_latest_model_context(StoreLoadModelContextParams {
                     thread_id: stored_thread.thread_id,
                     include_archived: true,
+                    rollout_path: None,
                 })
                 .await
                 .map_err(thread_store_resume_read_error)?;
@@ -4418,6 +4445,7 @@ impl ThreadRequestProcessor {
                 conversation_id: model_context.thread_id,
                 history: Arc::new(model_context.items),
                 rollout_path: stored_thread.rollout_path.clone(),
+                materialized_resume: model_context.materialized_resume.map(Box::new),
             });
             return Ok((history, stored_thread));
         }
@@ -4522,6 +4550,7 @@ impl ThreadRequestProcessor {
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: stored_thread.rollout_path.clone(),
+            materialized_resume: None,
         }))
     }
 
@@ -4879,9 +4908,10 @@ impl ThreadRequestProcessor {
         {
             Some(
                 self.thread_store
-                    .load_latest_model_context(StoreLoadThreadHistoryParams {
+                    .load_latest_model_context_for_replay(StoreLoadModelContextParams {
                         thread_id: source_thread_id,
                         include_archived: true,
+                        rollout_path: None,
                     })
                     .await
                     .map_err(thread_store_resume_read_error)?
@@ -4991,6 +5021,7 @@ impl ThreadRequestProcessor {
                         conversation_id: source_thread_id,
                         history: history_items,
                         rollout_path: source_thread.rollout_path.clone(),
+                        materialized_resume: None,
                     }),
                     thread_source,
                     parent_trace,

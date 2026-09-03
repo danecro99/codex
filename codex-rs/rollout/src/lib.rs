@@ -27,6 +27,14 @@ pub mod state_db;
 
 pub use codex_history::CompactedItem;
 pub use codex_history::InitialHistory;
+pub use codex_history::MATERIALIZED_RESUME_STATE_VERSION;
+pub use codex_history::MaterializedAutoCompactWindow;
+pub use codex_history::MaterializedPreviousTurnSettings;
+pub use codex_history::MaterializedResume;
+pub use codex_history::MaterializedResumeAppendGeneration;
+pub use codex_history::MaterializedResumeLineageSegment;
+pub use codex_history::MaterializedResumeSource;
+pub use codex_history::MaterializedResumeState;
 pub use codex_history::ResponseItemEnvelope;
 pub use codex_history::ResumedHistory;
 pub use codex_history::RolloutItem;
@@ -84,6 +92,7 @@ pub use compression::plain_rollout_path;
 pub use compression::spawn_rollout_compression_worker;
 pub use seekable_reader::open_rollout_seekable_reader;
 pub use seekable_reader::rollout_contains_prefix;
+pub use seekable_reader::rollout_logical_len;
 
 /// Materializes a compressed rollout as plain JSONL before another rollout references it.
 pub async fn materialize_rollout_for_reference(

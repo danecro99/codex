@@ -2,19 +2,25 @@
 //! Compaction replaces only model history; replay restores retained evidence and rollback trims it.
 
 use crate::context::ContextualUserFragment;
+#[cfg(test)]
 use crate::context::ModelSwitchInstructions;
+#[cfg(test)]
 use crate::context::world_state::PersistentModeState;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::normalize;
+#[cfg(test)]
 use crate::event_mapping::has_non_contextual_dev_message_content;
+#[cfg(test)]
 use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::turn_context::TurnContext;
 use crate::utils::json::serialized_json_bytes;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+#[cfg(test)]
 use codex_context_fragments::set_annotated_content;
+#[cfg(test)]
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ConversationHistorySnapshot;
 use codex_guardian_context::SectionHistory;
@@ -211,6 +217,10 @@ impl ContextManager {
         self.world_state_baseline = Some(snapshot);
     }
 
+    pub(crate) fn world_state_baseline(&self) -> Option<WorldStateSnapshot> {
+        self.world_state_baseline.clone()
+    }
+
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
         match &mut self.token_info {
             Some(info) => info.fill_to_context_window(context_window),
@@ -312,6 +322,10 @@ impl ContextManager {
         &self.items
     }
 
+    pub(crate) fn annotated_items_arc(&self) -> Arc<Vec<ResponseItemEnvelope>> {
+        Arc::clone(&self.items)
+    }
+
     /// Returns raw items in the history and consumes the snapshot.
     pub(crate) fn into_raw_items(self) -> Vec<ResponseItem> {
         self.into_annotated_items()
@@ -323,6 +337,10 @@ impl ContextManager {
     /// Returns annotated history items and consumes the snapshot.
     pub(crate) fn into_annotated_items(self) -> Vec<ResponseItemEnvelope> {
         Arc::unwrap_or_clone(self.items)
+    }
+
+    pub(crate) fn into_annotated_items_arc(self) -> Arc<Vec<ResponseItemEnvelope>> {
+        self.items
     }
 
     pub(crate) fn history_version(&self) -> u64 {
@@ -408,6 +426,12 @@ impl ContextManager {
         self.world_state_baseline = None;
     }
 
+    pub(crate) fn replace_annotated_arc(&mut self, items: Arc<Vec<ResponseItemEnvelope>>) {
+        self.items = items;
+        self.history_version = self.history_version.saturating_add(1);
+        self.world_state_baseline = None;
+    }
+
     /// Drop the last `num_turns` instruction turns from this history.
     ///
     /// Instruction turns are history messages that should behave like a new prompt boundary:
@@ -424,6 +448,7 @@ impl ContextManager {
     /// `reference_context_item`. The surviving history no longer contains the full bundle that
     /// established the prior baseline, so future turns must fall back to full reinjection instead
     /// of diffing against stale state.
+    #[cfg(test)]
     pub(crate) fn drop_last_n_user_turns(&mut self, num_turns: u32) {
         if num_turns == 0 {
             return;
@@ -597,6 +622,7 @@ impl ContextManager {
     /// rollback-trimmable contextual fragments and persistent developer text, this also clears the
     /// stored `reference_context_item` baseline so the next real turn falls back to full
     /// reinjection.
+    #[cfg(test)]
     fn trim_pre_turn_context_updates(
         &mut self,
         snapshot: &[ResponseItemEnvelope],
@@ -988,6 +1014,7 @@ fn is_inter_agent_instruction_content(content: &[ContentItem]) -> bool {
     InterAgentCommunication::is_message_content(content)
 }
 
+#[cfg(test)]
 fn user_message_positions(items: &[ResponseItemEnvelope]) -> Vec<usize> {
     let mut positions = Vec::new();
     for (idx, envelope) in items.iter().enumerate() {

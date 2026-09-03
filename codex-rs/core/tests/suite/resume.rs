@@ -81,6 +81,13 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
         .await?;
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    std::fs::remove_file(
+        initial
+            .home
+            .path()
+            .join("materialized_resume_state_v5")
+            .join(format!("{}.json", initial.session_configured.thread_id)),
+    )?;
     let resumed = builder.restart(&server, &initial).await?;
     let initial_messages = resumed
         .session_configured
@@ -110,7 +117,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> {
+async fn checkpoint_resume_omits_partial_initial_messages_and_preserves_reasoning() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -137,32 +144,40 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     let resumed = builder.restart(&server, &initial).await?;
-    let initial_messages = resumed
-        .session_configured
-        .initial_messages
-        .expect("expected initial messages to be present for resumed session");
-    match initial_messages.as_slice() {
-        [
-            EventMsg::TurnStarted(started),
-            EventMsg::UserMessage(first_user),
-            EventMsg::AgentReasoning(reasoning),
-            EventMsg::AgentReasoningRawContent(raw),
-            EventMsg::AgentMessage(assistant_message),
-            EventMsg::TokenCount(_),
-            EventMsg::TurnComplete(completed),
-        ] => {
-            assert_eq!(first_user.message, "Record reasoning messages");
-            assert_eq!(reasoning.text, "Summarized step");
-            assert_eq!(raw.text, "raw detail");
-            assert_eq!(assistant_message.message, "Completed reasoning turn");
-            assert_eq!(completed.turn_id, started.turn_id);
-            assert_eq!(
-                completed.last_agent_message.as_deref(),
-                Some("Completed reasoning turn")
-            );
-        }
-        other => panic!("unexpected initial messages after resume: {other:#?}"),
-    }
+    assert!(resumed.session_configured.initial_messages.is_none());
+
+    let resumed_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-resumed"),
+            ev_assistant_message("msg-2", "Completed resumed turn"),
+            ev_completed("resp-resumed"),
+        ]),
+    )
+    .await;
+    resumed
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Continue after checkpoint".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&resumed.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let request = resumed_mock.single_request();
+    assert!(
+        request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "Record reasoning messages")
+    );
+    let body = request.body_json().to_string();
+    assert!(body.contains("Summarized step"));
+    assert!(body.contains("raw detail"));
+    assert!(body.contains("Completed reasoning turn"));
 
     Ok(())
 }
@@ -219,7 +234,26 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
     let mut resume_builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.4".to_string());
     });
-    let resumed = resume_builder.restart(&server, &initial).await?;
+    let resume_home = Arc::clone(&initial.home);
+    let resume_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    let first_error = resume_builder
+        .restart(&server, &initial)
+        .await
+        .err()
+        .expect("the first incompatible resume must establish a loud rebuild boundary");
+    assert!(
+        first_error
+            .to_string()
+            .contains("codex_resume_state_needs_rebuild"),
+        "{first_error:#}"
+    );
+    let resumed = resume_builder
+        .resume(&server, resume_home, resume_path)
+        .await?;
     resumed
         .codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -316,7 +350,26 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
     let mut resume_builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.5".to_string());
     });
-    let resumed = resume_builder.restart(&server, &initial).await?;
+    let resume_home = Arc::clone(&initial.home);
+    let resume_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    let first_error = resume_builder
+        .restart(&server, &initial)
+        .await
+        .err()
+        .expect("the first incompatible resume must establish a loud rebuild boundary");
+    assert!(
+        first_error
+            .to_string()
+            .contains("codex_resume_state_needs_rebuild"),
+        "{first_error:#}"
+    );
+    let resumed = resume_builder
+        .resume(&server, resume_home, resume_path)
+        .await?;
     core_test_support::submit_thread_settings(
         &resumed.codex,
         ThreadSettingsOverrides {

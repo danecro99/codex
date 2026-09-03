@@ -7,6 +7,7 @@ use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
@@ -37,6 +38,8 @@ pub(crate) struct SessionState {
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) latest_token_usage_record: Option<TokenUsageRecord>,
+    /// Startup cwd claimed by this thread's own newest applied settings snapshot.
+    owned_startup_cwd: Option<PathBuf>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
@@ -78,6 +81,7 @@ impl SessionState {
             history,
             latest_rate_limits: None,
             latest_token_usage_record: None,
+            owned_startup_cwd: None,
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
@@ -114,6 +118,19 @@ impl SessionState {
 
     pub(crate) fn set_next_turn_is_first(&mut self, value: bool) {
         self.next_turn_is_first = value;
+    }
+
+    /// Startup cwd this thread claimed through its own applied settings, if any.
+    pub(crate) fn owned_startup_cwd(&self) -> Option<PathBuf> {
+        self.owned_startup_cwd.clone()
+    }
+
+    pub(crate) fn set_owned_startup_cwd(&mut self, cwd: Option<PathBuf>) {
+        self.owned_startup_cwd = cwd;
+    }
+
+    pub(crate) fn next_turn_is_first(&self) -> bool {
+        self.next_turn_is_first
     }
 
     pub(crate) fn take_next_turn_is_first(&mut self) -> bool {

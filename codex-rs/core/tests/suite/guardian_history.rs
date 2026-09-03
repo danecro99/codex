@@ -22,7 +22,7 @@ use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::ForkBoundary;
 use codex_thread_store::InMemoryThreadStore;
-use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::LoadModelContextParams;
 use codex_thread_store::PrepareForkParams;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -98,19 +98,24 @@ async fn guardian_history_survives_restart_and_user_fork(
     initial.thread_manager.remove_thread(&thread_id).await;
     let model_context = initial
         .thread_store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await?;
     // Cross the wire boundary even for the pathless in-memory store: replay must not rely on
-    // retained runtime metadata or the original live ContextManager.
+    // retained runtime metadata or the original live ContextManager. The durable resume fence
+    // crosses it too, since a checkpoint hit returns only the model-state suffix.
     let items: Vec<RolloutItem> =
         serde_json::from_value(serde_json::to_value(model_context.items)?)?;
+    let materialized_resume: Option<codex_history::MaterializedResume> =
+        serde_json::from_value(serde_json::to_value(model_context.materialized_resume)?)?;
     let history = InitialHistory::Resumed(ResumedHistory {
         conversation_id: thread_id,
         history: Arc::new(items),
         rollout_path: None,
+        materialized_resume: materialized_resume.map(Box::new),
     });
     let fork = if history_mode == ThreadHistoryMode::Paginated {
         let prepared = initial

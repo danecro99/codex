@@ -16,6 +16,7 @@ use crate::CreateThreadParams;
 use crate::LoadThreadHistoryParams;
 use crate::LocalThreadStore;
 use crate::PersistContext;
+use crate::PublishMaterializedResumeParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
@@ -300,6 +301,30 @@ impl LiveThread {
                 thread_id: self.thread_id,
                 include_archived,
             })
+            .await
+    }
+
+    pub async fn publish_materialized_resume_state(
+        &self,
+        params: PublishMaterializedResumeParams,
+    ) -> ThreadStoreResult<()> {
+        if params.thread_id != self.thread_id {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "materialized resume state belongs to {}, not {}",
+                    params.thread_id, self.thread_id
+                ),
+            });
+        }
+        self.thread_store
+            .publish_materialized_resume_state(params)
+            .await
+    }
+
+    /// Establishes an explicit clean-rebuild boundary for this thread's private resume state.
+    pub async fn prepare_materialized_resume_state_rebuild(&self) -> ThreadStoreResult<()> {
+        self.thread_store
+            .prepare_materialized_resume_state_rebuild(self.thread_id)
             .await
     }
 

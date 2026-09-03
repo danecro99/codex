@@ -1,9 +1,11 @@
+mod append_generation;
 mod archive_thread;
 mod create_thread;
 mod delete_thread;
 mod helpers;
 mod list_threads;
 mod live_writer;
+mod materialized_resume;
 mod model_context;
 mod move_thread_to_section;
 mod paginated_fork;
@@ -64,6 +66,7 @@ use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
 use crate::ListTimelineParams;
 use crate::ListTurnsParams;
+use crate::LoadModelContextParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveProjectParams;
 use crate::MoveThreadToSectionParams;
@@ -71,6 +74,7 @@ use crate::PersistContext;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
+use crate::PublishMaterializedResumeParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::RenameThreadSectionParams;
@@ -495,9 +499,35 @@ impl ThreadStore for LocalThreadStore {
 
     fn load_latest_model_context(
         &self,
-        params: LoadThreadHistoryParams,
+        params: LoadModelContextParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(async move { model_context::load_latest_model_context(self, params).await })
+    }
+
+    fn load_latest_model_context_for_replay(
+        &self,
+        params: LoadModelContextParams,
+    ) -> ThreadStoreFuture<'_, StoredModelContext> {
+        Box::pin(
+            async move { model_context::load_latest_model_context_for_replay(self, params).await },
+        )
+    }
+
+    fn publish_materialized_resume_state(
+        &self,
+        params: PublishMaterializedResumeParams,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { materialized_resume::publish(self, params).await })
+    }
+
+    fn prepare_materialized_resume_state_rebuild(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let _writer_guard = self.live_writer_locks.lock(thread_id).await;
+            materialized_resume::remove(self, thread_id)
+        })
     }
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {

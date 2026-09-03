@@ -81,6 +81,32 @@ fn configure_insta_workspace_root_for_snapshot_tests() {
 }
 
 #[track_caller]
+/// Drops the derived materialized-resume state for a rollout that a test rewrote out of band.
+///
+/// The resume fence treats an out-of-band rewrite of an append-only transcript as a hard error.
+/// Fixtures that synthesize legacy transcripts must therefore discard the derived artifacts the
+/// recording session published, which is exactly what an explicit rebuild boundary does.
+pub fn discard_derived_resume_state(rollout_path: &Path) {
+    // <codex_home>/sessions/<year>/<month>/<day>/rollout-*.jsonl
+    let codex_home = rollout_path.ancestors().nth(5).unwrap_or_else(|| {
+        panic!(
+            "rollout path is not inside a Codex home: {}",
+            rollout_path.display()
+        )
+    });
+    for directory in [
+        "materialized_resume_state_v5",
+        "rollout_append_generation_v5",
+    ] {
+        let path = codex_home.join(directory);
+        match std::fs::remove_dir_all(path.as_path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("failed to discard {}: {err}", path.display()),
+        }
+    }
+}
+
 pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Captures<'s> {
     let regex = Regex::new(pattern).expect("failed to compile regex");
     regex

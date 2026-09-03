@@ -352,6 +352,7 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         .collect::<serde_json::Result<Vec<_>>>()?
         .join("\n");
     fs::write(&rollout_path, format!("{rollout}\n"))?;
+    core_test_support::discard_derived_resume_state(&rollout_path);
 
     let mut resume_builder = test_codex().with_config(|config| {
         let _ = config.features.enable(Feature::ImageResizeNotice);

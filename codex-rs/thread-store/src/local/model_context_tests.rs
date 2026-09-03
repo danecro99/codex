@@ -60,9 +60,10 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
 
     let context = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await
         .expect("load model context");
@@ -123,9 +124,10 @@ async fn loads_recent_context_after_many_empty_wake_turns() {
         .expect("read session metadata");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let context = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await
         .expect("load model context");
@@ -257,9 +259,10 @@ async fn loads_turn_metadata_across_an_older_checkpoint() {
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
 
     let context = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await
         .expect("load model context");
@@ -342,9 +345,10 @@ async fn uses_agent_message_turn_context_without_scanning_older_turn() {
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
 
     let context = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await
         .expect("load model context");
@@ -382,9 +386,10 @@ async fn ignores_contextual_user_messages_when_selecting_turn_context() {
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
 
     let context = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await
         .expect("load model context");
@@ -466,9 +471,10 @@ async fn replays_nested_archived_lineage_from_frozen_prefix() {
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
 
     let context = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id: child_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await
         .expect("load lineage model context");
@@ -508,9 +514,10 @@ async fn replays_nested_archived_lineage_from_frozen_prefix() {
         std::fs::remove_file(path).expect("remove plain rollout");
     }
     let compressed_context = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id: child_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await
         .expect("load compressed lineage model context");
@@ -531,11 +538,7 @@ fn write_paginated_rollout<const N: usize>(
     uuid: Uuid,
     items: [RolloutItem; N],
 ) -> PathBuf {
-    let path =
-        write_session_file_with_history_mode(home, timestamp, uuid, ThreadHistoryMode::Paginated)
-            .expect("write session file");
-    append_items(path.as_path(), items);
-    path
+    write_ordinaled_paginated_rollout(home, timestamp, uuid, items)
 }
 
 fn write_ordinaled_paginated_rollout<const N: usize>(
@@ -615,9 +618,10 @@ async fn assert_reverse_scan_matches_full_history(home: &Path, path: &Path) {
         .expect("read session metadata");
     let store = LocalThreadStore::new(test_config(home), /*state_db*/ None);
     let items = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id: session_meta.meta.id,
             include_archived: false,
+            rollout_path: None,
         })
         .await
         .expect("scan model context")
@@ -632,7 +636,10 @@ async fn assert_reverse_scan_matches_full_history(home: &Path, path: &Path) {
     );
 }
 
+/// Appends to a paginated rollout the way the canonical writer does: every record continues the
+/// existing ordinal sequence, so the source stays fenceable.
 fn append_items(path: &Path, items: impl IntoIterator<Item = RolloutItem>) {
+    let mut next_ordinal = last_ordinal(path) + 1;
     let mut file = OpenOptions::new()
         .append(true)
         .open(path)
@@ -640,9 +647,10 @@ fn append_items(path: &Path, items: impl IntoIterator<Item = RolloutItem>) {
     for item in items {
         let line = RolloutLine {
             timestamp: "2025-01-03T13:00:01Z".to_string(),
-            ordinal: None,
+            ordinal: Some(next_ordinal),
             item,
         };
+        next_ordinal += 1;
         writeln!(
             file,
             "{}",
@@ -650,6 +658,20 @@ fn append_items(path: &Path, items: impl IntoIterator<Item = RolloutItem>) {
         )
         .expect("append rollout line");
     }
+}
+
+fn last_ordinal(path: &Path) -> u64 {
+    std::fs::read(path)
+        .expect("read rollout")
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            serde_json::from_slice::<RolloutLine>(line)
+                .expect("parse rollout line")
+                .ordinal
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn turn_started(turn_id: &str) -> RolloutItem {

@@ -61,7 +61,7 @@ use crate::ItemSortKey;
 use crate::ListItemsParams;
 use crate::ListThreadsParams;
 use crate::ListTurnsParams;
-use crate::LoadThreadHistoryParams;
+use crate::LoadModelContextParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
 use crate::ThreadMetadataPatch;
@@ -1502,9 +1502,10 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
             .contains("superseded checkpoint")
     );
     let context = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await
         .expect("load migrated model context");

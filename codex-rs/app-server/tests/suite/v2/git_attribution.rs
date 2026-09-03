@@ -288,7 +288,12 @@ async fn cold_resume_replaces_legacy_attribution_without_duplication(
         status.success(),
         "initial app-server did not exit successfully"
     );
-    replace_attribution_fragment_with_legacy(&rollout_path, legacy_attribution)?;
+    replace_attribution_fragment_with_legacy(
+        codex_home.path(),
+        &thread.id,
+        &rollout_path,
+        legacy_attribution,
+    )?;
 
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -324,6 +329,8 @@ async fn cold_resume_replaces_legacy_attribution_without_duplication(
 }
 
 fn replace_attribution_fragment_with_legacy(
+    codex_home: &Path,
+    thread_id: &str,
     rollout_path: &Path,
     legacy_attribution: LegacyAttribution,
 ) -> Result<()> {
@@ -369,6 +376,21 @@ fn replace_attribution_fragment_with_legacy(
         "rollout did not contain saved git attribution state"
     );
     std::fs::write(rollout_path, format!("{}\n", lines.join("\n")))?;
+    for private_state in [
+        codex_home
+            .join("materialized_resume_state_v5")
+            .join(format!("{thread_id}.json")),
+        codex_home
+            .join("rollout_append_generation_v5")
+            .join(format!("{thread_id}.json")),
+    ] {
+        std::fs::remove_file(&private_state).with_context(|| {
+            format!(
+                "failed to remove private resume state while constructing legacy rollout: {}",
+                private_state.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
