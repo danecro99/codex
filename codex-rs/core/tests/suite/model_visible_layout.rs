@@ -558,6 +558,15 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
                 .expect("test config should allow feature update");
             config.personality = Some(Personality::Pragmatic);
         });
+    // Resuming under a different model contract invalidates the recorded checkpoint; drop it
+    // the way an explicit rebuild boundary would.
+    core_test_support::discard_derived_resume_state(
+        initial
+            .session_configured
+            .rollout_path
+            .as_ref()
+            .expect("rollout path"),
+    );
     let resumed = resume_builder.restart(&server, &initial).await?;
     let resume_override_cwd = resumed.cwd_path().join(PRETURN_CONTEXT_DIFF_CWD);
     fs::create_dir_all(&resume_override_cwd)?;
@@ -659,6 +668,15 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
             config.update_plan_enabled = true;
             config.model = Some("gpt-5.4".to_string());
         });
+    // Resuming under a different model contract invalidates the recorded checkpoint; drop it
+    // the way an explicit rebuild boundary would.
+    core_test_support::discard_derived_resume_state(
+        initial
+            .session_configured
+            .rollout_path
+            .as_ref()
+            .expect("rollout path"),
+    );
     let resumed = resume_builder.restart(&server, &initial).await?;
     let resume_override_cwd = resumed.cwd_path().join(PRETURN_CONTEXT_DIFF_CWD);
     fs::create_dir_all(&resume_override_cwd)?;

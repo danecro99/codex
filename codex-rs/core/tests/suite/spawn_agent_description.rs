@@ -481,6 +481,7 @@ async fn multi_agent_v2_cold_resume_refreshes_legacy_usage_hints_once(
         "initial rollout should record usage-hint presence on its active mode"
     );
     std::fs::write(&rollout_path, format!("{legacy_rollout}\n"))?;
+    core_test_support::discard_derived_resume_state(&rollout_path);
 
     let resumed_responses = mount_sse_sequence(
         &server,

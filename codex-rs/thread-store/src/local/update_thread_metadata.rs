@@ -164,7 +164,14 @@ pub(super) async fn update_thread_metadata(
     let name = patch.name;
     let git_info = patch.git_info;
     if let Some(memory_mode) = patch.memory_mode {
-        apply_thread_memory_mode(resolved_rollout.path.as_path(), thread_id, memory_mode).await?;
+        apply_thread_memory_mode(
+            store,
+            resolved_rollout.rollout_id,
+            resolved_rollout.path.as_path(),
+            thread_id,
+            memory_mode,
+        )
+        .await?;
         refresh_resolved_rollout_path(&mut resolved_rollout).await;
     }
 
@@ -234,7 +241,8 @@ pub(super) async fn update_thread_metadata(
     };
     if let Some(((sha, branch, origin_url), memory_mode)) = resolved_git_info.as_ref() {
         apply_thread_git_info_to_rollout(
-            resolved_rollout.path.as_path(),
+            store,
+            &resolved_rollout,
             thread_id,
             sha,
             branch,
@@ -775,13 +783,15 @@ fn resolve_git_info_patch(
 }
 
 async fn apply_thread_git_info_to_rollout(
-    rollout_path: &Path,
+    store: &LocalThreadStore,
+    resolved_rollout: &ResolvedThreadRollout,
     thread_id: ThreadId,
     sha: &Option<String>,
     branch: &Option<String>,
     origin_url: &Option<SanitizedGitUrl>,
     memory_mode: Option<&str>,
 ) -> ThreadStoreResult<()> {
+    let rollout_path = resolved_rollout.path.as_path();
     let mut session_meta =
         read_session_meta_line(rollout_path)
             .await
@@ -803,14 +813,21 @@ async fn apply_thread_git_info_to_rollout(
         repository_url: origin_url.clone(),
     });
     session_meta.meta.memory_mode = memory_mode.map(str::to_string);
-    append_rollout_item_to_path(rollout_path, &RolloutItem::SessionMeta(session_meta))
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to set thread git metadata: {err}"),
-        })
+    let history_mode = session_meta.meta.history_mode;
+    append_item_with_generation(
+        store,
+        thread_id,
+        resolved_rollout.rollout_id,
+        rollout_path,
+        history_mode,
+        RolloutItem::SessionMeta(session_meta),
+    )
+    .await
 }
 
 async fn apply_thread_memory_mode(
+    store: &LocalThreadStore,
+    rollout_id: ThreadId,
     rollout_path: &Path,
     thread_id: ThreadId,
     memory_mode: ThreadMemoryMode,
@@ -834,11 +851,46 @@ async fn apply_thread_memory_mode(
     // code will preserve the latest prior git marker when this field is absent.
     session_meta.git = None;
     session_meta.meta.memory_mode = Some(memory_mode_as_str(memory_mode).to_string());
-    append_rollout_item_to_path(rollout_path, &RolloutItem::SessionMeta(session_meta))
+    let history_mode = session_meta.meta.history_mode;
+    append_item_with_generation(
+        store,
+        thread_id,
+        rollout_id,
+        rollout_path,
+        history_mode,
+        RolloutItem::SessionMeta(session_meta),
+    )
+    .await
+}
+
+async fn append_item_with_generation(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    rollout_id: ThreadId,
+    rollout_path: &Path,
+    history_mode: ThreadHistoryMode,
+    item: RolloutItem,
+) -> ThreadStoreResult<()> {
+    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    // The fence is history-mode specific: a paginated source is fenced on its terminal ordinal,
+    // so inspecting it as Legacy would report a position the journal can never match.
+    let generation_start = super::append_generation::begin_append(
+        store,
+        thread_id,
+        rollout_id,
+        rollout_path,
+        history_mode,
+        std::slice::from_ref(&item),
+    )?;
+    append_rollout_item_to_path(rollout_path, &item)
         .await
         .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to set thread memory mode: {err}"),
-        })
+            message: format!("failed to append thread metadata: {err}"),
+        })?;
+    if generation_start.started {
+        super::append_generation::finish_append(store, rollout_id)?;
+    }
+    Ok(())
 }
 
 fn memory_mode_as_str(mode: ThreadMemoryMode) -> &'static str {

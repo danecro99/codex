@@ -15,6 +15,7 @@ use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
+#[cfg(test)]
 use crate::compact;
 use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
@@ -72,6 +73,11 @@ use codex_extension_api::TurnContextContributionInput;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_features::unstable_features_warning_event;
+use codex_history::MATERIALIZED_RESUME_STATE_VERSION;
+use codex_history::MaterializedAutoCompactWindow;
+use codex_history::MaterializedPreviousTurnSettings;
+use codex_history::MaterializedResume;
+use codex_history::MaterializedResumeState;
 use codex_history::RolloutItem;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
@@ -138,6 +144,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnContextNetworkItem;
@@ -163,7 +170,9 @@ use codex_thread_store::CreateThreadParams;
 use codex_thread_store::LiveThread;
 use codex_thread_store::LiveThreadInitGuard;
 use codex_thread_store::LocalThreadStore;
+use codex_thread_store::MaterializedResumePublicationFence;
 use codex_thread_store::PersistContext;
+use codex_thread_store::PublishMaterializedResumeParams;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::ThreadPersistenceMetadata;
@@ -281,6 +290,11 @@ pub(crate) struct PreviousTurnSettings {
     pub(crate) model: String,
     pub(crate) comp_hash: Option<String>,
     pub(crate) realtime_active: Option<bool>,
+}
+
+struct AppliedRolloutReconstruction {
+    previous_turn_settings: Option<PreviousTurnSettings>,
+    materialized_state: MaterializedResumeState,
 }
 
 use crate::exec_policy::ExecPolicyUpdateError;
@@ -1381,7 +1395,10 @@ impl Session {
         state.clear_connector_selection();
     }
 
-    async fn record_initial_history(&self, conversation_history: InitialHistory) {
+    async fn record_initial_history(
+        &self,
+        conversation_history: InitialHistory,
+    ) -> anyhow::Result<()> {
         let (is_subagent, is_paginated_subagent) = {
             let state = self.state.lock().await;
             let session_configuration = &state.session_configuration;
@@ -1412,18 +1429,81 @@ impl Session {
             InitialHistory::Resumed(resumed_history) => {
                 let turn_context = self.new_default_turn().await;
                 let rollout_items = resumed_history.history;
+                let materialized_resume = resumed_history.materialized_resume;
+                if let Some(materialized_state) = materialized_resume
+                    .as_ref()
+                    .and_then(|resume| resume.state.as_ref())
+                {
+                    let active_model = turn_context.model_info();
+                    let active_truncation_policy: TruncationPolicy =
+                        active_model.truncation_policy.into();
+                    // The stored state's semantics depend on the truncation contract it was
+                    // built under, not on the model slug: a session that switched models keeps a
+                    // usable checkpoint as long as the contract is identical.
+                    if materialized_state.truncation_policy != active_truncation_policy {
+                        let live_thread = self.services.live_thread.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "codex_resume_state_needs_rebuild: incompatible materialized state has no live persistence handle"
+                            )
+                        })?;
+                        live_thread
+                            .prepare_materialized_resume_state_rebuild()
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "codex_resume_state_needs_rebuild: failed to establish the clean rebuild boundary: {err}"
+                                )
+                            })?;
+                        anyhow::bail!(
+                            "codex_resume_state_needs_rebuild: materialized state was built for model {} with a different truncation contract; retry Resume to rebuild it from the canonical transcript for {}",
+                            materialized_state.materialized_model,
+                            active_model.slug
+                        );
+                    }
+                }
+                let reducer_started = std::time::Instant::now();
+                let applied = self
+                    .apply_rollout_reconstruction(
+                        &turn_context,
+                        &rollout_items,
+                        materialized_resume
+                            .as_ref()
+                            .and_then(|resume| resume.state.as_ref()),
+                    )
+                    .await?;
+                let reducer_elapsed_millis =
+                    u64::try_from(reducer_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                tracing::info!(
+                    reducer_elapsed_millis,
+                    replay_input_items = rollout_items.len(),
+                    checkpoint_hit = materialized_resume
+                        .as_ref()
+                        .is_some_and(|resume| resume.state.is_some()),
+                    "reconstructed materialized resume state"
+                );
+                self.state
+                    .lock()
+                    .await
+                    .set_next_turn_is_first(!applied.materialized_state.has_prior_user_turns);
+                let previous_turn_settings = applied.previous_turn_settings;
                 if matches!(
-                    rollout_items.iter().rev().find_map(|item| match item {
-                        RolloutItem::EventMsg(event) => agent_status_from_event(event),
-                        _ => None,
-                    }),
+                    applied.materialized_state.last_agent_status.as_ref(),
                     Some(AgentStatus::Interrupted)
                 ) {
                     self.agent_status.send_replace(AgentStatus::Interrupted);
                 }
-                let previous_turn_settings = self
-                    .apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+
+                if let Some(materialized_resume) = materialized_resume
+                    && (materialized_resume.state.is_none() || rollout_items.len() > 1)
+                {
+                    self.publish_materialized_resume_state(
+                        &turn_context,
+                        *materialized_resume,
+                        applied.materialized_state,
+                        reducer_elapsed_millis,
+                    )
+                    .await?;
+                }
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info().slug.as_str();
@@ -1445,15 +1525,8 @@ impl Session {
                     .await;
                 }
 
-                // Seed usage info from the recorded rollout so UIs can show token counts
-                // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
-                    let mut state = self.state.lock().await;
-                    state.set_token_info(Some(info));
-                }
-                self.state.lock().await.latest_token_usage_record =
-                    Self::last_token_usage_record_from_rollout(&rollout_items);
-
+                // Token counts are seeded by the replay reducer, which also owns the
+                // checkpoint-suffix path where `rollout_items` is not the full transcript.
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
                 if !is_subagent {
@@ -1464,8 +1537,12 @@ impl Session {
             InitialHistory::Forked(mut rollout_items) => {
                 let turn_context = self.new_default_turn().await;
                 Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
-                self.apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+                self.apply_rollout_reconstruction(
+                    &turn_context,
+                    &rollout_items,
+                    /*materialized_state*/ None,
+                )
+                .await?;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -1525,6 +1602,7 @@ impl Session {
                     .await;
             }
         }
+        Ok(())
     }
 
     #[instrument(
@@ -1539,9 +1617,10 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-    ) -> Option<PreviousTurnSettings> {
+        materialized_state: Option<&MaterializedResumeState>,
+    ) -> anyhow::Result<AppliedRolloutReconstruction> {
         let rollout_reconstruction::RolloutReconstruction {
-            mut history,
+            history,
             guardian_history,
             previous_turn_settings,
             reference_context_item,
@@ -1550,16 +1629,24 @@ impl Session {
             first_window_id,
             previous_window_id,
             window_id,
+            token_info,
+            latest_token_usage_record,
+            last_agent_status,
+            mcp_resource_origins,
+            owned_startup_cwd,
+            auto_compact_window_prefill_input_tokens,
+            has_prior_user_turns,
         } = self
-            .reconstruct_history_from_rollout(turn_context, rollout_items)
-            .await;
+            .reconstruct_resume_state(turn_context, rollout_items, materialized_state)
+            .await?;
         // Keep the recorded rollout unchanged. Prepare its reconstructed history before
         // installing it, so legacy media is processed once for this resume or fork and
         // will be processed again if the rollout is reconstructed in a future session.
         // Replay disables image-resize notices, so media preparation remains one-to-one. Keep
         // the prior batch behavior and carry history-only metadata in a positional sidecar.
         let (mut prepared_history, metadata): (Vec<_>, Vec<_>) = history
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|envelope| (envelope.item, envelope.metadata))
             .unzip();
         let _ = prepare_image_response_items(
@@ -1573,51 +1660,243 @@ impl Session {
             metadata.len(),
             "replay media preparation must remain one-to-one when resize notices are disabled"
         );
-        history = prepared_history
+        let prepared_history = prepared_history
             .into_iter()
             .zip(metadata)
             .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
             .collect();
-        {
+        let (window_number, window_ids) = {
             let mut state = self.state.lock().await;
             state.replace_annotated_history(
-                history,
-                reference_context_item,
+                prepared_history,
+                reference_context_item.clone(),
                 HistoryReplacement::Reset,
             );
             state
                 .history
                 .restore_guardian_history(guardian_history.as_ref());
-            if let Some(world_state) = world_state_baseline {
+            if let Some(world_state) = world_state_baseline.clone() {
                 state.history.set_world_state_baseline(world_state);
             }
             let fallback_ids = state.auto_compact_window_ids();
             let window_id = window_id.unwrap_or(fallback_ids.window_id);
-            state.restore_auto_compact_window(
-                window_number,
-                AutoCompactWindowIds {
-                    first_window_id: first_window_id.unwrap_or(window_id),
-                    previous_window_id,
-                    window_id,
-                },
-            );
+            let window_ids = AutoCompactWindowIds {
+                first_window_id: first_window_id.unwrap_or(window_id),
+                previous_window_id,
+                window_id,
+            };
+            state.restore_auto_compact_window(window_number, window_ids);
             state.set_previous_turn_settings(previous_turn_settings.clone());
-        }
-        let prefix_tokens = if matches!(
+            state.set_token_info(token_info.clone());
+            state.latest_token_usage_record = latest_token_usage_record.clone();
+            state.set_owned_startup_cwd(owned_startup_cwd.clone());
+            (window_number, window_ids)
+        };
+        let tracks_prefill = matches!(
             turn_context.config.model_auto_compact_token_limit_scope,
             AutoCompactTokenLimitScope::BodyAfterPrefix
-        ) {
+        );
+        let recomputed_prefix_tokens = if tracks_prefill {
             let history = self.clone_history().await;
             let base_instructions = self.get_base_instructions().await;
             history.estimate_token_count_with_base_instructions(&base_instructions)
         } else {
             None
         };
+        let prefix_tokens = tracks_prefill
+            .then(|| auto_compact_window_prefill_input_tokens.or(recomputed_prefix_tokens))
+            .flatten();
         if let Some(prefix_tokens) = prefix_tokens {
             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
                 .await;
         }
-        previous_turn_settings
+        let truncation_policy = turn_context.model_info().truncation_policy.into();
+        Ok(AppliedRolloutReconstruction {
+            previous_turn_settings: previous_turn_settings.clone(),
+            materialized_state: MaterializedResumeState {
+                version: MATERIALIZED_RESUME_STATE_VERSION,
+                materialized_model: turn_context.model_info().slug.clone(),
+                history,
+                guardian_history,
+                previous_turn_settings: previous_turn_settings.map(|settings| {
+                    MaterializedPreviousTurnSettings {
+                        model: settings.model,
+                        comp_hash: settings.comp_hash,
+                        realtime_active: settings.realtime_active,
+                    }
+                }),
+                reference_context_item,
+                world_state_baseline: world_state_baseline
+                    .map(|snapshot| WorldStateItem::full(snapshot.into_object())),
+                mcp_resource_origins,
+                auto_compact_window: MaterializedAutoCompactWindow {
+                    window_number,
+                    first_window_id: window_ids.first_window_id.to_string(),
+                    previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+                    window_id: window_ids.window_id.to_string(),
+                },
+                owned_startup_cwd,
+                token_info,
+                latest_token_usage_record,
+                last_agent_status,
+                truncation_policy,
+                auto_compact_window_prefill_input_tokens: prefix_tokens,
+                has_prior_user_turns,
+            },
+        })
+    }
+
+    async fn publish_materialized_resume_state(
+        &self,
+        turn_context: &TurnContext,
+        materialized_resume: MaterializedResume,
+        materialized_state: MaterializedResumeState,
+        reducer_elapsed_millis: u64,
+    ) -> anyhow::Result<()> {
+        let max_state_bytes =
+            materialized_resume_state_max_bytes(turn_context.model_info().as_ref())?;
+        let live_thread = self.services.live_thread.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "codex_resume_state_needs_compaction: resumed source has no live persistence handle"
+            )
+        })?;
+        let persist_started = std::time::Instant::now();
+        live_thread
+            .publish_materialized_resume_state(PublishMaterializedResumeParams {
+                thread_id: self.thread_id(),
+                fence: MaterializedResumePublicationFence::Loaded(Box::new(
+                    materialized_resume.source,
+                )),
+                state: materialized_state,
+                max_state_bytes,
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to publish materialized resume state: {err}"))?;
+        let persist_elapsed_millis =
+            u64::try_from(persist_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let bootstrap_elapsed_millis =
+            reducer_elapsed_millis.saturating_add(persist_elapsed_millis);
+        tracing::info!(
+            reducer_elapsed_millis,
+            persist_elapsed_millis,
+            bootstrap_elapsed_millis,
+            max_state_bytes,
+            "published materialized resume state"
+        );
+        if let Some(metrics) = codex_otel::global() {
+            let tags = &[];
+            for (name, value) in [
+                (
+                    "codex.resume.reducer_elapsed_millis",
+                    reducer_elapsed_millis,
+                ),
+                (
+                    "codex.resume.persist_elapsed_millis",
+                    persist_elapsed_millis,
+                ),
+                (
+                    "codex.resume.bootstrap_elapsed_millis",
+                    bootstrap_elapsed_millis,
+                ),
+            ] {
+                let _ = metrics.histogram(name, i64::try_from(value).unwrap_or(i64::MAX), tags);
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the model contract a fresh resume would use, without building a turn context.
+    ///
+    /// This runs on the event path, where constructing a turn context would wait on turn
+    /// environments that the pending event itself is expected to settle.
+    async fn default_turn_model_info(&self) -> Arc<ModelInfo> {
+        let session_configuration = {
+            let state = self.state.lock().await;
+            state.session_configuration.clone()
+        };
+        Arc::new(
+            session_configuration
+                .step_settings
+                .resolve_model_info(
+                    self.services.models_manager.as_ref(),
+                    &session_configuration.model_info_overrides,
+                    self.features.enabled(Feature::Personality),
+                )
+                .await,
+        )
+    }
+
+    async fn publish_current_materialized_resume_state(
+        &self,
+        last_agent_status: AgentStatus,
+    ) -> anyhow::Result<()> {
+        let Some(rollout_path) = self.current_rollout_path().await? else {
+            return Ok(());
+        };
+        self.flush_rollout().await?;
+        let model_info = self.default_turn_model_info().await;
+        let (state, history_mode) = {
+            let state = self.state.lock().await;
+            let history = state.history.annotated_items_arc();
+            if history.is_empty() {
+                return Ok(());
+            }
+            let window_ids = state.auto_compact_window_ids();
+            let window = state.auto_compact_window_snapshot();
+            let materialized_state = MaterializedResumeState {
+                version: MATERIALIZED_RESUME_STATE_VERSION,
+                materialized_model: model_info.slug.clone(),
+                history,
+                guardian_history: state.history.guardian_history_checkpoint(),
+                previous_turn_settings: state.previous_turn_settings().map(|settings| {
+                    MaterializedPreviousTurnSettings {
+                        model: settings.model,
+                        comp_hash: settings.comp_hash,
+                        realtime_active: settings.realtime_active,
+                    }
+                }),
+                reference_context_item: state.reference_context_item(),
+                world_state_baseline: state
+                    .history
+                    .world_state_baseline()
+                    .map(|snapshot| WorldStateItem::full(snapshot.into_object())),
+                mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
+                owned_startup_cwd: state.owned_startup_cwd(),
+                auto_compact_window: MaterializedAutoCompactWindow {
+                    window_number: state.auto_compact_window_number(),
+                    first_window_id: window_ids.first_window_id.to_string(),
+                    previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+                    window_id: window_ids.window_id.to_string(),
+                },
+                token_info: state.token_info(),
+                latest_token_usage_record: state.latest_token_usage_record.clone(),
+                last_agent_status: Some(last_agent_status),
+                truncation_policy: model_info.truncation_policy.into(),
+                auto_compact_window_prefill_input_tokens: window.prefill_input_tokens,
+                has_prior_user_turns: !state.next_turn_is_first(),
+            };
+            (materialized_state, state.session_configuration.history_mode)
+        };
+        let max_state_bytes = materialized_resume_state_max_bytes(model_info.as_ref())?;
+        let live_thread = self.services.live_thread.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "codex_resume_state_needs_compaction: active source has no live persistence handle"
+            )
+        })?;
+        live_thread
+            .publish_materialized_resume_state(PublishMaterializedResumeParams {
+                thread_id: self.thread_id(),
+                fence: MaterializedResumePublicationFence::Current {
+                    rollout_path,
+                    history_mode,
+                },
+                state,
+                max_state_bytes,
+            })
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("failed to proactively publish materialized resume state: {err}")
+            })
     }
 
     async fn set_auto_compact_window_estimated_prefill_for_scope(
@@ -2367,6 +2646,12 @@ impl Session {
     }
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+        let terminal_status = match &event.msg {
+            EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) => {
+                agent_status_from_event(&event.msg)
+            }
+            _ => None,
+        };
         // Keep realtime reduction, canonical append, and delivery in the same order.
         // This lock must not acquire SessionState or ActiveTurn: event producers can
         // already hold those locks. Host presentation policies are synchronous.
@@ -2394,10 +2679,18 @@ impl Session {
             warn!("failed to persist realtime history: {error}");
         }
         // Persist the event into rollout storage; the store applies its persistence policy.
-        if persist {
+        let persisted = if persist {
             let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
-            self.persist_rollout_items(&rollout_items).await;
-        }
+            match self.try_persist_rollout_items(&rollout_items).await {
+                Ok(()) => true,
+                Err(err) => {
+                    error!("failed to record rollout items: {err:#}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
         self.services
             .rollout_thread_trace
             .record_protocol_event(&event.msg);
@@ -2405,6 +2698,15 @@ impl Session {
             && let Err(error) = self.send_realtime_history_effects(&event.id, effects).await
         {
             warn!("failed to persist realtime history: {error}");
+        }
+        // Publishing reads SessionState, so it must not run while the realtime-history lock is
+        // held: event producers can already hold SessionState and wait for that lock.
+        drop(realtime_history);
+        if persisted
+            && let Some(status) = terminal_status
+            && let Err(err) = self.publish_current_materialized_resume_state(status).await
+        {
+            error!("codex_resume_state_needs_compaction: {err:#}");
         }
         self.deliver_event_raw(event).await;
     }
@@ -4133,11 +4435,16 @@ impl Session {
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
-        if let Some(live_thread) = self.live_thread()
-            && let Err(e) = live_thread.append_items(items).await
-        {
-            error!("failed to record rollout items: {e:#}");
+        if let Err(err) = self.try_persist_rollout_items(items).await {
+            error!("failed to record rollout items: {err:#}");
         }
+    }
+
+    async fn try_persist_rollout_items(&self, items: &[RolloutItem]) -> anyhow::Result<()> {
+        if let Some(live_thread) = self.live_thread() {
+            live_thread.append_items(items).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
@@ -4614,9 +4921,38 @@ impl Session {
         state.take_pending_session_start_source()
     }
 
+    /// Records the startup cwd this thread claimed through its own applied settings.
+    pub(crate) async fn set_owned_startup_cwd(&self, cwd: PathBuf) {
+        let mut state = self.state.lock().await;
+        state.set_owned_startup_cwd(Some(cwd));
+    }
+
     fn show_raw_agent_reasoning(&self) -> bool {
         self.services.show_raw_agent_reasoning
     }
+}
+
+/// Envelope and non-text structural headroom for a serialized materialized resume state, sized to
+/// one maximum persisted rollout record.
+const MATERIALIZED_RESUME_STATE_STRUCTURAL_HEADROOM_BYTES: usize = 16 * 1024 * 1024;
+
+fn materialized_resume_state_max_bytes(model_info: &ModelInfo) -> anyhow::Result<u64> {
+    let model_context_window = model_info.usable_context_window().ok_or_else(|| {
+        anyhow::anyhow!(
+            "codex_resume_state_needs_compaction: active model has no context-window bound"
+        )
+    })?;
+    let context_tokens = usize::try_from(model_context_window).map_err(|_| {
+        anyhow::anyhow!(
+            "codex_resume_state_needs_compaction: active model context-window bound is invalid"
+        )
+    })?;
+    // Six bytes per model-context byte is JSON's worst-case character escaping expansion.
+    // One maximum rollout record covers envelope and non-text structural state.
+    let max_state_bytes = codex_utils_string::approx_bytes_for_tokens(context_tokens)
+        .saturating_mul(6)
+        .saturating_add(MATERIALIZED_RESUME_STATE_STRUCTURAL_HEADROOM_BYTES);
+    Ok(u64::try_from(max_state_bytes).unwrap_or(u64::MAX))
 }
 
 pub(crate) fn emit_subagent_session_started(

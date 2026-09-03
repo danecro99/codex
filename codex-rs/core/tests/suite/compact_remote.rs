@@ -425,6 +425,7 @@ fn annotate_retained_user_in_rollout(path: &Path, retained_text: &str) -> Result
         .collect::<std::result::Result<Vec<_>, _>>()?
         .join("\n");
     fs::write(path, format!("{contents}\n"))?;
+    core_test_support::discard_derived_resume_state(path);
     Ok(())
 }
 

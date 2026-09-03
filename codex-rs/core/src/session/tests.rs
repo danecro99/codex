@@ -166,6 +166,7 @@ use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TokenUsageRecord;
+use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -2238,7 +2239,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
         .await;
 
-    assert_eq!(reconstructed.history, replacement_history);
+    assert_eq!(reconstructed.history.as_ref(), &replacement_history);
     assert_eq!(42, reconstructed.window_number);
     assert_eq!(Some(first_window_id), reconstructed.first_window_id);
     assert_eq!(Some(previous_window_id), reconstructed.previous_window_id);
@@ -2255,8 +2256,10 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, raw_history_items(&history));
@@ -2439,7 +2442,8 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
     let (resumed_session, _resumed_turn_context) = make_session_and_context().await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("record initial history");
     assert_eq!(
         strip_response_item_ids(&raw_history_items(&resumed_session.clone_history().await)),
         strip_response_item_ids(std::slice::from_ref(&expected_item))
@@ -2508,7 +2512,8 @@ async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resum
         .await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("record initial history");
     let resumed_history = resumed_session.clone_history().await;
     let resumed_items = raw_history_items(&resumed_history);
     let [resumed_item] = resumed_items.as_slice() else {
@@ -2627,8 +2632,10 @@ async fn prepares_resumed_history_before_installing_it() {
                 metadata: Some(CodexHarnessMetadata::default()),
             })]),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(
@@ -2684,6 +2691,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
+                materialized_resume: None,
             }),
             /*inherited_multi_agent_version*/ None,
         ),
@@ -2695,6 +2703,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
+                materialized_resume: None,
             }),
             Some(MultiAgentVersion::V2),
         ),
@@ -2709,6 +2718,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
                     Some(MultiAgentVersion::Disabled)
                 )]),
                 rollout_path: None,
+                materialized_resume: None,
             }),
             Some(MultiAgentVersion::V2),
         ),
@@ -2737,7 +2747,10 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
 async fn record_initial_history_new_defers_initial_context_until_first_turn() {
     let (session, _turn_context) = make_session_and_context().await;
 
-    session.record_initial_history(InitialHistory::New).await;
+    session
+        .record_initial_history(InitialHistory::New)
+        .await
+        .expect("record initial history");
 
     let history = session.clone_history().await;
     assert_eq!(raw_history_items(&history), Vec::<ResponseItem>::new());
@@ -2771,8 +2784,10 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history_before_seed = session.state.lock().await.clone_history();
     assert_eq!(expected, raw_history_items(&history_before_seed));
@@ -2881,8 +2896,10 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let actual = session.state.lock().await.token_info();
     assert_eq!(actual, Some(info2));
@@ -3451,7 +3468,8 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(
@@ -3571,7 +3589,8 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         .record_initial_history(InitialHistory::Forked(vec![RolloutItem::ResponseItem(
             response_item,
         )]))
-        .await;
+        .await
+        .expect("record initial history");
 
     let live_history = session.clone_history().await;
     let live_items = raw_history_items(&live_history);
@@ -3827,7 +3846,8 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.clone_history().await;
     assert_eq!(
@@ -3886,6 +3906,16 @@ async fn thread_rollback_drops_last_turn_from_history() {
         let mut state = sess.state.lock().await;
         state.set_reference_context_item(Some(tc.to_turn_context_item()));
     }
+    sess.publish_current_materialized_resume_state(AgentStatus::Completed(None))
+        .await
+        .expect("publish pre-rollback checkpoint");
+    let checkpoint_path = sess
+        .get_config()
+        .await
+        .codex_home
+        .join("materialized_resume_state_v5")
+        .join(format!("{}.json", sess.thread_id()));
+    assert!(checkpoint_path.exists());
 
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 1).await;
 
@@ -3900,6 +3930,10 @@ async fn thread_rollback_drops_last_turn_from_history() {
     assert_eq!(expected, raw_history_items(&history));
     assert_eq!(sess.previous_turn_settings().await, None);
     assert!(sess.reference_context_item().await.is_none());
+    assert!(
+        !checkpoint_path.exists(),
+        "rollback must invalidate a checkpoint before its durable marker crosses the fence"
+    );
 
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
         .await
@@ -4975,6 +5009,152 @@ async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
         .await
         .expect("attached rollout should flush");
     rollout_path
+}
+
+#[tokio::test]
+async fn fresh_long_session_materializes_resume_state_at_turn_completion() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let rollout_path = attach_thread_persistence(&mut session).await;
+    let items = (0..512)
+        .map(|index| ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: format!("{index}:{}", "x".repeat(2_048)),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        })
+        .collect::<Vec<_>>();
+    let _ = session.state.lock().await.take_next_turn_is_first();
+    session
+        .record_conversation_items(&turn_context, items.as_slice())
+        .await;
+    session
+        .send_event(
+            &turn_context,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn_context.sub_id.clone(),
+                last_agent_message: None,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    let config = session.get_config().await;
+    let artifact_path = config
+        .codex_home
+        .join("materialized_resume_state_v5")
+        .join(format!("{}.json", session.thread_id()));
+    let artifact: codex_history::MaterializedResume = serde_json::from_slice(
+        std::fs::read(artifact_path.as_path())
+            .expect("fresh terminal turn must publish resume state")
+            .as_slice(),
+    )
+    .expect("decode proactive materialization");
+    let materialized_state = artifact.state.expect("materialized state");
+    assert_eq!(materialized_state.history.len(), 512);
+    assert!(materialized_state.has_prior_user_turns);
+
+    let resumed = session
+        .services
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadModelContextParams {
+            thread_id: session.thread_id(),
+            include_archived: false,
+            rollout_path: Some(rollout_path),
+        })
+        .await
+        .expect("resume fresh materialized session");
+    assert_eq!(
+        resumed.diagnostics.outcome,
+        codex_thread_store::ResumeCheckpointOutcome::Hit
+    );
+    assert_eq!(resumed.diagnostics.suffix_items, 0);
+    assert!(resumed.diagnostics.source_bytes <= 512 * 1_024);
+    assert_eq!(resumed.items.len(), 1);
+}
+
+#[tokio::test]
+async fn incompatible_model_checkpoint_establishes_a_loud_clean_rebuild_boundary() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let rollout_path = attach_thread_persistence(&mut session).await;
+    session
+        .record_conversation_items(&turn_context, &[user_message("persisted user turn")])
+        .await;
+    session
+        .publish_current_materialized_resume_state(AgentStatus::Completed(None))
+        .await
+        .expect("publish model-bound checkpoint");
+    let checkpoint_path = session
+        .get_config()
+        .await
+        .codex_home
+        .join("materialized_resume_state_v5")
+        .join(format!("{}.json", session.thread_id()));
+    let mut loaded = session
+        .services
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadModelContextParams {
+            thread_id: session.thread_id(),
+            include_archived: false,
+            rollout_path: Some(rollout_path.clone()),
+        })
+        .await
+        .expect("load model-bound checkpoint");
+    // Only the truncation contract decides whether stored state is replayable; record a
+    // deliberately incompatible one together with the model that produced it.
+    {
+        let state = loaded
+            .materialized_resume
+            .as_mut()
+            .and_then(|resume| resume.state.as_mut())
+            .expect("materialized state");
+        state.materialized_model = "incompatible-model".to_string();
+        state.truncation_policy = match state.truncation_policy {
+            TruncationPolicy::Tokens(tokens) => TruncationPolicy::Tokens(tokens.saturating_add(1)),
+            other => {
+                panic!("test model is expected to use a token truncation contract, got {other:?}")
+            }
+        };
+    }
+
+    let error = session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: session.thread_id(),
+            history: Arc::new(loaded.items),
+            rollout_path: Some(rollout_path.clone()),
+            materialized_resume: loaded.materialized_resume.map(Box::new),
+        }))
+        .await
+        .expect_err("incompatible model state must require an explicit retry");
+    assert!(
+        error
+            .to_string()
+            .contains("codex_resume_state_needs_rebuild"),
+        "{error:#}"
+    );
+    assert!(!checkpoint_path.exists());
+
+    let rebuild = session
+        .services
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadModelContextParams {
+            thread_id: session.thread_id(),
+            include_archived: false,
+            rollout_path: Some(rollout_path),
+        })
+        .await
+        .expect("next explicit resume can reconstruct the canonical transcript");
+    assert_eq!(
+        rebuild.diagnostics.outcome,
+        codex_thread_store::ResumeCheckpointOutcome::Miss
+    );
+    assert!(rebuild.materialized_resume.is_some());
 }
 
 fn text_block(s: &str) -> serde_json::Value {
@@ -6968,6 +7148,7 @@ async fn resumed_root_session_uses_thread_id_as_session_id() {
             conversation_id: thread_id,
             history: Arc::new(Vec::new()),
             rollout_path: None,
+            materialized_resume: None,
         }),
         SessionSource::Exec,
         AgentControl::default(),
@@ -7011,6 +7192,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
                 git: None,
             })]),
             rollout_path: None,
+            materialized_resume: None,
         }),
         session_source,
         AgentControl::default(),
@@ -7064,6 +7246,7 @@ async fn resumed_copied_fork_ignores_source_history_base() {
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: None,
+            materialized_resume: None,
         }),
         SessionSource::Exec,
         AgentControl::default(),
@@ -12447,7 +12630,7 @@ async fn sample_rollout(
     let snapshot1 = raw_history_items(&live_history);
     let user_messages1 = collect_user_messages(&snapshot1);
     let rebuilt1 = compact::build_compacted_history(Vec::new(), &user_messages1, summary1);
-    live_history.replace_annotated(rebuilt1);
+    live_history.replace_annotated(rebuilt1.clone());
     let (window_number, window_ids) = session.advance_auto_compact_window().await;
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary1.to_string(),
@@ -12480,7 +12663,7 @@ async fn sample_rollout(
     let snapshot2 = raw_history_items(&live_history);
     let user_messages2 = collect_user_messages(&snapshot2);
     let rebuilt2 = compact::build_compacted_history(Vec::new(), &user_messages2, summary2);
-    live_history.replace_annotated(rebuilt2);
+    live_history.replace_annotated(rebuilt2.clone());
     let (window_number, window_ids) = session.advance_auto_compact_window().await;
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary2.to_string(),

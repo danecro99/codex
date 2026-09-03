@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codex_protocol::protocol::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -32,6 +33,58 @@ fn response_item_envelope_accessors_preserve_item() {
     *envelope = replacement_item.clone();
 
     assert_eq!(envelope.into_item(), replacement_item);
+}
+
+#[test]
+fn checkpoint_suffix_does_not_advertise_complete_initial_messages() {
+    let thread_id = ThreadId::new();
+    let window_id = ThreadId::new().to_string();
+    let history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(Vec::new()),
+        rollout_path: Some(PathBuf::from("rollout.jsonl")),
+        materialized_resume: Some(Box::new(MaterializedResume {
+            source: MaterializedResumeSource {
+                thread_id,
+                rollout_id: thread_id,
+                canonical_rollout_path: PathBuf::from("rollout.jsonl"),
+                history_mode: ThreadHistoryMode::Legacy,
+                end_byte_offset: 0,
+                end_ordinal_exclusive: None,
+                modified_unix_nanos: 0,
+                prefix_head_sha256: String::new(),
+                prefix_tail_sha256: String::new(),
+                append_generation: None,
+                lineage: Vec::new(),
+            },
+            state: Some(MaterializedResumeState {
+                version: MATERIALIZED_RESUME_STATE_VERSION,
+                materialized_model: "test-model".to_string(),
+                history: Arc::new(Vec::new()),
+                guardian_history: None,
+                previous_turn_settings: None,
+                reference_context_item: None,
+                world_state_baseline: None,
+                mcp_resource_origins: None,
+                owned_startup_cwd: None,
+                auto_compact_window: MaterializedAutoCompactWindow {
+                    window_number: 0,
+                    first_window_id: window_id.clone(),
+                    previous_window_id: None,
+                    window_id,
+                },
+                token_info: None,
+                latest_token_usage_record: None,
+                last_agent_status: None,
+                truncation_policy: TruncationPolicy::Tokens(128_000),
+                auto_compact_window_prefill_input_tokens: None,
+                has_prior_user_turns: false,
+            }),
+            max_state_bytes: Some(1),
+        })),
+    });
+
+    assert!(history.get_event_msgs().is_none());
 }
 
 #[test]
@@ -569,6 +622,7 @@ fn copied_history_uses_persisted_history_mode() -> Result<()> {
         conversation_id: thread_id,
         history: Arc::new(vec![session_meta.clone()]),
         rollout_path: None,
+        materialized_resume: None,
     });
 
     assert_eq!(
@@ -588,6 +642,7 @@ fn copied_history_uses_persisted_history_mode() -> Result<()> {
             conversation_id: thread_id,
             history: Arc::new(Vec::new()),
             rollout_path: None,
+            materialized_resume: None,
         })
         .get_history_mode(ThreadHistoryMode::Paginated),
         ThreadHistoryMode::Paginated

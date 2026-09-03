@@ -325,6 +325,23 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             return;
         }
     };
+    if let Err(err) = live_thread
+        .prepare_materialized_resume_state_rebuild()
+        .await
+    {
+        sess.send_event_raw(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
+                message: format!(
+                    "failed to invalidate derived resume state before rollback: {err}"
+                ),
+                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+            }),
+        })
+        .await;
+        return;
+    }
 
     let rollback_event = ThreadRolledBackEvent { num_turns };
     let rollback_msg = EventMsg::ThreadRolledBack(rollback_event.clone());
@@ -333,8 +350,25 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
-    sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
+    if let Err(err) = sess
+        .apply_rollout_reconstruction(
+            turn_context.as_ref(),
+            replay_items.as_slice(),
+            /*materialized_state*/ None,
+        )
+        .await
+    {
+        sess.send_event_raw(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
+                message: format!("failed to reconstruct history after rollback: {err}"),
+                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+            }),
+        })
         .await;
+        return;
+    }
     sess.services
         .thread_extension_data
         .remove::<NodeReplReviewEvidence>();

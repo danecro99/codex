@@ -103,6 +103,11 @@ pub(super) async fn emit_applied(
     submission_id: String,
     snapshot: ThreadSettingsSnapshot,
 ) {
+    // Resume reconstructs the thread's startup cwd from its own applied snapshots, so keep the
+    // live session's copy in step with what it is about to persist.
+    session
+        .set_owned_startup_cwd(snapshot.cwd.to_path_buf())
+        .await;
     let msg = EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
         thread_id: Some(session.thread_id()),
         thread_settings: snapshot,

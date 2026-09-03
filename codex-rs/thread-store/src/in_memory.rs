@@ -26,11 +26,13 @@ use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ListThreadsParams;
+use crate::LoadModelContextParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveThreadToSectionParams;
 use crate::PersistContext;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
+use crate::ResumeLoadDiagnostics;
 use crate::ResumeThreadParams;
 use crate::StoredModelContext;
 use crate::StoredThread;
@@ -638,7 +640,7 @@ impl InMemoryThreadStore {
 
     async fn load_latest_model_context(
         &self,
-        params: LoadThreadHistoryParams,
+        params: LoadModelContextParams,
     ) -> ThreadStoreResult<StoredModelContext> {
         let mut state = self.state.lock().await;
         state.calls.load_latest_model_context += 1;
@@ -652,6 +654,8 @@ impl InMemoryThreadStore {
         Ok(StoredModelContext {
             thread_id: params.thread_id,
             items: items.clone(),
+            materialized_resume: None,
+            diagnostics: ResumeLoadDiagnostics::default(),
         })
     }
 
@@ -903,7 +907,7 @@ impl ThreadStore for InMemoryThreadStore {
 
     fn load_latest_model_context(
         &self,
-        params: LoadThreadHistoryParams,
+        params: LoadModelContextParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(InMemoryThreadStore::load_latest_model_context(self, params))
     }

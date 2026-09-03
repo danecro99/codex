@@ -22,6 +22,8 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_rollout::MaterializedResume;
+use codex_rollout::MaterializedResumeState;
 use codex_rollout::RolloutItem;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -158,6 +160,23 @@ pub struct LoadThreadHistoryParams {
     pub include_archived: bool,
 }
 
+/// Parameters for reconstructing the latest model-visible context.
+///
+/// This is deliberately separate from [`LoadThreadHistoryParams`]: a model-context load may be
+/// bound to one exact rollout file, while history loads always address the logical thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadModelContextParams {
+    /// Thread whose model context is being reconstructed.
+    pub thread_id: ThreadId,
+    /// Whether archived threads are eligible.
+    pub include_archived: bool,
+    /// Exact local rollout path selected by a path-addressed resume.
+    ///
+    /// Stores that support this field must verify that the path belongs to `thread_id` rather than
+    /// resolving another rollout for the same logical thread.
+    pub rollout_path: Option<PathBuf>,
+}
+
 /// Persisted rollout history for a thread, without any filesystem path requirement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThreadHistory {
@@ -178,6 +197,50 @@ pub struct StoredModelContext {
     pub thread_id: ThreadId,
     /// Persisted rollout items in replay order.
     pub items: Vec<RolloutItem>,
+    /// Private checkpoint input and publication fence for Core reconstruction.
+    pub materialized_resume: Option<MaterializedResume>,
+    /// Read/replay measurements retained for focused acceptance tests and tracing.
+    pub diagnostics: ResumeLoadDiagnostics,
+}
+
+/// Bounded-read measurements for one resume-state load.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeLoadDiagnostics {
+    pub outcome: ResumeCheckpointOutcome,
+    pub source_bytes: u64,
+    pub source_items: u64,
+    pub checkpoint_bytes: u64,
+    pub checkpoint_items: u64,
+    pub suffix_bytes: u64,
+    pub suffix_items: u64,
+    pub scan_elapsed_millis: u64,
+    pub checkpoint_elapsed_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCheckpointOutcome {
+    Hit,
+    #[default]
+    Miss,
+}
+
+/// Publishes exact reconstructed state only if the loaded source fence still matches.
+#[derive(Clone, Debug)]
+pub struct PublishMaterializedResumeParams {
+    pub thread_id: ThreadId,
+    pub fence: MaterializedResumePublicationFence,
+    pub state: MaterializedResumeState,
+    pub max_state_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum MaterializedResumePublicationFence {
+    Loaded(Box<codex_rollout::MaterializedResumeSource>),
+    Current {
+        rollout_path: PathBuf,
+        history_mode: ThreadHistoryMode,
+    },
 }
 
 /// Requested boundary for inheriting a paginated thread's history.

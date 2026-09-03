@@ -18,6 +18,20 @@ use codex_protocol::protocol::InterAgentCommunication;
 
 pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &InitialHistory) -> bool {
     conversation_history.scan_rollout_items(rollout_item_is_user_turn_boundary)
+        || matches!(
+            conversation_history,
+            InitialHistory::Resumed(resumed)
+                if resumed
+                    .materialized_resume
+                    .as_ref()
+                    .and_then(|resume| resume.state.as_ref())
+                    .is_some_and(|state| {
+                        state
+                            .history
+                            .iter()
+                            .any(|item| is_user_turn_boundary(&item.item))
+                    })
+        )
 }
 
 fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {

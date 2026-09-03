@@ -160,6 +160,13 @@ pub(super) async fn shutdown_thread(
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
+    let append_generation_start = super::append_generation::begin_sync(
+        store,
+        thread_id,
+        rollout_id,
+        recorder.rollout_path(),
+        history_mode,
+    )?;
     if matches!(history_mode, ThreadHistoryMode::Legacy) {
         recorder.shutdown().await.map_err(thread_store_io_error)?;
     } else {
@@ -173,6 +180,10 @@ pub(super) async fn shutdown_thread(
         {
             warn!("failed to project durable rollout during shutdown for {thread_id}: {err}");
         }
+    }
+    if append_generation_start.started {
+        let finish_io = super::append_generation::finish_append(store, rollout_id)?;
+        record_append_generation_io(thread_id, rollout_id, append_generation_start.io, finish_io);
     }
     sync_materialized_rollout_path(store, thread_id, rollout_path.as_path()).await?;
     if let Some(metrics) = codex_otel::global()
@@ -328,13 +339,32 @@ async fn write_and_project(
         RolloutWriteOp::Persist => RolloutWriteOp::Persist,
         RolloutWriteOp::Flush => RolloutWriteOp::Flush,
     };
-    if matches!(history_mode, ThreadHistoryMode::Legacy) {
-        durable_write(&recorder, write_op).await?;
-    } else {
+    let append_generation_start = match &write_op {
+        RolloutWriteOp::AppendItems(items) => super::append_generation::begin_append(
+            store,
+            thread_id,
+            rollout_id,
+            recorder.rollout_path(),
+            history_mode,
+            items.as_slice(),
+        )?,
+        RolloutWriteOp::Persist | RolloutWriteOp::Flush => super::append_generation::begin_sync(
+            store,
+            thread_id,
+            rollout_id,
+            recorder.rollout_path(),
+            history_mode,
+        )?,
+    };
+    durable_write(&recorder, write_op).await?;
+    if append_generation_start.started {
+        let finish_io = super::append_generation::finish_append(store, rollout_id)?;
+        record_append_generation_io(thread_id, rollout_id, append_generation_start.io, finish_io);
+    }
+    if matches!(history_mode, ThreadHistoryMode::Paginated) {
         let rollout_path = recorder.rollout_path();
         // SQLite is a rebuildable view. The flush barrier must win before projection starts so it
         // can lag JSONL after failure, but can never get ahead of canonical history.
-        durable_write(&recorder, write_op).await?;
         if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
             store,
             rollout_id,
@@ -349,6 +379,35 @@ async fn write_and_project(
         sync_materialized_rollout_path(store, thread_id, recorder.rollout_path()).await?;
     }
     Ok(())
+}
+
+fn record_append_generation_io(
+    thread_id: ThreadId,
+    rollout_id: ThreadId,
+    start: super::append_generation::AppendGenerationIo,
+    finish: super::append_generation::AppendGenerationIo,
+) {
+    let source_bytes = start.source_bytes.saturating_add(finish.source_bytes);
+    let suffix_bytes = start.suffix_bytes.saturating_add(finish.suffix_bytes);
+    let suffix_items = start.suffix_items.saturating_add(finish.suffix_items);
+    tracing::info!(
+        thread_id = %thread_id,
+        rollout_id = %rollout_id,
+        source_bytes,
+        suffix_bytes,
+        suffix_items,
+        "advanced rollout append generation"
+    );
+    if let Some(metrics) = codex_otel::global() {
+        let tags = &[];
+        for (name, value) in [
+            ("codex.resume.append_source_bytes", source_bytes),
+            ("codex.resume.append_suffix_bytes", suffix_bytes),
+            ("codex.resume.append_suffix_items", suffix_items),
+        ] {
+            let _ = metrics.histogram(name, i64::try_from(value).unwrap_or(i64::MAX), tags);
+        }
+    }
 }
 
 async fn durable_write(recorder: &RolloutRecorder, write: RolloutWriteOp) -> ThreadStoreResult<()> {

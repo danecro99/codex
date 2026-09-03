@@ -19,7 +19,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::ForkBoundary;
-use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::LoadModelContextParams;
 use codex_thread_store::PrepareForkParams;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
@@ -163,9 +163,10 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
 
     // Follow the paginated resume path: load the latest checkpoint from disk, then resume core.
     let context = store
-        .load_latest_model_context(LoadThreadHistoryParams {
+        .load_latest_model_context(LoadModelContextParams {
             thread_id: child.thread_id,
             include_archived: false,
+            rollout_path: None,
         })
         .await?;
     let resumed = test
@@ -176,6 +177,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
                 conversation_id: context.thread_id,
                 history: Arc::new(context.items),
                 rollout_path: Some(child_path),
+                materialized_resume: context.materialized_resume.map(Box::new),
             }),
             codex_core::test_support::auth_manager_from_auth(codex_login::CodexAuth::from_api_key(
                 "dummy",

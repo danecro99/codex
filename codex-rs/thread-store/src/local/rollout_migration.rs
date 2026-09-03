@@ -71,7 +71,7 @@ use telemetry::RolloutMigrationTelemetry;
 use telemetry::RolloutMigrationTrigger;
 
 const PROJECTION_BATCH_BYTES: u64 = 256 * 1024;
-const MAX_ROLLOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_ROLLOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 enum CanonicalizationAttempt {
     Complete {
@@ -823,7 +823,7 @@ impl LocalThreadStore {
                     .map_err(migration_error)?;
             }
             sync_parent_directory(rollout_path).await?;
-            self.finish_published_migration(thread_id, journal_path, legacy_names)
+            self.finish_published_migration(thread_id, rollout_path, journal_path, legacy_names)
                 .await
         }
         .await;
@@ -1041,7 +1041,7 @@ impl LocalThreadStore {
         if let Some(decompressed_path) = decompressed_path.as_ref() {
             remove_file_if_present(decompressed_path).await?;
         }
-        self.finish_published_migration(thread_id, journal_path, legacy_names)
+        self.finish_published_migration(thread_id, rollout_path, journal_path, legacy_names)
             .await?;
         Ok(rollout_path.to_path_buf())
     }
@@ -1072,9 +1072,16 @@ impl LocalThreadStore {
     async fn finish_published_migration(
         &self,
         thread_id: ThreadId,
+        rollout_path: &Path,
         journal_path: &Path,
         legacy_names: &HashMap<ThreadId, String>,
     ) -> ThreadStoreResult<()> {
+        // Migration republishes the rollout as a new file. Its derived resume state describes the
+        // replaced bytes, so it is dropped here rather than left to fail a later fence check.
+        super::materialized_resume::remove(self, thread_id)?;
+        if let Some(rollout_id) = codex_rollout::rollout_id_from_path(rollout_path) {
+            super::append_generation::remove(self, rollout_id)?;
+        }
         self.promote_legacy_name(thread_id, legacy_names).await?;
         tokio::fs::remove_file(journal_path)
             .await

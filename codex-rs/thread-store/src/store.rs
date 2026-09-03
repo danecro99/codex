@@ -21,12 +21,14 @@ use crate::ListProjectsParams;
 use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
 use crate::ListTurnsParams;
+use crate::LoadModelContextParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveProjectParams;
 use crate::MoveThreadToSectionParams;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
+use crate::PublishMaterializedResumeParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::RenameThreadSectionParams;
@@ -149,11 +151,46 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Implementations that cannot perform a targeted read may return the full persisted history.
     fn load_latest_model_context(
         &self,
-        _params: LoadThreadHistoryParams,
+        _params: LoadModelContextParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(async {
             Err(ThreadStoreError::Unsupported {
                 operation: "load_latest_model_context",
+            })
+        })
+    }
+
+    /// Loads source replay for fork and metadata consumers without applying private resume state.
+    /// Stores that never return materialized resume state can use the ordinary implementation.
+    fn load_latest_model_context_for_replay(
+        &self,
+        params: LoadModelContextParams,
+    ) -> ThreadStoreFuture<'_, StoredModelContext> {
+        self.load_latest_model_context(params)
+    }
+
+    /// Atomically publishes a materialized resume state against its previously loaded source
+    /// fence. Stores that do not return a materialization fence never receive this call.
+    fn publish_materialized_resume_state(
+        &self,
+        _params: PublishMaterializedResumeParams,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "publish_materialized_resume_state",
+            })
+        })
+    }
+
+    /// Removes only private derived resume state so the next explicit resume can rebuild it from
+    /// the canonical transcript. Corrupt artifacts must not use this operation as a cache miss.
+    fn prepare_materialized_resume_state_rebuild(
+        &self,
+        _thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "prepare_materialized_resume_state_rebuild",
             })
         })
     }

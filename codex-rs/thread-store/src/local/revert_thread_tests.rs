@@ -1,11 +1,17 @@
+use std::sync::Arc;
+
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_rollout::MATERIALIZED_RESUME_STATE_VERSION;
+use codex_rollout::MaterializedAutoCompactWindow;
+use codex_rollout::MaterializedResumeState;
 use codex_rollout::RolloutItem;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -17,6 +23,8 @@ use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ListTurnsParams;
+use crate::MaterializedResumePublicationFence;
+use crate::PublishMaterializedResumeParams;
 use crate::RevertThreadParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
@@ -66,6 +74,45 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         /*new_thread_memory_mode*/ None,
     )
     .await;
+    let materialized_resume_path = home
+        .path()
+        .join("materialized_resume_state_v5")
+        .join(format!("{thread_id}.json"));
+    let window_id = ThreadId::new().to_string();
+    store
+        .publish_materialized_resume_state(PublishMaterializedResumeParams {
+            thread_id,
+            fence: MaterializedResumePublicationFence::Current {
+                rollout_path: original_path.clone(),
+                history_mode: ThreadHistoryMode::Paginated,
+            },
+            state: MaterializedResumeState {
+                version: MATERIALIZED_RESUME_STATE_VERSION,
+                materialized_model: "test-model".to_string(),
+                history: Arc::new(Vec::new()),
+                guardian_history: None,
+                previous_turn_settings: None,
+                reference_context_item: None,
+                world_state_baseline: None,
+                mcp_resource_origins: None,
+                owned_startup_cwd: None,
+                auto_compact_window: MaterializedAutoCompactWindow {
+                    window_number: 0,
+                    first_window_id: window_id.clone(),
+                    previous_window_id: None,
+                    window_id,
+                },
+                token_info: None,
+                latest_token_usage_record: None,
+                last_agent_status: None,
+                truncation_policy: TruncationPolicy::Tokens(128_000),
+                auto_compact_window_prefill_input_tokens: None,
+                has_prior_user_turns: false,
+            },
+            max_state_bytes: 64 * 1024 * 1024,
+        })
+        .await
+        .expect("publish valid materialized resume state");
     compress_rollout(original_path.as_path());
 
     store
@@ -75,6 +122,7 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         })
         .await
         .expect("revert before second turn");
+    assert!(!materialized_resume_path.exists());
     let first_replacement_path = state_db
         .get_thread(thread_id)
         .await

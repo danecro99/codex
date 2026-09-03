@@ -1102,6 +1102,7 @@ impl RolloutRecorder {
             conversation_id,
             history: Arc::new(items),
             rollout_path: Some(compression::plain_rollout_path(path)),
+            materialized_resume: None,
         }))
     }
 

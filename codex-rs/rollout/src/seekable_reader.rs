@@ -55,6 +55,33 @@ pub fn open_rollout_seekable_reader(path: &Path) -> io::Result<File> {
     }
 }
 
+/// Returns the logical JSONL length of a plain or compressed rollout.
+///
+/// Rollouts written by Codex pledge their source size, so the length comes from the frame header
+/// without decoding. Frames without a pledged size are decoded once to measure them, matching the
+/// bound-checking fallback in [`rollout_contains_prefix`].
+pub fn rollout_logical_len(path: &Path) -> io::Result<u64> {
+    match RolloutReader::open(path)? {
+        RolloutReader::Plain(file) => Ok(file.metadata()?.len()),
+        RolloutReader::Compressed(mut file) => {
+            // A zstd frame header occupies at most 18 bytes.
+            let mut header = [0; 18];
+            let read = file.read(&mut header)?;
+            if let Some(size) = zstd::zstd_safe::get_frame_content_size(&header[..read])
+                .ok()
+                .flatten()
+            {
+                return Ok(size);
+            }
+            file.rewind()?;
+            io::copy(
+                &mut zstd::stream::read::Decoder::new(file)?,
+                &mut io::sink(),
+            )
+        }
+    }
+}
+
 /// Checks a frozen prefix's byte bound using a blocking read of the logical JSONL representation.
 ///
 /// A known first-frame size is a lower bound even for concatenated zstd frames. New compressed
