@@ -6393,11 +6393,16 @@ pub(crate) async fn build_world_state_from_turn_context(
 // todo: use online model info
 pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let (tx_event, _rx_event) = async_channel::unbounded();
-    let codex_home = tempfile::tempdir().expect("create temp dir");
-    let config = build_test_config(codex_home.path()).await;
+    // The auth home must outlive this helper: `AuthManager` keeps only the path, and the
+    // isolated-auth-home contract canonicalizes it on every credential-store access.
+    let codex_home = tempfile::tempdir().expect("create temp dir").keep();
+    let config = build_test_config(&codex_home).await;
     let config = Arc::new(config);
     let thread_id = ThreadId::default();
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("Test API Key"),
+        codex_home,
+    );
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),

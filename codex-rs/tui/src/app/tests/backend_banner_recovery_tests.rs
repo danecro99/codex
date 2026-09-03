@@ -65,6 +65,9 @@ async fn backend_banner_limit_error_refreshes_again_after_intervening_rolling_ha
     )?;
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
     app.config.codex_home = home.path().to_path_buf().abs();
+    // Credentials live in the auth home, which tracks `codex_home` when
+    // `CODEX_AUTH_HOME` is unset, so relocate both together.
+    app.config.auth_home = home.path().to_path_buf().abs();
     app.config.chatgpt_base_url = server.uri();
     app.config.sqlite = codex_state::SqliteConfig::new_for_testing(home.path().abs());
     set_chatgpt_auth(&mut app.chat_widget);
