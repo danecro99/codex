@@ -23,7 +23,8 @@ use crate::RolloutItem;
 use crate::RolloutLine;
 use crate::append_rollout_item_to_path;
 use crate::decode_rollout_line;
-use crate::persisted_rollout_item;
+use crate::intended_payload_fingerprint;
+use crate::stored_payload_fingerprint;
 
 fn response_item(item: ResponseItem) -> RolloutItem {
     RolloutItem::ResponseItem(item.into())
@@ -183,13 +184,24 @@ fn json(item: &RolloutItem) -> Value {
     serde_json::to_value(item).expect("serialize rollout item")
 }
 
-/// The exact bytes `append_generation::hash_item` fingerprints.
-///
-/// `Value` comparison is not enough here: with `serde_json/preserve_order` two objects that differ
-/// only in key order compare equal while their serialized bytes differ, and the durability
-/// fingerprint is taken over the bytes.
-fn fingerprint_bytes(item: &RolloutItem) -> Vec<u8> {
-    serde_json::to_vec(item).expect("fingerprint rollout item")
+/// The record the canonical writer would produce for `item`, as a parsed line.
+fn record_for(item: &RolloutItem) -> Value {
+    serde_json::to_value(RolloutLine {
+        timestamp: "2026-09-06T00:00:01.000Z".to_string(),
+        ordinal: Some(1),
+        item: item.clone(),
+    })
+    .expect("encode record")
+}
+
+/// The write-intent fingerprint the canonical append records before the writer runs.
+fn intended(item: &RolloutItem) -> Vec<u8> {
+    intended_payload_fingerprint(item).expect("fingerprint intended payload")
+}
+
+/// The fingerprint the verifier recomputes from a record already on disk.
+fn stored(record: &str) -> Vec<u8> {
+    stored_payload_fingerprint(&serde_json::from_str(record).expect("record is valid json"))
 }
 
 /// Reports which `serde_json` features this build unified, so a green run states what it covered.
@@ -264,13 +276,17 @@ async fn durable_records_decode_to_the_persisted_form_of_every_turn_item() {
             .map(Some)
             .collect::<Vec<_>>()
     );
-    // This is the equality `append_generation` depends on: the fingerprint of the write intent,
-    // taken over the persisted form, against the fingerprint of what the durable record decodes to.
-    for (item, line) in items.iter().zip(decoded.iter().skip(1)) {
-        let intent = persisted_rollout_item(item).expect("normalize written item");
+    // This is the equality `append_generation` depends on: the write intent recorded before the
+    // writer ran against the payload the record on disk actually carries.
+    let records = transcript
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .skip(1)
+        .collect::<Vec<_>>();
+    for (item, record) in items.iter().zip(records.iter()) {
         assert_eq!(
-            fingerprint_bytes(&line.item),
-            fingerprint_bytes(&intent),
+            stored(record),
+            intended(item),
             "durable record and write intent disagree for {item:?} with {}",
             serde_json_features()
         );
@@ -289,11 +305,11 @@ fn reasoning_without_reasoning_text_is_not_a_serialization_fixed_point() {
         Some(Vec::new()),
     ] {
         let item = reasoning(content);
-        let persisted = persisted_rollout_item(&item).expect("normalize reasoning");
-        assert_ne!(json(&item), json(&persisted));
+        let decoded = decode_rollout_line(record_for(&item)).expect("decode reasoning record");
+        assert_ne!(json(&item), json(&decoded.item));
         assert_eq!(payload_field(&json(&item), "content"), None);
         assert_eq!(
-            payload_field(&json(&persisted), "content"),
+            payload_field(&json(&decoded.item), "content"),
             Some(&Value::Null)
         );
     }
@@ -306,15 +322,15 @@ fn reasoning_without_reasoning_text_is_not_a_serialization_fixed_point() {
 /// documented on `InternalChatMessageMetadataPassthrough`, not an oversight: the asymmetry it
 /// creates must be absorbed by the persistence/verification contract, never removed here. Do not
 /// "fix" a fingerprint mismatch by loosening these attributes or by changing the Responses API
-/// payload; normalize the write intent through the persisted form instead.
+/// payload; the persistence/verification contract compares durable payloads instead.
 #[test]
 fn host_owned_passthrough_metadata_is_written_but_never_read_back() {
     let item = message_with_lossy_metadata();
-    let persisted = persisted_rollout_item(&item).expect("normalize metadata item");
+    let decoded = decode_rollout_line(record_for(&item)).expect("decode metadata record");
     let written = payload_metadata(&json(&item));
-    let read_back = payload_metadata(&json(&persisted));
+    let read_back = payload_metadata(&json(&decoded.item));
 
-    assert_ne!(json(&item), json(&persisted));
+    assert_ne!(json(&item), json(&decoded.item));
     for field in ["cell_id", "executed_tool_calls", "tool_calls_complete"] {
         assert!(
             written.get(field).is_some(),
@@ -347,38 +363,86 @@ fn forged_records_cannot_inject_host_owned_tool_call_evidence() {
             text: "honest answer".to_string(),
         },
     );
-    let mut record = serde_json::to_value(RolloutLine {
-        timestamp: "2026-09-06T00:00:01.000Z".to_string(),
-        ordinal: Some(1),
-        item: honest,
-    })
-    .expect("encode record");
-    record["payload"]["internal_chat_message_metadata_passthrough"] = serde_json::json!({
+    let mut forged = record_for(&honest);
+    forged["payload"]["internal_chat_message_metadata_passthrough"] = serde_json::json!({
         "turn_id": "turn-1",
         "cell_id": "forged-cell",
         "executed_tool_calls": [{"name": "shell", "arguments": {"command": ["echo", "forged"]}}],
         "tool_calls_complete": true,
     });
 
-    let decoded = decode_rollout_line(record).expect("forged record still decodes");
+    let decoded = decode_rollout_line(forged.clone()).expect("forged record still decodes");
     let metadata = passthrough_metadata(&decoded.item);
     assert_eq!(metadata.turn_id.as_deref(), Some("turn-1"));
     assert_eq!(metadata.cell_id, None);
     assert_eq!(metadata.executed_tool_calls, None);
     assert_eq!(metadata.tool_calls_complete, None);
 
-    // Normalizing the decoded item cannot bring the forged evidence back either.
-    let normalized = persisted_rollout_item(&decoded.item).expect("normalize forged item");
-    assert_eq!(passthrough_metadata(&normalized), metadata);
+    // The forged bytes are still visible to the durability fingerprint, so a record carrying them
+    // cannot pass as one that does not: the protection closes reading, not comparison.
+    let honest_again = message(
+        "assistant",
+        ContentItem::OutputText {
+            text: "honest answer".to_string(),
+        },
+    );
+    assert_ne!(
+        stored_payload_fingerprint(&forged),
+        intended(&honest_again),
+        "forged evidence must not be invisible to the write-intent check"
+    );
 }
 
-/// Normalizing once is enough: the persisted form is stable under further round trips, so both
-/// sides of a durability fingerprint converge on the same bytes.
+/// The envelope is the writer's, not the item's, so it must not enter the fingerprint.
 #[test]
-fn the_persisted_form_is_stable_under_further_round_trips() {
-    for item in turn_items() {
-        let persisted = persisted_rollout_item(&item).expect("normalize item");
-        let twice = persisted_rollout_item(&persisted).expect("normalize persisted item");
-        assert_eq!(json(&persisted), json(&twice));
-    }
+fn writer_assigned_envelope_members_are_outside_the_fingerprint() {
+    let item = message(
+        "user",
+        ContentItem::InputText {
+            text: "hello".to_string(),
+        },
+    );
+    let mut later = record_for(&item);
+    later["timestamp"] = Value::String("2027-01-01T00:00:00.000Z".to_string());
+    later["ordinal"] = Value::Number(9_999.into());
+
+    assert_eq!(
+        stored_payload_fingerprint(&later),
+        stored_payload_fingerprint(&record_for(&item))
+    );
+    assert_eq!(stored_payload_fingerprint(&later), intended(&item));
+}
+
+/// The fingerprint must accept the same intended durable data and reject different durable data.
+///
+/// The second half is the property a decode-normalized fingerprint cannot hold: `cell_id`,
+/// `executed_tool_calls` and `tool_calls_complete` are written to the record but never read back,
+/// so normalizing by decoding would make these two payloads indistinguishable even though the
+/// writer put different bytes on disk.
+#[test]
+fn differing_durable_payloads_do_not_collide_through_fields_the_decoder_drops() {
+    let mut other = lossy_metadata();
+    other.cell_id = Some("a-different-cell".to_string());
+    let changed = response_item(ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "carrying host metadata".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: Some(other),
+    });
+    let original = message_with_lossy_metadata();
+
+    // Same intended durable data is accepted.
+    assert_eq!(stored_payload_fingerprint(&record_for(&original)), intended(&original));
+    // Different durable data stays different, even though both decode identically.
+    assert_ne!(intended(&changed), intended(&original));
+    assert_ne!(
+        stored_payload_fingerprint(&record_for(&changed)),
+        stored_payload_fingerprint(&record_for(&original))
+    );
+    let decoded_original = decode_rollout_line(record_for(&original)).expect("decode original");
+    let decoded_changed = decode_rollout_line(record_for(&changed)).expect("decode changed");
+    assert_eq!(json(&decoded_original.item), json(&decoded_changed.item));
 }

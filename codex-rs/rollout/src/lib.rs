@@ -9,6 +9,7 @@ use serde_json::Value;
 pub(crate) mod compression;
 pub(crate) mod config;
 pub(crate) mod list;
+mod durable_payload;
 mod maintenance;
 pub(crate) mod metadata;
 mod model_context;
@@ -73,25 +74,6 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
     })
 }
 
-/// Normalizes a rollout item into the exact value its persisted record decodes back to.
-///
-/// The canonical writer serializes items with [`RolloutItem`]'s `Serialize` impl and readers
-/// restore them with [`decode_rollout_line`]. That encoding deliberately does not carry every
-/// in-memory field: `ResponseItem::Reasoning::content` is dropped whenever it holds no
-/// `reasoning_text`, and the dropped field decodes back as `None`, which serializes again as an
-/// explicit `null`. Serialization is therefore not a fixed point, so a durability fingerprint
-/// taken over an in-memory item can never equal the fingerprint of the record it produced.
-///
-/// Producers that fingerprint a write intent before handing items to the writer must fingerprint
-/// this form so their intent is comparable with what the durable record decodes to.
-///
-/// This normalization absorbs the asymmetry; it must never be used to widen what a record can
-/// carry back in. Fields that are `skip_deserializing` on purpose, such as the host-owned
-/// tool-call evidence on `InternalChatMessageMetadataPassthrough`, stay dropped here exactly as
-/// they are when a record is decoded.
-pub fn persisted_rollout_item(item: &RolloutItem) -> serde_json::Result<RolloutItem> {
-    serde_json::from_value(serde_json::to_value(item)?)
-}
 
 pub const SESSIONS_SUBDIR: &str = "sessions";
 pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
@@ -105,6 +87,8 @@ pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock:
 });
 
 pub use codex_protocol::protocol::SessionMeta;
+pub use durable_payload::intended_payload_fingerprint;
+pub use durable_payload::stored_payload_fingerprint;
 pub use compression::RolloutLineReader;
 pub use compression::existing_rollout_path;
 pub use compression::open_rollout_line_reader;
