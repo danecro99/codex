@@ -2718,9 +2718,11 @@ impl Session {
     /// Tells the client once that this thread stopped producing durable history.
     ///
     /// Rollout persistence is otherwise fire-and-forget: without this the conversation keeps
-    /// rendering while nothing after the last durable record survives a resume. The report carries
-    /// no `codex_error_info` and does not touch the agent status, because the turn itself is still
-    /// running; only persistence is broken.
+    /// rendering while nothing after the last durable record survives a resume.
+    ///
+    /// The report is delivered but deliberately not persisted, so it cannot itself depend on the
+    /// storage that just failed and cannot enter replayed history. It also leaves the agent status
+    /// alone: the turn is still running, only persistence is broken.
     async fn report_durable_history_failure(&self, turn_id: &str, err: &anyhow::Error) {
         if self
             .durable_history_failure_reported

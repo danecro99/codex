@@ -6865,6 +6865,47 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     (session, turn_context)
 }
 
+/// A durable-history write failure must reach the client, exactly once, without ending the turn.
+///
+/// Rollout persistence is fire-and-forget everywhere else, so this report is the only thing that
+/// stops a thread from rendering normally while nothing it shows would survive a resume.
+#[tokio::test]
+async fn durable_history_failure_is_reported_to_the_client_once() -> anyhow::Result<()> {
+    let (session, rx_event) = make_session_with_config_and_rx(|_config| {}).await?;
+    let mut agent_status = session.agent_status.subscribe();
+    agent_status.mark_unchanged();
+
+    // Startup events are already queued; this test is about what the failure adds.
+    while rx_event.try_recv().is_ok() {}
+
+    let failure = anyhow::anyhow!("canonical rollout append was rolled back: {}", "test reason");
+    session
+        .report_durable_history_failure("turn-1", &failure)
+        .await;
+    session
+        .report_durable_history_failure("turn-2", &failure)
+        .await;
+
+    let event = rx_event.recv().await?;
+    assert_eq!(event.id, "turn-1");
+    let EventMsg::Error(error) = event.msg else {
+        panic!("expected an error event, got {:?}", event.msg);
+    };
+    assert!(
+        error.message.contains("no longer being saved to disk")
+            && error.message.contains("test reason"),
+        "{}",
+        error.message
+    );
+    // The turn itself is still running: this is delivered, never persisted, so it cannot enter
+    // history or move the agent status.
+    assert_eq!(error.codex_error_info, None);
+    assert!(!agent_status.has_changed()?);
+    // Only the first failure is reported; the rest stay in the log.
+    assert!(rx_event.is_empty());
+    Ok(())
+}
+
 async fn make_session_with_config(
     mutator: impl FnOnce(&mut Config),
 ) -> anyhow::Result<Arc<Session>> {
