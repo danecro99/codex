@@ -122,8 +122,27 @@ enum PendingAppendEvidence {
     ExactItems {
         item_count: u64,
         items_sha256: String,
+        /// Which fingerprint definition produced `items_sha256`.
+        #[serde(default)]
+        fingerprint: ItemsFingerprint,
     },
     Sync,
+}
+
+/// Identifies how a pending append's item fingerprint was computed.
+///
+/// A journal outlives the process that wrote it, so a release that changes what `items_sha256`
+/// covers cannot compare its own fingerprint against one an earlier release recorded. Naming the
+/// definition keeps that situation observable instead of silently reinterpreting an old value, and
+/// there is deliberately no path that verifies a superseded fingerprint.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ItemsFingerprint {
+    /// Recorded before durable payloads were fingerprinted. Absent from older journals entirely.
+    #[default]
+    Superseded,
+    /// Canonical durable payload bytes, the form [`summarize_suffix`] compares against.
+    DurablePayload,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -170,6 +189,7 @@ pub(super) fn begin_append(
         PendingAppendEvidence::ExactItems {
             item_count: u64::try_from(items.len()).unwrap_or(u64::MAX),
             items_sha256: hash_items(items)?,
+            fingerprint: ItemsFingerprint::DurablePayload,
         },
     )?;
     Ok(AppendGenerationStart { started, io })
@@ -460,6 +480,17 @@ fn recover_pending(
     };
     io.add_suffix(suffix.bytes_read, suffix.item_count);
     let evidence_error = match &pending.evidence {
+        // A superseded fingerprint cannot be recomputed here, so the suffix it describes is
+        // unverifiable and is rolled back like any other unverified suffix. There is no
+        // compatibility path that would accept it on the old definition.
+        PendingAppendEvidence::ExactItems { fingerprint, .. }
+            if *fingerprint != ItemsFingerprint::DurablePayload =>
+        {
+            Some(
+                "pending append was fingerprinted by a superseded release and cannot be verified"
+                    .to_string(),
+            )
+        }
         PendingAppendEvidence::ExactItems { item_count, .. }
             if suffix.item_count != *item_count =>
         {
@@ -855,9 +886,12 @@ fn summarize_suffix(
         }
         let value = serde_json::from_slice(line.as_slice())
             .map_err(|err| invalid(format!("pending append is corrupt: {err}")))?;
+        hash_payload(
+            &mut items_hasher,
+            codex_rollout::stored_payload_fingerprint(&value).as_slice(),
+        );
         let rollout_line = codex_rollout::decode_rollout_line(value)
             .map_err(|err| invalid(format!("pending append is invalid: {err}")))?;
-        hash_item(&mut items_hasher, &rollout_line.item)?;
         if history_mode == ThreadHistoryMode::Paginated {
             let expected =
                 next_ordinal.ok_or_else(|| invalid("missing paginated append ordinal"))?;
@@ -888,30 +922,27 @@ fn summarize_suffix(
 
 /// Fingerprints the write intent for a canonical append.
 ///
-/// [`summarize_suffix`] can only fingerprint what the durable records decode back to, so the
-/// intent must describe the same normalized form. Fingerprinting the raw in-memory items instead
-/// rejects faithful writes whenever the persisted encoding drops a field, which then truncates the
-/// suffix that was written correctly.
+/// Both this and [`summarize_suffix`] fingerprint the durable payload itself, so the intent
+/// describes exactly the records the writer is about to produce. Fingerprinting the in-memory item
+/// on one side and a decoded item on the other cannot agree, because the persisted encoding is not
+/// a serialization fixed point; normalizing the intent by decoding it would instead make payloads
+/// that differ only in `skip_deserializing` fields fingerprint the same.
 fn hash_items(items: &[RolloutItem]) -> ThreadStoreResult<String> {
     let mut hasher = Sha256::new();
     for item in items {
-        let persisted = codex_rollout::persisted_rollout_item(item).map_err(|err| {
+        let payload = codex_rollout::intended_payload_fingerprint(item).map_err(|err| {
             ThreadStoreError::Internal {
-                message: format!("failed to normalize canonical rollout append items: {err}"),
+                message: format!("failed to fingerprint canonical rollout append items: {err}"),
             }
         })?;
-        hash_item(&mut hasher, &persisted)?;
+        hash_payload(&mut hasher, payload.as_slice());
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn hash_item(hasher: &mut Sha256, item: &RolloutItem) -> ThreadStoreResult<()> {
-    let bytes = serde_json::to_vec(item).map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to fingerprint canonical rollout append items: {err}"),
-    })?;
-    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
-    hasher.update(bytes);
-    Ok(())
+fn hash_payload(hasher: &mut Sha256, payload: &[u8]) {
+    hasher.update(u64::try_from(payload.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(payload);
 }
 
 fn load_journal(

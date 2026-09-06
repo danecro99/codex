@@ -11,6 +11,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
@@ -115,6 +116,40 @@ fn function_call_output(call_id: &str) -> RolloutItem {
         }
         .into(),
     )
+}
+
+fn message_with_host_metadata(cell_id: &str) -> RolloutItem {
+    RolloutItem::ResponseItem(
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "same visible text".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    cell_id: Some(cell_id.to_string()),
+                    ..InternalChatMessageMetadataPassthrough::default()
+                },
+            ),
+        }
+        .into(),
+    )
+}
+
+/// What resume must hand back for `item`: exactly what its canonical record decodes to.
+fn durable_readback_form(item: &RolloutItem) -> RolloutItem {
+    codex_rollout::decode_rollout_line(
+        serde_json::to_value(RolloutLine {
+            timestamp: "2025-01-03T15:00:19Z".to_string(),
+            ordinal: Some(1),
+            item: item.clone(),
+        })
+        .expect("encode canonical record"),
+    )
+    .expect("decode canonical record")
+    .item
 }
 
 fn state() -> MaterializedResumeState {
@@ -398,13 +433,60 @@ async fn canonical_append_keeps_every_turn_item_shape_durable() {
     let expected = turn
         .iter()
         .map(|item| {
-            serde_json::to_value(
-                codex_rollout::persisted_rollout_item(item).expect("normalize appended item"),
-            )
-            .expect("serialize expected item")
+            serde_json::to_value(durable_readback_form(item)).expect("serialize expected item")
         })
         .collect::<Vec<_>>();
     assert_eq!(durable, expected);
+
+    // A resumed thread must be able to record a new turn and read that back too.
+    publish_loaded_state(&store, thread_id, &resumed).await;
+    let next_turn = vec![
+        user_message("and now?".to_string()),
+        reasoning(Some(vec![ReasoningItemContent::Text {
+            text: "more raw reasoning".to_string(),
+        }])),
+        assistant_message("still nothing".to_string()),
+    ];
+    for item in &next_turn {
+        append_with_generation(
+            &store,
+            thread_id,
+            path.as_path(),
+            ThreadHistoryMode::Paginated,
+            item,
+        )
+        .await;
+    }
+    let extended = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path),
+        },
+    )
+    .await
+    .expect("resume after a second turn");
+    assert_eq!(extended.diagnostics.outcome, ResumeCheckpointOutcome::Hit);
+    assert_eq!(
+        extended.diagnostics.suffix_items,
+        u64::try_from(next_turn.len()).expect("suffix items")
+    );
+    // The checkpoint published above already covers the first turn, so this resume replays only
+    // the records written after it.
+    let next_durable = extended
+        .items
+        .iter()
+        .skip(1)
+        .map(|item| serde_json::to_value(item).expect("serialize durable item"))
+        .collect::<Vec<_>>();
+    let next_expected = next_turn
+        .iter()
+        .map(|item| {
+            serde_json::to_value(durable_readback_form(item)).expect("serialize expected item")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(next_durable, next_expected);
 }
 
 #[tokio::test]
@@ -1046,6 +1128,155 @@ async fn torn_canonical_append_rolls_back_and_allows_the_next_operation() {
 /// A rejected canonical append truncates the durable suffix, but the live writer keeps the
 /// position it already advanced to. Without a barrier every later append is silently rolled back
 /// too, and the thread keeps running while nothing after the last durable record survives resume.
+/// A record that differs only in fields the decoder drops is still a different durable write.
+///
+/// `cell_id` is `skip_deserializing`, so both payloads decode identically. A write intent that
+/// normalized itself by decoding would accept the wrong record here; fingerprinting the durable
+/// payload rejects it, and the correctly restored prefix survives.
+#[tokio::test]
+async fn a_suffix_differing_only_in_undecodable_fields_is_still_rejected() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_021);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-21",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let loaded = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("load source");
+    publish_loaded_state(&store, thread_id, &loaded).await;
+    let stable_bytes = std::fs::read(path.as_path()).expect("read stable source");
+
+    let intended = message_with_host_metadata("intended-cell");
+    let written = message_with_host_metadata("substituted-cell");
+    assert_eq!(
+        serde_json::to_value(durable_readback_form(&intended)).expect("decode intended"),
+        serde_json::to_value(durable_readback_form(&written)).expect("decode written"),
+        "the two payloads must be indistinguishable after decoding"
+    );
+
+    assert!(
+        crate::local::append_generation::begin_append(
+            &store,
+            thread_id,
+            thread_id,
+            path.as_path(),
+            ThreadHistoryMode::Paginated,
+            std::slice::from_ref(&intended),
+        )
+        .expect("begin append")
+        .started
+    );
+    codex_rollout::append_rollout_item_to_path(path.as_path(), &written)
+        .await
+        .expect("write the substituted record");
+    let error = crate::local::append_generation::finish_append(&store, thread_id)
+        .expect_err("a substituted durable payload must be rejected");
+    assert!(
+        matches!(
+            &error,
+            ThreadStoreError::CanonicalAppendRolledBack { reason }
+                if reason.contains("canonical write intent")
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(path.as_path()).expect("read source after rollback"),
+        stable_bytes
+    );
+}
+
+/// A pending append recorded by a superseded fingerprint definition must not be verified here.
+#[tokio::test]
+async fn a_superseded_pending_fingerprint_is_rejected_rather_than_reinterpreted() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_022);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-22",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let loaded = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("load source");
+    publish_loaded_state(&store, thread_id, &loaded).await;
+    let stable_bytes = std::fs::read(path.as_path()).expect("read stable source");
+
+    let appended = user_message("written by the previous release".to_string());
+    assert!(
+        crate::local::append_generation::begin_append(
+            &store,
+            thread_id,
+            thread_id,
+            path.as_path(),
+            ThreadHistoryMode::Paginated,
+            std::slice::from_ref(&appended),
+        )
+        .expect("begin append")
+        .started
+    );
+    // Rewrite the journal as an earlier release left it: a pending fingerprint with no definition.
+    let journal_path = crate::local::append_generation::journal_path(&store, thread_id);
+    let mut journal: serde_json::Value = serde_json::from_slice(
+        std::fs::read(journal_path.as_path())
+            .expect("read journal")
+            .as_slice(),
+    )
+    .expect("journal is json");
+    let pending = journal
+        .get_mut("pending")
+        .and_then(|pending| pending.get_mut("evidence"))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("pending evidence");
+    assert!(pending.remove("fingerprint").is_some());
+    std::fs::write(
+        journal_path.as_path(),
+        serde_json::to_vec(&journal).expect("encode journal"),
+    )
+    .expect("write journal");
+
+    codex_rollout::append_rollout_item_to_path(path.as_path(), &appended)
+        .await
+        .expect("append the pending suffix");
+    let error = crate::local::append_generation::finish_append(&store, thread_id)
+        .expect_err("a superseded fingerprint cannot be verified");
+    assert!(
+        matches!(
+            &error,
+            ThreadStoreError::CanonicalAppendRolledBack { reason }
+                if reason.contains("superseded release")
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(path.as_path()).expect("read source after rollback"),
+        stable_bytes
+    );
+}
+
 #[tokio::test]
 async fn a_rolled_back_append_stops_the_live_writer_instead_of_poisoning_it() {
     let home = TempDir::new().expect("temp dir");
