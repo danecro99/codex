@@ -1198,6 +1198,90 @@ async fn a_suffix_differing_only_in_undecodable_fields_is_still_rejected() {
     );
 }
 
+/// A stable generation predates this release's pending fingerprint and must keep working.
+///
+/// The discriminator lives on the pending record only, so a journal that is not mid-append is
+/// byte-identical to what an earlier release wrote. It must accept new writes and resume with its
+/// identity, chain and anchors intact rather than being treated as defective history.
+#[tokio::test]
+async fn a_stable_generation_without_a_pending_fingerprint_keeps_working() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_023);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-23",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let loaded = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("load source");
+    publish_loaded_state(&store, thread_id, &loaded).await;
+
+    // A settled journal carries no fingerprint at all, so an earlier release wrote exactly this.
+    let journal_path = crate::local::append_generation::journal_path(&store, thread_id);
+    let settled = std::fs::read_to_string(journal_path.as_path()).expect("read journal");
+    assert!(!settled.contains("fingerprint"), "{settled}");
+    let identity: serde_json::Value = serde_json::from_str(settled.as_str()).expect("journal json");
+
+    append_with_generation(
+        &store,
+        thread_id,
+        path.as_path(),
+        ThreadHistoryMode::Paginated,
+        &user_message("written against the settled generation".to_string()),
+    )
+    .await;
+    let resumed = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path),
+        },
+    )
+    .await
+    .expect("resume after writing against a settled generation");
+    assert_eq!(resumed.diagnostics.outcome, ResumeCheckpointOutcome::Hit);
+    assert_eq!(resumed.diagnostics.suffix_items, 1);
+
+    let advanced: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(journal_path.as_path())
+            .expect("read advanced journal")
+            .as_str(),
+    )
+    .expect("advanced journal json");
+    assert_eq!(advanced["generation_id"], identity["generation_id"]);
+    assert_eq!(advanced["rollout_id"], identity["rollout_id"]);
+    assert_eq!(
+        advanced["canonical_rollout_path"],
+        identity["canonical_rollout_path"]
+    );
+    // The anchor keeps its own ancestry while its descendant pointer follows the new write.
+    for field in ["anchor_id", "checkpoint_thread_id", "generation", "chain_sha256"] {
+        assert_eq!(
+            advanced["checkpoint_anchors"][0][field],
+            identity["checkpoint_anchors"][0][field],
+            "{field}"
+        );
+    }
+    assert_ne!(
+        advanced["checkpoint_anchors"][0]["descendant_generation"],
+        identity["checkpoint_anchors"][0]["descendant_generation"]
+    );
+    assert_ne!(advanced["stable"], identity["stable"]);
+}
+
 /// A pending append recorded by a superseded fingerprint definition must not be verified here.
 #[tokio::test]
 async fn a_superseded_pending_fingerprint_is_rejected_rather_than_reinterpreted() {
@@ -1261,19 +1345,35 @@ async fn a_superseded_pending_fingerprint_is_rejected_rather_than_reinterpreted(
     codex_rollout::append_rollout_item_to_path(path.as_path(), &appended)
         .await
         .expect("append the pending suffix");
+    let suffix_bytes = std::fs::read(path.as_path()).expect("read source with pending suffix");
+    assert_ne!(suffix_bytes, stable_bytes);
+
     let error = crate::local::append_generation::finish_append(&store, thread_id)
         .expect_err("a superseded fingerprint cannot be verified");
     assert!(
-        matches!(
-            &error,
-            ThreadStoreError::CanonicalAppendRolledBack { reason }
-                if reason.contains("superseded release")
-        ),
+        error.to_string().contains("superseded release"),
+        "{error}"
+    );
+    // Refusal must not be destructive: the unverifiable suffix is left exactly where it is, so
+    // nothing is discarded on rules that never applied to it.
+    assert_eq!(
+        std::fs::read(path.as_path()).expect("read source after refusal"),
+        suffix_bytes
+    );
+    // The refusal is loud on every path, including plain recovery, not only when finishing.
+    let error = crate::local::append_generation::load_current(
+        &store,
+        thread_id,
+        path.as_path(),
+    )
+    .expect_err("recovery must refuse a superseded pending too");
+    assert!(
+        error.to_string().contains("superseded release"),
         "{error}"
     );
     assert_eq!(
-        std::fs::read(path.as_path()).expect("read source after rollback"),
-        stable_bytes
+        std::fs::read(path.as_path()).expect("read source after recovery refusal"),
+        suffix_bytes
     );
 }
 

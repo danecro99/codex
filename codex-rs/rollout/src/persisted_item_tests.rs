@@ -115,6 +115,22 @@ fn function_call() -> RolloutItem {
     })
 }
 
+/// A tool result stamped by the host through the real recording API, not by hand.
+fn host_stamped_function_call_output() -> RolloutItem {
+    let RolloutItem::ResponseItem(mut envelope) = function_call_output() else {
+        panic!("function_call_output builds a response item");
+    };
+    envelope.item.set_tool_call_cell_id("cell-7");
+    envelope
+        .item
+        .append_executed_tool_calls(vec![ExecutedToolCall::new(
+            "shell".to_string(),
+            serde_json::json!({"command": ["echo", "hi"]}),
+        )]);
+    envelope.item.mark_tool_calls_complete();
+    RolloutItem::ResponseItem(envelope)
+}
+
 fn function_call_output() -> RolloutItem {
     response_item(ResponseItem::FunctionCallOutput {
         id: None,
@@ -147,6 +163,7 @@ fn turn_items() -> Vec<RolloutItem> {
         reasoning(None),
         function_call(),
         function_call_output(),
+        host_stamped_function_call_output(),
         message_with_lossy_metadata(),
         tool_search_call_with_nested_value(),
         message(
@@ -391,6 +408,49 @@ fn forged_records_cannot_inject_host_owned_tool_call_evidence() {
         intended(&honest_again),
         "forged evidence must not be invisible to the write-intent check"
     );
+}
+
+/// A record carrying an unexpected extra member is a different durable payload.
+///
+/// Typed decoding ignores members it does not know, so an extra key is exactly the kind of
+/// difference a decode-normalized fingerprint would erase. The durable payload keeps it visible.
+#[test]
+fn an_extra_wire_member_is_a_different_durable_payload() {
+    let item = message(
+        "assistant",
+        ContentItem::OutputText {
+            text: "answer".to_string(),
+        },
+    );
+    let mut extended = record_for(&item);
+    extended["payload"]["unexpected_member"] = Value::String("injected".to_string());
+
+    assert_eq!(stored_payload_fingerprint(&record_for(&item)), intended(&item));
+    assert_ne!(stored_payload_fingerprint(&extended), intended(&item));
+    // The typed decoder still accepts the record, which is why the fingerprint has to catch it.
+    let decoded = decode_rollout_line(extended).expect("record still decodes");
+    assert_eq!(json(&decoded.item), json(&item));
+}
+
+/// Host-stamped tool results go through the same recording API the runtime uses.
+#[test]
+fn host_stamped_tool_results_reach_the_record_and_stay_comparable() {
+    let stamped = host_stamped_function_call_output();
+    let plain = function_call_output();
+    let record = record_for(&stamped);
+
+    let metadata = payload_metadata(&json(&stamped));
+    for field in ["cell_id", "executed_tool_calls", "tool_calls_complete"] {
+        assert!(metadata.get(field).is_some(), "{field} must be stamped");
+    }
+    // Same intended durable data still matches its record ...
+    assert_eq!(stored_payload_fingerprint(&record), intended(&stamped));
+    // ... while the stamping stays distinguishable to the fingerprint.
+    assert_ne!(intended(&stamped), intended(&plain));
+    // Decoding keeps the evidence out: every stamped field is gone, leaving only an empty
+    // metadata envelope, so the decoded item can no longer tell the two writes apart.
+    let decoded = decode_rollout_line(record).expect("decode stamped");
+    assert_eq!(payload_metadata(&json(&decoded.item)), serde_json::json!({}));
 }
 
 /// The envelope is the writer's, not the item's, so it must not enter the fingerprint.

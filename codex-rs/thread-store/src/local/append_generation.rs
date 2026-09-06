@@ -135,6 +135,11 @@ enum PendingAppendEvidence {
 /// covers cannot compare its own fingerprint against one an earlier release recorded. Naming the
 /// definition keeps that situation observable instead of silently reinterpreting an old value, and
 /// there is deliberately no path that verifies a superseded fingerprint.
+///
+/// The discriminator lives on the pending record alone, which is the only part of the journal the
+/// change affects. [`StableGeneration`] carries the raw suffix chain, the source position and the
+/// checkpoint anchors, none of which depend on this definition, so a journal that is not mid-append
+/// is unchanged by this release and needs no version transition.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ItemsFingerprint {
@@ -438,6 +443,17 @@ fn recover_pending(
     let Some(pending) = journal.pending.clone() else {
         return Ok(AppendGenerationIo::default());
     };
+    // A pending fingerprint this release cannot recompute is refused before anything is read or
+    // truncated. Rolling it back would destroy a suffix on rules that never applied to it, and
+    // reinterpreting it would be a silent dual-hash fallback. Only the pending record is affected:
+    // a journal whose generation is stable carries no fingerprint at all and stays fully usable.
+    if let PendingAppendEvidence::ExactItems { fingerprint, .. } = &pending.evidence
+        && *fingerprint != ItemsFingerprint::DurablePayload
+    {
+        return Err(invalid(
+            "pending append was fingerprinted by a superseded release; its suffix is neither verified nor discarded here",
+        ));
+    }
     let current_end = std::fs::metadata(journal.canonical_rollout_path.as_path())
         .map_err(source_error)?
         .len();
@@ -480,17 +496,6 @@ fn recover_pending(
     };
     io.add_suffix(suffix.bytes_read, suffix.item_count);
     let evidence_error = match &pending.evidence {
-        // A superseded fingerprint cannot be recomputed here, so the suffix it describes is
-        // unverifiable and is rolled back like any other unverified suffix. There is no
-        // compatibility path that would accept it on the old definition.
-        PendingAppendEvidence::ExactItems { fingerprint, .. }
-            if *fingerprint != ItemsFingerprint::DurablePayload =>
-        {
-            Some(
-                "pending append was fingerprinted by a superseded release and cannot be verified"
-                    .to_string(),
-            )
-        }
         PendingAppendEvidence::ExactItems { item_count, .. }
             if suffix.item_count != *item_count =>
         {
