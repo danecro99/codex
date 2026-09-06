@@ -75,6 +75,11 @@ pub(crate) struct Session {
     pub(super) fork_persistence: ForkPersistence,
     pub(super) forked_from_ordinal_exclusive: Option<u64>,
     pub(super) next_internal_sub_id: AtomicU64,
+    /// Set once this session has told the client that durable history stopped being written.
+    ///
+    /// Rollout persistence is fire-and-forget, so without this the conversation keeps rendering
+    /// normally while every later append fails and resume loses the transcript.
+    pub(super) durable_history_failure_reported: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -1524,6 +1529,7 @@ impl Session {
                 fork_persistence,
                 forked_from_ordinal_exclusive,
                 next_internal_sub_id: AtomicU64::new(0),
+                durable_history_failure_reported: AtomicBool::new(false),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

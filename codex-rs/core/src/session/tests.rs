@@ -6813,6 +6813,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         fork_persistence: ForkPersistence::Copied,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
+        durable_history_failure_reported: AtomicBool::new(false),
     };
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -9116,6 +9117,7 @@ where
         fork_persistence: ForkPersistence::Copied,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
+        durable_history_failure_reported: AtomicBool::new(false),
     });
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());

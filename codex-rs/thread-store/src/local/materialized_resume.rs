@@ -419,6 +419,12 @@ pub(super) async fn publish(
         )));
     }
     let _writer_guard = store.live_writer_locks.lock(params.thread_id).await;
+    // A checkpoint replaces the canonical replay on resume. If this thread's live writer already
+    // lost a rolled-back append, the state it would publish no longer matches durable history, so
+    // publishing it would present an incomplete transcript as healthy.
+    if let Ok(writer) = super::live_writer::live_writer_parts(store, params.thread_id).await {
+        writer.ensure_durable_history_intact()?;
+    }
     let existing_artifact = read_existing_artifact(store, params.thread_id)?;
     let mut current_source = match params.fence {
         MaterializedResumePublicationFence::Loaded(source) => {

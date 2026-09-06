@@ -6,14 +6,20 @@ use std::io::Write;
 use std::sync::Arc;
 
 use chrono::Utc;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_rollout::MATERIALIZED_RESUME_STATE_VERSION;
 use codex_rollout::MaterializedAutoCompactWindow;
@@ -25,11 +31,15 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::*;
+use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::DeleteThreadParams;
 use crate::LoadModelContextParams;
 use crate::ResumeCheckpointOutcome;
+use crate::ResumeThreadParams;
+use crate::ThreadPersistenceMetadata;
 use crate::ThreadStore;
+use crate::ThreadStoreError;
 use crate::local::model_context::load_latest_model_context;
 use crate::local::test_support::test_config;
 use crate::local::test_support::write_session_file_with_history_mode;
@@ -41,6 +51,66 @@ fn user_message(text: String) -> RolloutItem {
             role: "user".to_string(),
             content: vec![ContentItem::InputText { text }],
             phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    )
+}
+
+fn assistant_message(text: String) -> RolloutItem {
+    RolloutItem::ResponseItem(
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText { text }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    )
+}
+
+fn reasoning(content: Option<Vec<ReasoningItemContent>>) -> RolloutItem {
+    RolloutItem::ResponseItem(
+        ResponseItem::Reasoning {
+            id: Some(ResponseItemId::with_suffix("rs", "1")),
+            summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                text: "summary".to_string(),
+            }],
+            content,
+            encrypted_content: Some("encrypted".to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    )
+}
+
+fn function_call(call_id: &str) -> RolloutItem {
+    RolloutItem::ResponseItem(
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".to_string(),
+            namespace: None,
+            arguments: r#"{"command":["echo","hi"]}"#.to_string(),
+            encrypted_function_args: None,
+            call_id: call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    )
+}
+
+fn function_call_output(call_id: &str) -> RolloutItem {
+    RolloutItem::ResponseItem(
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id.to_string()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("hi\n".to_string()),
+                success: Some(true),
+            },
             internal_chat_message_metadata_passthrough: None,
         }
         .into(),
@@ -248,6 +318,93 @@ async fn second_unchanged_resume_reads_only_bounded_checkpoint_input() {
     assert!(replay.diagnostics.source_items > 2_000);
     assert!(replay.items.len() > 2_000);
     assert_eq!(replay.materialized_resume, None);
+}
+
+/// A turn's real item shapes must survive the canonical append and come back on resume.
+///
+/// The write intent is fingerprinted before the writer runs and re-checked against the decoded
+/// durable records, so any item whose persisted encoding differs from its in-memory form used to
+/// be rejected as a foreign write and truncated back off the transcript.
+#[tokio::test]
+async fn canonical_append_keeps_every_turn_item_shape_durable() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_019);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-19",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let first = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("first resume");
+    publish_loaded_state(&store, thread_id, &first).await;
+
+    let turn = vec![
+        user_message("what changed?".to_string()),
+        reasoning(Some(vec![ReasoningItemContent::Text {
+            text: "raw reasoning".to_string(),
+        }])),
+        reasoning(Some(Vec::new())),
+        reasoning(Some(vec![ReasoningItemContent::ReasoningText {
+            text: "visible reasoning".to_string(),
+        }])),
+        function_call("call-1"),
+        function_call_output("call-1"),
+        assistant_message("nothing changed".to_string()),
+    ];
+    for item in &turn {
+        append_with_generation(
+            &store,
+            thread_id,
+            path.as_path(),
+            ThreadHistoryMode::Paginated,
+            item,
+        )
+        .await;
+    }
+
+    let resumed = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("resume after appending a full turn");
+    assert_eq!(resumed.diagnostics.outcome, ResumeCheckpointOutcome::Hit);
+    assert_eq!(
+        resumed.diagnostics.suffix_items,
+        u64::try_from(turn.len()).expect("suffix items")
+    );
+    let durable = resumed
+        .items
+        .iter()
+        .skip(1)
+        .map(|item| serde_json::to_value(item).expect("serialize durable item"))
+        .collect::<Vec<_>>();
+    let expected = turn
+        .iter()
+        .map(|item| {
+            serde_json::to_value(
+                codex_rollout::persisted_rollout_item(item).expect("normalize appended item"),
+            )
+            .expect("serialize expected item")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(durable, expected);
 }
 
 #[tokio::test]
@@ -820,7 +977,10 @@ async fn torn_canonical_append_rolls_back_and_allows_the_next_operation() {
     file.sync_all().expect("sync torn suffix");
     let error = crate::local::append_generation::finish_append(&store, thread_id)
         .expect_err("the current torn append must fail after rollback");
-    assert!(error.to_string().contains("rolled back"), "{error}");
+    assert!(
+        matches!(error, ThreadStoreError::CanonicalAppendRolledBack { .. }),
+        "{error}"
+    );
     assert_eq!(
         std::fs::read(path.as_path()).expect("read recovered source"),
         stable_bytes
@@ -848,7 +1008,11 @@ async fn torn_canonical_append_rolls_back_and_allows_the_next_operation() {
     let error = crate::local::append_generation::finish_append(&store, thread_id)
         .expect_err("a valid but unknown suffix must roll back");
     assert!(
-        error.to_string().contains("canonical write intent"),
+        matches!(
+            &error,
+            ThreadStoreError::CanonicalAppendRolledBack { reason }
+                if reason.contains("canonical write intent")
+        ),
         "{error}"
     );
     assert_eq!(
@@ -877,6 +1041,109 @@ async fn torn_canonical_append_rolls_back_and_allows_the_next_operation() {
     .expect("resume after deterministic torn-append recovery");
     assert_eq!(resumed.diagnostics.outcome, ResumeCheckpointOutcome::Hit);
     assert_eq!(resumed.diagnostics.suffix_items, 1);
+}
+
+/// A rejected canonical append truncates the durable suffix, but the live writer keeps the
+/// position it already advanced to. Without a barrier every later append is silently rolled back
+/// too, and the thread keeps running while nothing after the last durable record survives resume.
+#[tokio::test]
+async fn a_rolled_back_append_stops_the_live_writer_instead_of_poisoning_it() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_020);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-20",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    store
+        .resume_thread(ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(path.clone()),
+            history: None,
+            include_archived: false,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("open the live writer");
+
+    // The live writer captured its ordinal when it opened the rollout. Another writer extending
+    // the same file leaves it one record behind, which is the state a rollback also produces.
+    codex_rollout::append_rollout_item_to_path(
+        path.as_path(),
+        &user_message("out-of-band record".to_string()),
+    )
+    .await
+    .expect("extend the rollout out of band");
+    let loaded = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("load the extended source");
+    publish_loaded_state(&store, thread_id, &loaded).await;
+    let durable_bytes = std::fs::read(path.as_path()).expect("read durable transcript");
+
+    let rejected = store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![user_message("first lost item".to_string())],
+        })
+        .await
+        .expect_err("a suffix written at a stale ordinal must be rejected");
+    assert!(
+        matches!(
+            &rejected,
+            ThreadStoreError::CanonicalAppendRolledBack { reason }
+                if reason.contains("pending append ordinal")
+        ),
+        "{rejected}"
+    );
+    assert_eq!(
+        std::fs::read(path.as_path()).expect("read transcript after rollback"),
+        durable_bytes
+    );
+
+    let repeated = store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![user_message("second lost item".to_string())],
+        })
+        .await
+        .expect_err("a writer that lost durable history must not keep appending");
+    assert_eq!(repeated.to_string(), rejected.to_string());
+    assert_eq!(
+        std::fs::read(path.as_path()).expect("read transcript after the barrier"),
+        durable_bytes
+    );
+
+    let source = loaded
+        .materialized_resume
+        .as_ref()
+        .expect("materialization fence")
+        .source
+        .clone();
+    let published = store
+        .publish_materialized_resume_state(PublishMaterializedResumeParams {
+            thread_id,
+            fence: MaterializedResumePublicationFence::Loaded(Box::new(source)),
+            state: state(),
+            max_state_bytes: 64 * 1024,
+        })
+        .await
+        .expect_err("a checkpoint must not present lost history as durable");
+    assert_eq!(published.to_string(), rejected.to_string());
 }
 
 #[tokio::test]
