@@ -386,7 +386,8 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             turn_context.as_ref(),
             EventMsg::Warning(WarningEvent {
                 message: format!(
-                    "Rolled the thread back, but failed to save the rollback marker. Codex will continue retrying. Error: {err}"
+                    "Rolled the thread back, but failed to save the rollback marker. {} Error: {err}",
+                    super::TRANSCRIPT_NOT_SAVED_HINT
                 ),
             }),
         )

@@ -148,11 +148,11 @@ struct LiveRecorderEntry {
     // so missing SQLite rows can still be seeded.
     history_mode: ThreadHistoryMode,
     writer_lock: WriterLockGuard,
-    // Set when a canonical append was rolled back. Rollback restores the rollout file to its last
-    // verified position, but this recorder keeps the position it had already advanced to, so every
-    // later append would either be rolled back again or leave an undetectable hole in durable
-    // history. Fail those appends with the original cause instead.
-    canonical_append_failure: Arc<OnceLock<String>>,
+    // Set once this writer can no longer justify where the rollout ends: either a canonical append
+    // was rolled back, or a write or its verification did not complete. Either way this recorder
+    // keeps a position the file may no longer have, so every later append would be rolled back
+    // again or leave an undetectable hole. Fail those appends with the original cause instead.
+    writer_stop: Arc<OnceLock<live_writer::WriterStop>>,
 }
 
 #[derive(Default)]
@@ -343,7 +343,7 @@ impl LocalThreadStore {
                     rollout_id,
                     history_mode,
                     writer_lock,
-                    canonical_append_failure: Arc::new(OnceLock::new()),
+                    writer_stop: Arc::new(OnceLock::new()),
                 });
                 Ok(())
             }

@@ -225,6 +225,7 @@ fn thread_section_store_error(
         error @ (ThreadStoreError::ThreadNotFound { .. }
         | ThreadStoreError::Conflict { .. }
         | ThreadStoreError::CanonicalAppendRolledBack { .. }
+        | ThreadStoreError::CanonicalWriteUnresolved { .. }
         | ThreadStoreError::Internal { .. }) => {
             let action = operation
                 .strip_prefix("threadSection/")
