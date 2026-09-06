@@ -160,13 +160,24 @@ pub(super) async fn shutdown_thread(
 ) -> ThreadStoreResult<()> {
     let mut pending_metadata = store.pending_thread_metadata.lock(thread_id).await;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    let writer = live_writer_parts(store, thread_id).await?;
     let LiveWriter {
         recorder,
         rollout_id,
         history_mode,
         ..
-    } = live_writer_parts(store, thread_id).await?;
+    } = &writer;
+    let (rollout_id, history_mode) = (*rollout_id, *history_mode);
     let rollout_path = recorder.rollout_path().to_path_buf();
+    // A stopped writer still has to release its handle and its lock; it just must not write. Any
+    // buffered item would land after a durable position this writer can no longer justify.
+    if writer.stopped() {
+        recorder.abandon().await;
+        store.live_recorders.lock().await.remove(&thread_id);
+        drop(_live_writer_guard);
+        let _ = pending_metadata.take();
+        return Ok(());
+    }
     let append_generation_start = super::append_generation::begin_sync(
         store,
         thread_id,
@@ -341,7 +352,24 @@ impl LiveWriter {
         let ThreadStoreError::CanonicalAppendRolledBack { reason } = err else {
             return;
         };
-        let _ = self.canonical_append_failure.set(reason.clone());
+        self.stop_writing(reason.clone());
+    }
+
+    /// Records why this writer stopped and makes the recorder refuse further writes.
+    ///
+    /// The marker and the recorder have to move together. Leaving the recorder live would let a
+    /// later append, a shutdown flush or a checkpoint publication act on a rollout whose durable
+    /// position this writer can no longer justify.
+    fn stop_writing(&self, reason: String) {
+        if self.canonical_append_failure.set(reason.clone()).is_ok() {
+            self.recorder
+                .disable_writes(&std::io::Error::other(reason));
+        }
+    }
+
+    /// Whether this writer already stopped.
+    fn stopped(&self) -> bool {
+        self.canonical_append_failure.get().is_some()
     }
 }
 
@@ -404,7 +432,14 @@ async fn write_and_project(
             history_mode,
         )?,
     };
-    durable_write(recorder, write_op).await?;
+    // An append whose durable write did not complete leaves this rollout's real end position
+    // unknown to the recorder: whatever it buffered is still queued and would be flushed against
+    // the next append's write intent. Stop the writer here rather than after the verification it
+    // never reached.
+    if let Err(err) = durable_write(recorder, write_op).await {
+        writer.stop_writing(format!("canonical rollout write did not complete: {err}"));
+        return Err(err);
+    }
     if append_generation_start.started {
         let finish_io =
             super::append_generation::finish_append(store, rollout_id).inspect_err(|err| {

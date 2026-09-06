@@ -358,7 +358,6 @@ use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::DeprecationNoticeEvent;
-use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -2720,6 +2719,13 @@ impl Session {
     /// Rollout persistence is otherwise fire-and-forget: without this the conversation keeps
     /// rendering while nothing after the last durable record survives a resume.
     ///
+    /// This is a warning rather than an error on purpose. `EventMsg::Error` is a turn-terminating
+    /// contract for its consumers: the app server clears the running turn and its pending input
+    /// before it ever inspects `codex_error_info`, and the TUI finalizes the turn and releases the
+    /// next queued input. Reporting a storage failure that way would end the turn for the client
+    /// while it keeps running here, which is a worse desynchronization than the silence it
+    /// replaces.
+    ///
     /// The report is delivered but deliberately not persisted, so it cannot itself depend on the
     /// storage that just failed and cannot enter replayed history. It also leaves the agent status
     /// alone: the turn is still running, only persistence is broken.
@@ -2732,12 +2738,10 @@ impl Session {
         }
         let event = Event {
             id: turn_id.to_string(),
-            msg: EventMsg::Error(ErrorEvent {
+            msg: EventMsg::Warning(WarningEvent {
                 message: format!(
-                    "Thread history is no longer being saved to disk: {err:#}. Anything after the last saved item will be missing if this thread is resumed."
+                    "This thread's history could not be saved to disk: {err:#}. Anything not already saved would be missing if this thread is resumed."
                 ),
-                codex_error_info: None,
-                misalignment: None,
             }),
         };
         if let Err(err) = self.tx_event.send(event).await {
@@ -4471,7 +4475,23 @@ impl Session {
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
         if let Err(err) = self.try_persist_rollout_items(items).await {
             error!("failed to record rollout items: {err:#}");
+            // Report from wherever the failure is first observed. Conversation items travel this
+            // path, so waiting for a later event append to fail would leave the first lost turn
+            // silent for as long as that append happens to succeed.
+            let turn_id = self.active_turn_id().await.unwrap_or_default();
+            self.report_durable_history_failure(turn_id.as_str(), &err)
+                .await;
         }
+    }
+
+    /// The turn a fire-and-forget persistence failure belongs to, when one is running.
+    async fn active_turn_id(&self) -> Option<String> {
+        self.active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|active| active.task.as_ref())
+            .map(|task| task.turn_context.sub_id.clone())
     }
 
     async fn try_persist_rollout_items(&self, items: &[RolloutItem]) -> anyhow::Result<()> {

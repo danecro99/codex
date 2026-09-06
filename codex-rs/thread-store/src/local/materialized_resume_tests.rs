@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::AppendThreadItemsParams;
+use crate::CreateThreadParams;
 use crate::ArchiveThreadParams;
 use crate::DeleteThreadParams;
 use crate::LoadModelContextParams;
@@ -1198,6 +1199,117 @@ async fn a_suffix_differing_only_in_undecodable_fields_is_still_rejected() {
     );
 }
 
+/// An append whose durable write never completed must not be followed by a stale write.
+///
+/// The recorder still holds whatever it buffered, so a later flush would place those items after a
+/// durable position this writer can no longer justify. Nothing may write again, a checkpoint may
+/// not be published, and shutdown must still release the handle without writing.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unresolved_durable_write_stops_the_writer_without_losing_cleanup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempDir::new().expect("temp dir");
+    let thread_id = ThreadId::new();
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    store
+        .create_thread(CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: codex_protocol::models::BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            initial_window_id: "window-1".to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("create thread");
+
+    // The rollout materializes lazily, so making its directory unwritable is a real IO failure at
+    // the writer rather than an injected hook.
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(sessions.as_path()).expect("sessions dir");
+    let original = std::fs::metadata(sessions.as_path())
+        .expect("sessions metadata")
+        .permissions();
+    std::fs::set_permissions(sessions.as_path(), std::fs::Permissions::from_mode(0o555))
+        .expect("make sessions read-only");
+
+    let first = store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![user_message("never reached disk".to_string())],
+        })
+        .await
+        .expect_err("the durable write cannot complete");
+
+    std::fs::set_permissions(sessions.as_path(), original).expect("restore sessions permissions");
+
+    // Even with the filesystem healthy again, this writer must not place its buffered items.
+    let second = store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![user_message("must not be written either".to_string())],
+        })
+        .await
+        .expect_err("a stopped writer must not resume writing");
+    assert!(
+        matches!(second, ThreadStoreError::CanonicalAppendRolledBack { .. }),
+        "first={first}, second={second}"
+    );
+    let published = store
+        .publish_materialized_resume_state(PublishMaterializedResumeParams {
+            thread_id,
+            fence: MaterializedResumePublicationFence::Current {
+                rollout_path: home.path().join("sessions/unresolved.jsonl"),
+                history_mode: ThreadHistoryMode::Legacy,
+            },
+            state: state(),
+            max_state_bytes: 64 * 1024,
+        })
+        .await
+        .expect_err("a checkpoint must not run ahead of an unresolved rollout");
+    assert_eq!(published.to_string(), second.to_string());
+
+    // Cleanup still happens, and it writes nothing.
+    let before = std::fs::read_dir(sessions.as_path())
+        .expect("read sessions")
+        .count();
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("a stopped writer must still release its handle");
+    assert_eq!(
+        std::fs::read_dir(sessions.as_path())
+            .expect("read sessions after shutdown")
+            .count(),
+        before
+    );
+    assert!(matches!(
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![user_message("after teardown".to_string())],
+            })
+            .await,
+        Err(ThreadStoreError::ThreadNotFound { .. })
+    ));
+}
+
 /// A stable generation predates this release's pending fingerprint and must keep working.
 ///
 /// The discriminator lives on the pending record only, so a journal that is not mid-append is
@@ -1342,6 +1454,27 @@ async fn a_superseded_pending_fingerprint_is_rejected_rather_than_reinterpreted(
     )
     .expect("write journal");
 
+    let journal_bytes = std::fs::read(
+        crate::local::append_generation::journal_path(&store, thread_id).as_path(),
+    )
+    .expect("read superseded journal");
+
+    // Even with nothing written yet the refusal must not clear the pending evidence.
+    let error = crate::local::append_generation::load_current(&store, thread_id, path.as_path())
+        .expect_err("an empty suffix must not silently clear a superseded pending");
+    assert!(error.to_string().contains("superseded release"), "{error}");
+    assert_eq!(
+        std::fs::read(
+            crate::local::append_generation::journal_path(&store, thread_id).as_path()
+        )
+        .expect("read journal after empty-suffix refusal"),
+        journal_bytes
+    );
+    assert_eq!(
+        std::fs::read(path.as_path()).expect("read source after empty-suffix refusal"),
+        stable_bytes
+    );
+
     codex_rollout::append_rollout_item_to_path(path.as_path(), &appended)
         .await
         .expect("append the pending suffix");
@@ -1374,6 +1507,14 @@ async fn a_superseded_pending_fingerprint_is_rejected_rather_than_reinterpreted(
     assert_eq!(
         std::fs::read(path.as_path()).expect("read source after recovery refusal"),
         suffix_bytes
+    );
+    // Nothing about the journal moved either: no stable advance, no anchor edit, no evidence clear.
+    assert_eq!(
+        std::fs::read(
+            crate::local::append_generation::journal_path(&store, thread_id).as_path()
+        )
+        .expect("read journal after refusals"),
+        journal_bytes
     );
 }
 

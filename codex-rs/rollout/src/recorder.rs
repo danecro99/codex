@@ -124,6 +124,10 @@ pub enum RolloutRecorderParams {
 
 enum RolloutCmd {
     AddItems(Vec<RolloutItem>),
+    /// Stop the writer without writing anything else, releasing its file handle.
+    Abandon {
+        ack: oneshot::Sender<()>,
+    },
     Persist {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
@@ -967,9 +971,33 @@ impl RolloutRecorder {
         self.rollout_path.as_path()
     }
 
+    /// Marks this recorder unusable so no later call can extend the rollout.
+    ///
+    /// The rollout's durable position is no longer known to match what this writer believes, so
+    /// every later write would be placed against a stale position. This describes this writer
+    /// instance only: a fresh recorder opened over the same rollout reads the real file state and
+    /// works normally.
+    pub fn disable_writes(&self, reason: &IoError) {
+        self.writer_task.mark_failed(reason);
+    }
+
+    /// Stops the writer task without writing anything else.
+    ///
+    /// Used to release a rollout whose durable state is unresolved, where flushing would append at
+    /// a position the caller can no longer justify.
+    pub async fn abandon(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(RolloutCmd::Abandon { ack: tx }).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+
     pub async fn record_canonical_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
         if items.is_empty() {
             return Ok(());
+        }
+        if let Some(err) = self.writer_task.terminal_failure() {
+            return Err(err);
         }
         self.tx
             .send(RolloutCmd::AddItems(items.to_vec()))
@@ -986,6 +1014,9 @@ impl RolloutRecorder {
     /// This is idempotent. If materialization fails, the recorder keeps all pending items in memory
     /// and a later `persist()` or `flush()` can retry opening and writing the rollout file.
     pub async fn persist(&self) -> std::io::Result<()> {
+        if let Some(err) = self.writer_task.terminal_failure() {
+            return Err(err);
+        }
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(RolloutCmd::Persist { ack: tx })
@@ -1007,6 +1038,9 @@ impl RolloutRecorder {
     /// If the first writer attempt fails, the writer drops and reopens the file handle before
     /// retrying. This returns an error only when that retry also fails or the writer task is gone.
     pub async fn flush(&self) -> std::io::Result<()> {
+        if let Some(err) = self.writer_task.terminal_failure() {
+            return Err(err);
+        }
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(RolloutCmd::Flush { ack: tx })
@@ -1714,6 +1748,13 @@ impl RolloutWriterState {
         self.write_pending_with_recovery("flush").await
     }
 
+    /// Releases the writer without flushing, discarding anything still buffered.
+    fn abandon(&mut self) {
+        self.pending_items.clear();
+        self.meta = None;
+        self.writer = None;
+    }
+
     async fn shutdown(&mut self) -> std::io::Result<()> {
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
@@ -1855,6 +1896,14 @@ async fn rollout_writer(
             }
             RolloutCmd::Flush { ack } => {
                 let _ = ack.send(state.flush().await);
+            }
+            RolloutCmd::Abandon { ack } => {
+                // The caller already knows this rollout's durable state is unresolved, so any
+                // buffered item would land at a position it can no longer justify. Drop them and
+                // release the handle instead of writing them.
+                state.abandon();
+                let _ = ack.send(());
+                break;
             }
             RolloutCmd::Shutdown { ack } => match state.shutdown().await {
                 Ok(()) => {
