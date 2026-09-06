@@ -425,7 +425,10 @@ fn an_extra_wire_member_is_a_different_durable_payload() {
     let mut extended = record_for(&item);
     extended["payload"]["unexpected_member"] = Value::String("injected".to_string());
 
-    assert_eq!(stored_payload_fingerprint(&record_for(&item)), intended(&item));
+    assert_eq!(
+        stored_payload_fingerprint(&record_for(&item)),
+        intended(&item)
+    );
     assert_ne!(stored_payload_fingerprint(&extended), intended(&item));
     // The typed decoder still accepts the record, which is why the fingerprint has to catch it.
     let decoded = decode_rollout_line(extended).expect("record still decodes");
@@ -450,7 +453,10 @@ fn host_stamped_tool_results_reach_the_record_and_stay_comparable() {
     // Decoding keeps the evidence out: every stamped field is gone, leaving only an empty
     // metadata envelope, so the decoded item can no longer tell the two writes apart.
     let decoded = decode_rollout_line(record).expect("decode stamped");
-    assert_eq!(payload_metadata(&json(&decoded.item)), serde_json::json!({}));
+    assert_eq!(
+        payload_metadata(&json(&decoded.item)),
+        serde_json::json!({})
+    );
 }
 
 /// The envelope is the writer's, not the item's, so it must not enter the fingerprint.
@@ -495,7 +501,10 @@ fn differing_durable_payloads_do_not_collide_through_fields_the_decoder_drops() 
     let original = message_with_lossy_metadata();
 
     // Same intended durable data is accepted.
-    assert_eq!(stored_payload_fingerprint(&record_for(&original)), intended(&original));
+    assert_eq!(
+        stored_payload_fingerprint(&record_for(&original)),
+        intended(&original)
+    );
     // Different durable data stays different, even though both decode identically.
     assert_ne!(intended(&changed), intended(&original));
     assert_ne!(

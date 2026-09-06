@@ -33,8 +33,8 @@ use uuid::Uuid;
 
 use super::*;
 use crate::AppendThreadItemsParams;
-use crate::CreateThreadParams;
 use crate::ArchiveThreadParams;
+use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::LoadModelContextParams;
 use crate::ResumeCheckpointOutcome;
@@ -1381,10 +1381,14 @@ async fn a_stable_generation_without_a_pending_fingerprint_keeps_working() {
         identity["canonical_rollout_path"]
     );
     // The anchor keeps its own ancestry while its descendant pointer follows the new write.
-    for field in ["anchor_id", "checkpoint_thread_id", "generation", "chain_sha256"] {
+    for field in [
+        "anchor_id",
+        "checkpoint_thread_id",
+        "generation",
+        "chain_sha256",
+    ] {
         assert_eq!(
-            advanced["checkpoint_anchors"][0][field],
-            identity["checkpoint_anchors"][0][field],
+            advanced["checkpoint_anchors"][0][field], identity["checkpoint_anchors"][0][field],
             "{field}"
         );
     }
@@ -1443,7 +1447,9 @@ async fn a_verification_that_cannot_complete_stops_the_writer_without_claiming_a
     let error = store
         .append_items(AppendThreadItemsParams {
             thread_id,
-            items: vec![user_message("must not follow an unverified write".to_string())],
+            items: vec![user_message(
+                "must not follow an unverified write".to_string(),
+            )],
         })
         .await
         .expect_err("the writer must not continue after an incomplete verification");
@@ -1452,7 +1458,9 @@ async fn a_verification_that_cannot_complete_stops_the_writer_without_claiming_a
         "{error}"
     );
     assert!(
-        error.to_string().contains("failed to restore the exact stable prefix"),
+        error
+            .to_string()
+            .contains("failed to restore the exact stable prefix"),
         "the original cause must survive: {error}"
     );
     assert_eq!(
@@ -1531,20 +1539,17 @@ async fn a_superseded_pending_fingerprint_is_rejected_rather_than_reinterpreted(
     )
     .expect("write journal");
 
-    let journal_bytes = std::fs::read(
-        crate::local::append_generation::journal_path(&store, thread_id).as_path(),
-    )
-    .expect("read superseded journal");
+    let journal_bytes =
+        std::fs::read(crate::local::append_generation::journal_path(&store, thread_id).as_path())
+            .expect("read superseded journal");
 
     // Even with nothing written yet the refusal must not clear the pending evidence.
     let error = crate::local::append_generation::load_current(&store, thread_id, path.as_path())
         .expect_err("an empty suffix must not silently clear a superseded pending");
     assert!(error.to_string().contains("superseded release"), "{error}");
     assert_eq!(
-        std::fs::read(
-            crate::local::append_generation::journal_path(&store, thread_id).as_path()
-        )
-        .expect("read journal after empty-suffix refusal"),
+        std::fs::read(crate::local::append_generation::journal_path(&store, thread_id).as_path())
+            .expect("read journal after empty-suffix refusal"),
         journal_bytes
     );
     assert_eq!(
@@ -1560,10 +1565,7 @@ async fn a_superseded_pending_fingerprint_is_rejected_rather_than_reinterpreted(
 
     let error = crate::local::append_generation::finish_append(&store, thread_id)
         .expect_err("a superseded fingerprint cannot be verified");
-    assert!(
-        error.to_string().contains("superseded release"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("superseded release"), "{error}");
     // Refusal must not be destructive: the unverifiable suffix is left exactly where it is, so
     // nothing is discarded on rules that never applied to it.
     assert_eq!(
@@ -1571,26 +1573,17 @@ async fn a_superseded_pending_fingerprint_is_rejected_rather_than_reinterpreted(
         suffix_bytes
     );
     // The refusal is loud on every path, including plain recovery, not only when finishing.
-    let error = crate::local::append_generation::load_current(
-        &store,
-        thread_id,
-        path.as_path(),
-    )
-    .expect_err("recovery must refuse a superseded pending too");
-    assert!(
-        error.to_string().contains("superseded release"),
-        "{error}"
-    );
+    let error = crate::local::append_generation::load_current(&store, thread_id, path.as_path())
+        .expect_err("recovery must refuse a superseded pending too");
+    assert!(error.to_string().contains("superseded release"), "{error}");
     assert_eq!(
         std::fs::read(path.as_path()).expect("read source after recovery refusal"),
         suffix_bytes
     );
     // Nothing about the journal moved either: no stable advance, no anchor edit, no evidence clear.
     assert_eq!(
-        std::fs::read(
-            crate::local::append_generation::journal_path(&store, thread_id).as_path()
-        )
-        .expect("read journal after refusals"),
+        std::fs::read(crate::local::append_generation::journal_path(&store, thread_id).as_path())
+            .expect("read journal after refusals"),
         journal_bytes
     );
 }
