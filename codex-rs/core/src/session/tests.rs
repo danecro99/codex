@@ -6572,7 +6572,13 @@ pub(crate) async fn build_world_state_from_turn_context(
 
 // todo: use online model info
 pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
-    let (tx_event, _rx_event) = async_channel::unbounded();
+    let (session, turn_context, _rx_event) = make_session_and_context_and_event_rx().await;
+    (session, turn_context)
+}
+
+async fn make_session_and_context_and_event_rx()
+-> (Session, TurnContext, async_channel::Receiver<Event>) {
+    let (tx_event, rx_event) = async_channel::unbounded();
     // The auth home must outlive this helper: `AuthManager` keeps only the path, and the
     // isolated-auth-home contract canonicalizes it on every credential-store access.
     let codex_home = tempfile::tempdir().expect("create temp dir").keep();
@@ -6862,13 +6868,66 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         skills_snapshot,
     );
     session.mark_mcp_runtime_dirty();
-    (session, turn_context)
+    (session, turn_context, rx_event)
 }
 
-/// A durable-history write failure must reach the client, exactly once, without ending the turn.
+/// The first failing conversation-item append must reach the client, and must not end the turn.
 ///
-/// Rollout persistence is fire-and-forget everywhere else, so this report is the only thing that
-/// stops a thread from rendering normally while nothing it shows would survive a resume.
+/// This drives the real source: `persist_rollout_items` carries `ResponseItem`s and is
+/// fire-and-forget, so a failure there is the first thing a user would lose. The report has to be
+/// a warning, because `EventMsg::Error` is a turn-terminating contract for its consumers - the app
+/// server clears the running turn and its pending input before it looks at `codex_error_info`, and
+/// the TUI finalizes the turn and releases the next queued input - which would desynchronize the
+/// client from a turn that is still running here.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failing_response_item_append_warns_the_client_without_ending_the_turn()
+-> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut session, _turn_context, rx_event) = make_session_and_context_and_event_rx().await;
+    let config = session.get_config().await;
+    open_thread_persistence(&mut session).await;
+    while rx_event.try_recv().is_ok() {}
+
+    // Make the rollout directory unwritable so the append fails for a real IO reason.
+    let sessions = config.codex_home.to_path_buf().join("sessions");
+    std::fs::create_dir_all(sessions.as_path())?;
+    let original = std::fs::metadata(sessions.as_path())?.permissions();
+    std::fs::set_permissions(sessions.as_path(), std::fs::Permissions::from_mode(0o555))?;
+
+    session
+        .persist_rollout_items(&[RolloutItem::ResponseItem(
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "this answer is not durable".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        )])
+        .await;
+
+    std::fs::set_permissions(sessions.as_path(), original)?;
+
+    let event = rx_event.recv().await?;
+    let EventMsg::Warning(warning) = event.msg else {
+        panic!("a persistence failure must not end the turn: {:?}", event.msg);
+    };
+    assert!(
+        warning.message.contains("could not be saved to disk"),
+        "{}",
+        warning.message
+    );
+    // Nothing else is emitted, so the client's turn is neither finalized nor drained here.
+    assert!(rx_event.is_empty());
+    Ok(())
+}
+
+/// The report is emitted once per session and leaves the agent status alone.
 #[tokio::test]
 async fn durable_history_failure_is_reported_to_the_client_once() -> anyhow::Result<()> {
     let (session, rx_event) = make_session_with_config_and_rx(|_config| {}).await?;
@@ -6888,18 +6947,17 @@ async fn durable_history_failure_is_reported_to_the_client_once() -> anyhow::Res
 
     let event = rx_event.recv().await?;
     assert_eq!(event.id, "turn-1");
-    let EventMsg::Error(error) = event.msg else {
-        panic!("expected an error event, got {:?}", event.msg);
+    let EventMsg::Warning(warning) = event.msg else {
+        panic!("expected a warning event, got {:?}", event.msg);
     };
     assert!(
-        error.message.contains("no longer being saved to disk")
-            && error.message.contains("test reason"),
+        warning.message.contains("could not be saved to disk")
+            && warning.message.contains("test reason"),
         "{}",
-        error.message
+        warning.message
     );
     // The turn itself is still running: this is delivered, never persisted, so it cannot enter
     // history or move the agent status.
-    assert_eq!(error.codex_error_info, None);
     assert!(!agent_status.has_changed()?);
     // Only the first failure is reported; the rest stay in the log.
     assert!(rx_event.is_empty());
