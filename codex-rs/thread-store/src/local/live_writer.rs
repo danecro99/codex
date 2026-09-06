@@ -324,12 +324,40 @@ enum RolloutWriteOp {
     Flush,
 }
 
+/// Why a live writer stopped extending durable history.
+///
+/// The two cases are not interchangeable. One is a verified rejection whose suffix was restored;
+/// the other is a write whose durable outcome nobody established. Reporting the second as the
+/// first would claim a rollback that never happened.
+#[derive(Clone, Debug)]
+pub(super) enum WriterStop {
+    /// A canonical append was verified, rejected and rolled back off the transcript.
+    RolledBack { reason: String },
+    /// A canonical write or its verification did not complete, leaving the end position unknown.
+    Unresolved { reason: String },
+}
+
+impl WriterStop {
+    fn into_error(self) -> ThreadStoreError {
+        match self {
+            Self::RolledBack { reason } => ThreadStoreError::CanonicalAppendRolledBack { reason },
+            Self::Unresolved { reason } => ThreadStoreError::CanonicalWriteUnresolved { reason },
+        }
+    }
+
+    fn reason(&self) -> &str {
+        match self {
+            Self::RolledBack { reason } | Self::Unresolved { reason } => reason.as_str(),
+        }
+    }
+}
+
 /// The live rollout writer installed for a thread, plus the state a caller needs to use it.
 pub(super) struct LiveWriter {
     pub(super) recorder: RolloutRecorder,
     pub(super) rollout_id: ThreadId,
     pub(super) history_mode: ThreadHistoryMode,
-    canonical_append_failure: Arc<OnceLock<String>>,
+    writer_stop: Arc<OnceLock<WriterStop>>,
 }
 
 impl LiveWriter {
@@ -340,19 +368,29 @@ impl LiveWriter {
     /// append back again or, in legacy mode, silently leave a hole in durable history, so report
     /// the original cause instead of writing or publishing anything.
     pub(super) fn ensure_durable_history_intact(&self) -> ThreadStoreResult<()> {
-        match self.canonical_append_failure.get() {
-            Some(reason) => Err(ThreadStoreError::CanonicalAppendRolledBack {
-                reason: reason.clone(),
-            }),
+        match self.writer_stop.get() {
+            Some(stop) => Err(stop.clone().into_error()),
             None => Ok(()),
         }
     }
 
-    fn record_canonical_append_failure(&self, err: &ThreadStoreError) {
-        let ThreadStoreError::CanonicalAppendRolledBack { reason } = err else {
-            return;
+    /// Stops this writer after a canonical append failed to complete its verification.
+    ///
+    /// Every failure here has to stop it, not only a verified rejection. `rollback_pending_suffix`
+    /// truncates the suffix before it syncs, re-reads the position and rewrites the journal, so a
+    /// later I/O failure escapes as a plain internal error with the file already shortened and the
+    /// recorder already advanced. Leaving that case running is exactly the stale-ordinal follow-up
+    /// write the barrier exists to prevent.
+    pub(super) fn stop_after_failed_verification(&self, err: &ThreadStoreError) {
+        let stop = match err {
+            ThreadStoreError::CanonicalAppendRolledBack { reason } => WriterStop::RolledBack {
+                reason: reason.clone(),
+            },
+            err => WriterStop::Unresolved {
+                reason: format!("canonical append verification did not complete: {err}"),
+            },
         };
-        self.stop_writing(reason.clone());
+        self.stop_writing(stop);
     }
 
     /// Records why this writer stopped and makes the recorder refuse further writes.
@@ -360,16 +398,16 @@ impl LiveWriter {
     /// The marker and the recorder have to move together. Leaving the recorder live would let a
     /// later append, a shutdown flush or a checkpoint publication act on a rollout whose durable
     /// position this writer can no longer justify.
-    fn stop_writing(&self, reason: String) {
-        if self.canonical_append_failure.set(reason.clone()).is_ok() {
-            self.recorder
-                .disable_writes(&std::io::Error::other(reason));
+    fn stop_writing(&self, stop: WriterStop) {
+        let reason = std::io::Error::other(stop.reason().to_string());
+        if self.writer_stop.set(stop).is_ok() {
+            self.recorder.disable_writes(&reason);
         }
     }
 
     /// Whether this writer already stopped.
     fn stopped(&self) -> bool {
-        self.canonical_append_failure.get().is_some()
+        self.writer_stop.get().is_some()
     }
 }
 
@@ -385,7 +423,7 @@ pub(super) async fn live_writer_parts(
         recorder: entry.recorder.clone(),
         rollout_id: entry.rollout_id,
         history_mode: entry.history_mode,
-        canonical_append_failure: Arc::clone(&entry.canonical_append_failure),
+        writer_stop: Arc::clone(&entry.writer_stop),
     })
 }
 
@@ -437,13 +475,15 @@ async fn write_and_project(
     // the next append's write intent. Stop the writer here rather than after the verification it
     // never reached.
     if let Err(err) = durable_write(recorder, write_op).await {
-        writer.stop_writing(format!("canonical rollout write did not complete: {err}"));
+        writer.stop_writing(WriterStop::Unresolved {
+            reason: err.to_string(),
+        });
         return Err(err);
     }
     if append_generation_start.started {
         let finish_io =
             super::append_generation::finish_append(store, rollout_id).inspect_err(|err| {
-                writer.record_canonical_append_failure(err);
+                writer.stop_after_failed_verification(err);
             })?;
         record_append_generation_io(thread_id, rollout_id, append_generation_start.io, finish_io);
     }

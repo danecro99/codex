@@ -498,6 +498,14 @@ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
+/// Shared tail for every warning about a transcript that could not be written.
+///
+/// A persistence failure stops this thread's writer, so promising that Codex will keep retrying is
+/// false. It also does not promise that restarting heals anything: whatever was not written is
+/// simply not there.
+pub(crate) const TRANSCRIPT_NOT_SAVED_HINT: &str =
+    "Anything not already saved would be missing if this thread is resumed.";
+
 impl Session {
     /// Spawn and initialize a new session.
     /// Hide the concrete startup future from callers while keeping initialization lazy.
@@ -2740,7 +2748,7 @@ impl Session {
             id: turn_id.to_string(),
             msg: EventMsg::Warning(WarningEvent {
                 message: format!(
-                    "This thread's history could not be saved to disk: {err:#}. Anything not already saved would be missing if this thread is resumed."
+                    "This thread's history could not be saved to disk: {err:#}. {TRANSCRIPT_NOT_SAVED_HINT}"
                 ),
             }),
         };

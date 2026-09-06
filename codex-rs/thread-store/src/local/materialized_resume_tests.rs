@@ -1267,8 +1267,9 @@ async fn an_unresolved_durable_write_stops_the_writer_without_losing_cleanup() {
         })
         .await
         .expect_err("a stopped writer must not resume writing");
+    // Nothing was verified and nothing was rolled back here, so the error must not claim one.
     assert!(
-        matches!(second, ThreadStoreError::CanonicalAppendRolledBack { .. }),
+        matches!(second, ThreadStoreError::CanonicalWriteUnresolved { .. }),
         "first={first}, second={second}"
     );
     let published = store
@@ -1392,6 +1393,82 @@ async fn a_stable_generation_without_a_pending_fingerprint_keeps_working() {
         identity["checkpoint_anchors"][0]["descendant_generation"]
     );
     assert_ne!(advanced["stable"], identity["stable"]);
+}
+
+/// A verification that fails on the way to rolling back still has to stop the writer.
+///
+/// `rollback_pending_suffix` truncates before it syncs, re-reads the position and rewrites the
+/// journal, so an I/O failure anywhere after that escapes as a plain internal error rather than as
+/// a rejection. The suffix is already written and the recorder has already advanced, so stopping
+/// only on a rejection left the same stale writer running. The failure is injected as the error
+/// value the verification would return, because its real window is inside a single append call.
+#[tokio::test]
+async fn a_verification_that_cannot_complete_stops_the_writer_without_claiming_a_rollback() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_024);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-24",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    store
+        .resume_thread(ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(path.clone()),
+            history: None,
+            include_archived: false,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("open the live writer");
+    let durable_bytes = std::fs::read(path.as_path()).expect("read durable transcript");
+
+    // Exactly what `finish_append` hands back when the rollback itself cannot finish: the suffix
+    // may already be truncated, and this is not a verified rejection.
+    crate::local::live_writer::live_writer_parts(&store, thread_id)
+        .await
+        .expect("live writer")
+        .stop_after_failed_verification(&ThreadStoreError::Internal {
+            message: "failed to restore the exact stable prefix after a torn append".to_string(),
+        });
+
+    let error = store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![user_message("must not follow an unverified write".to_string())],
+        })
+        .await
+        .expect_err("the writer must not continue after an incomplete verification");
+    assert!(
+        matches!(error, ThreadStoreError::CanonicalWriteUnresolved { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("failed to restore the exact stable prefix"),
+        "the original cause must survive: {error}"
+    );
+    assert_eq!(
+        std::fs::read(path.as_path()).expect("read transcript after the barrier"),
+        durable_bytes
+    );
+
+    // Cleanup still releases the writer without writing.
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("a stopped writer must still release its handle");
+    assert_eq!(
+        std::fs::read(path.as_path()).expect("read transcript after shutdown"),
+        durable_bytes
+    );
 }
 
 /// A pending append recorded by a superseded fingerprint definition must not be verified here.

@@ -56,6 +56,17 @@ pub enum ThreadStoreError {
         reason: String,
     },
 
+    /// A canonical rollout write did not complete, so its durable outcome is unknown.
+    ///
+    /// Distinct from [`ThreadStoreError::CanonicalAppendRolledBack`]: nothing was verified and
+    /// nothing was rolled back. The rollout's real end position is simply no longer known to the
+    /// writer that attempted it.
+    #[error("canonical rollout write did not complete: {reason}")]
+    CanonicalWriteUnresolved {
+        /// What interrupted the write or its verification.
+        reason: String,
+    },
+
     /// Catch-all for implementation failures that do not fit a more specific category.
     #[error("thread-store internal error: {message}")]
     Internal {
