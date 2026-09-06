@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -158,7 +160,12 @@ pub(super) async fn shutdown_thread(
 ) -> ThreadStoreResult<()> {
     let mut pending_metadata = store.pending_thread_metadata.lock(thread_id).await;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
+    let LiveWriter {
+        recorder,
+        rollout_id,
+        history_mode,
+        ..
+    } = live_writer_parts(store, thread_id).await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
     let append_generation_start = super::append_generation::begin_sync(
         store,
@@ -306,15 +313,52 @@ enum RolloutWriteOp {
     Flush,
 }
 
+/// The live rollout writer installed for a thread, plus the state a caller needs to use it.
+pub(super) struct LiveWriter {
+    pub(super) recorder: RolloutRecorder,
+    pub(super) rollout_id: ThreadId,
+    pub(super) history_mode: ThreadHistoryMode,
+    canonical_append_failure: Arc<OnceLock<String>>,
+}
+
+impl LiveWriter {
+    /// Rejects work on a writer whose durable transcript already lost a rolled-back append.
+    ///
+    /// Rollback truncates the rollout file back to its last verified position while this writer
+    /// keeps the position it had already advanced to. Continuing would either roll every later
+    /// append back again or, in legacy mode, silently leave a hole in durable history, so report
+    /// the original cause instead of writing or publishing anything.
+    pub(super) fn ensure_durable_history_intact(&self) -> ThreadStoreResult<()> {
+        match self.canonical_append_failure.get() {
+            Some(reason) => Err(ThreadStoreError::CanonicalAppendRolledBack {
+                reason: reason.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn record_canonical_append_failure(&self, err: &ThreadStoreError) {
+        let ThreadStoreError::CanonicalAppendRolledBack { reason } = err else {
+            return;
+        };
+        let _ = self.canonical_append_failure.set(reason.clone());
+    }
+}
+
 pub(super) async fn live_writer_parts(
     store: &LocalThreadStore,
     thread_id: ThreadId,
-) -> ThreadStoreResult<(RolloutRecorder, ThreadId, ThreadHistoryMode)> {
+) -> ThreadStoreResult<LiveWriter> {
     let live_recorders = store.live_recorders.lock().await;
     let entry = live_recorders
         .get(&thread_id)
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-    Ok((entry.recorder.clone(), entry.rollout_id, entry.history_mode))
+    Ok(LiveWriter {
+        recorder: entry.recorder.clone(),
+        rollout_id: entry.rollout_id,
+        history_mode: entry.history_mode,
+        canonical_append_failure: Arc::clone(&entry.canonical_append_failure),
+    })
 }
 
 async fn write_and_project(
@@ -326,7 +370,11 @@ async fn write_and_project(
     // shutdown/discard/delete removes it. Keep the lookup defensive so late writes fail after
     // teardown.
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
+    let writer = live_writer_parts(store, thread_id).await?;
+    writer.ensure_durable_history_intact()?;
+    let recorder = &writer.recorder;
+    let rollout_id = writer.rollout_id;
+    let history_mode = writer.history_mode;
     let sync_rollout_path = matches!(&write_op, RolloutWriteOp::Persist | RolloutWriteOp::Flush);
     let write_op = match write_op {
         RolloutWriteOp::AppendItems(mut items) => {
@@ -356,9 +404,12 @@ async fn write_and_project(
             history_mode,
         )?,
     };
-    durable_write(&recorder, write_op).await?;
+    durable_write(recorder, write_op).await?;
     if append_generation_start.started {
-        let finish_io = super::append_generation::finish_append(store, rollout_id)?;
+        let finish_io =
+            super::append_generation::finish_append(store, rollout_id).inspect_err(|err| {
+                writer.record_canonical_append_failure(err);
+            })?;
         record_append_generation_io(thread_id, rollout_id, append_generation_start.io, finish_io);
     }
     if matches!(history_mode, ThreadHistoryMode::Paginated) {

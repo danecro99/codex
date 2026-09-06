@@ -553,9 +553,9 @@ fn pending_rollback_result(
     tracing::warn!(reason, "rolled back an incomplete canonical rollout append");
     match context {
         PendingRecoveryContext::Continue => Ok(io),
-        PendingRecoveryContext::FinishCurrentAppend => Err(ThreadStoreError::Internal {
-            message: format!("canonical rollout append was rolled back: {reason}"),
-        }),
+        PendingRecoveryContext::FinishCurrentAppend => {
+            Err(ThreadStoreError::CanonicalAppendRolledBack { reason })
+        }
     }
 }
 
@@ -886,10 +886,21 @@ fn summarize_suffix(
     })
 }
 
+/// Fingerprints the write intent for a canonical append.
+///
+/// [`summarize_suffix`] can only fingerprint what the durable records decode back to, so the
+/// intent must describe the same normalized form. Fingerprinting the raw in-memory items instead
+/// rejects faithful writes whenever the persisted encoding drops a field, which then truncates the
+/// suffix that was written correctly.
 fn hash_items(items: &[RolloutItem]) -> ThreadStoreResult<String> {
     let mut hasher = Sha256::new();
     for item in items {
-        hash_item(&mut hasher, item)?;
+        let persisted = codex_rollout::persisted_rollout_item(item).map_err(|err| {
+            ThreadStoreError::Internal {
+                message: format!("failed to normalize canonical rollout append items: {err}"),
+            }
+        })?;
+        hash_item(&mut hasher, &persisted)?;
     }
     Ok(format!("{:x}", hasher.finalize()))
 }

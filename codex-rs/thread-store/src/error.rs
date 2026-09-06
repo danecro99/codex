@@ -46,6 +46,16 @@ pub enum ThreadStoreError {
         operation: &'static str,
     },
 
+    /// A canonical rollout append was rejected and rolled back off the durable transcript.
+    ///
+    /// The rollout file was restored to its last verified position while the live writer kept the
+    /// position it had already advanced to, so the writer can no longer extend durable history.
+    #[error("canonical rollout append was rolled back: {reason}")]
+    CanonicalAppendRolledBack {
+        /// Why the durable suffix did not match the canonical write intent.
+        reason: String,
+    },
+
     /// Catch-all for implementation failures that do not fit a more specific category.
     #[error("thread-store internal error: {message}")]
     Internal {

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -357,6 +358,7 @@ use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::DeprecationNoticeEvent;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -2685,6 +2687,8 @@ impl Session {
                 Ok(()) => true,
                 Err(err) => {
                     error!("failed to record rollout items: {err:#}");
+                    self.report_durable_history_failure(event.id.as_str(), &err)
+                        .await;
                     false
                 }
             }
@@ -2709,6 +2713,34 @@ impl Session {
             error!("codex_resume_state_needs_compaction: {err:#}");
         }
         self.deliver_event_raw(event).await;
+    }
+
+    /// Tells the client once that this thread stopped producing durable history.
+    ///
+    /// Rollout persistence is otherwise fire-and-forget: without this the conversation keeps
+    /// rendering while nothing after the last durable record survives a resume. The report carries
+    /// no `codex_error_info` and does not touch the agent status, because the turn itself is still
+    /// running; only persistence is broken.
+    async fn report_durable_history_failure(&self, turn_id: &str, err: &anyhow::Error) {
+        if self
+            .durable_history_failure_reported
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let event = Event {
+            id: turn_id.to_string(),
+            msg: EventMsg::Error(ErrorEvent {
+                message: format!(
+                    "Thread history is no longer being saved to disk: {err:#}. Anything after the last saved item will be missing if this thread is resumed."
+                ),
+                codex_error_info: None,
+                misalignment: None,
+            }),
+        };
+        if let Err(err) = self.tx_event.send(event).await {
+            debug!("dropping durable-history failure report because channel is closed: {err}");
+        }
     }
 
     async fn deliver_event_raw(&self, event: Event) {

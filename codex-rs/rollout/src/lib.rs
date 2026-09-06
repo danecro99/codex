@@ -73,6 +73,21 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
     })
 }
 
+/// Normalizes a rollout item into the exact value its persisted record decodes back to.
+///
+/// The canonical writer serializes items with [`RolloutItem`]'s `Serialize` impl and readers
+/// restore them with [`decode_rollout_line`]. That encoding deliberately does not carry every
+/// in-memory field: `ResponseItem::Reasoning::content` is dropped whenever it holds no
+/// `reasoning_text`, and the dropped field decodes back as `None`, which serializes again as an
+/// explicit `null`. Serialization is therefore not a fixed point, so a durability fingerprint
+/// taken over an in-memory item can never equal the fingerprint of the record it produced.
+///
+/// Producers that fingerprint a write intent before handing items to the writer must fingerprint
+/// this form so their intent is comparable with what the durable record decodes to.
+pub fn persisted_rollout_item(item: &RolloutItem) -> serde_json::Result<RolloutItem> {
+    serde_json::from_value(serde_json::to_value(item)?)
+}
+
 pub const SESSIONS_SUBDIR: &str = "sessions";
 pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
 pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock::new(|| {
@@ -152,6 +167,10 @@ pub use session_index::find_thread_names_by_ids;
 pub use session_index::remove_thread_name_entries;
 pub use state_db::StateDbHandle;
 pub use state_db::sqlite_telemetry_recorder;
+
+#[cfg(test)]
+#[path = "persisted_item_tests.rs"]
+mod persisted_item_tests;
 
 #[cfg(test)]
 mod tests;

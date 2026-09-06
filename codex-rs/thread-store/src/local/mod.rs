@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
 use tokio::sync::OwnedMutexGuard;
@@ -147,6 +148,11 @@ struct LiveRecorderEntry {
     // so missing SQLite rows can still be seeded.
     history_mode: ThreadHistoryMode,
     writer_lock: WriterLockGuard,
+    // Set when a canonical append was rolled back. Rollback restores the rollout file to its last
+    // verified position, but this recorder keeps the position it had already advanced to, so every
+    // later append would either be rolled back again or leave an undetectable hole in durable
+    // history. Fail those appends with the original cause instead.
+    canonical_append_failure: Arc<OnceLock<String>>,
 }
 
 #[derive(Default)]
@@ -337,6 +343,7 @@ impl LocalThreadStore {
                     rollout_id,
                     history_mode,
                     writer_lock,
+                    canonical_append_failure: Arc::new(OnceLock::new()),
                 });
                 Ok(())
             }
