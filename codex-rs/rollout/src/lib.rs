@@ -84,6 +84,11 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
 ///
 /// Producers that fingerprint a write intent before handing items to the writer must fingerprint
 /// this form so their intent is comparable with what the durable record decodes to.
+///
+/// This normalization absorbs the asymmetry; it must never be used to widen what a record can
+/// carry back in. Fields that are `skip_deserializing` on purpose, such as the host-owned
+/// tool-call evidence on `InternalChatMessageMetadataPassthrough`, stay dropped here exactly as
+/// they are when a record is decoded.
 pub fn persisted_rollout_item(item: &RolloutItem) -> serde_json::Result<RolloutItem> {
     serde_json::from_value(serde_json::to_value(item)?)
 }
