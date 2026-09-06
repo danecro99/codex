@@ -6915,7 +6915,10 @@ async fn a_failing_response_item_append_warns_the_client_without_ending_the_turn
 
     let event = rx_event.recv().await?;
     let EventMsg::Warning(warning) = event.msg else {
-        panic!("a persistence failure must not end the turn: {:?}", event.msg);
+        panic!(
+            "a persistence failure must not end the turn: {:?}",
+            event.msg
+        );
     };
     assert!(
         warning.message.contains("could not be saved to disk"),
@@ -6937,7 +6940,10 @@ async fn durable_history_failure_is_reported_to_the_client_once() -> anyhow::Res
     // Startup events are already queued; this test is about what the failure adds.
     while rx_event.try_recv().is_ok() {}
 
-    let failure = anyhow::anyhow!("canonical rollout append was rolled back: {}", "test reason");
+    let failure = anyhow::anyhow!(
+        "canonical rollout append was rolled back: {}",
+        "test reason"
+    );
     session
         .report_durable_history_failure("turn-1", &failure)
         .await;

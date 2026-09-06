@@ -8,8 +8,8 @@ use serde_json::Value;
 
 pub(crate) mod compression;
 pub(crate) mod config;
-pub(crate) mod list;
 mod durable_payload;
+pub(crate) mod list;
 mod maintenance;
 pub(crate) mod metadata;
 mod model_context;
@@ -74,7 +74,6 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
     })
 }
 
-
 pub const SESSIONS_SUBDIR: &str = "sessions";
 pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
 pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock::new(|| {
@@ -87,13 +86,13 @@ pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock:
 });
 
 pub use codex_protocol::protocol::SessionMeta;
-pub use durable_payload::intended_payload_fingerprint;
-pub use durable_payload::stored_payload_fingerprint;
 pub use compression::RolloutLineReader;
 pub use compression::existing_rollout_path;
 pub use compression::open_rollout_line_reader;
 pub use compression::plain_rollout_path;
 pub use compression::spawn_rollout_compression_worker;
+pub use durable_payload::intended_payload_fingerprint;
+pub use durable_payload::stored_payload_fingerprint;
 pub use seekable_reader::open_rollout_seekable_reader;
 pub use seekable_reader::rollout_contains_prefix;
 pub use seekable_reader::rollout_logical_len;

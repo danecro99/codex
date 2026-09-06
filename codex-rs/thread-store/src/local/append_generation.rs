@@ -946,7 +946,11 @@ fn hash_items(items: &[RolloutItem]) -> ThreadStoreResult<String> {
 }
 
 fn hash_payload(hasher: &mut Sha256, payload: &[u8]) {
-    hasher.update(u64::try_from(payload.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(
+        u64::try_from(payload.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
     hasher.update(payload);
 }
 
