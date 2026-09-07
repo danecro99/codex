@@ -864,6 +864,89 @@ async fn unsampled_rewrite_between_canonical_appends_is_loud() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_volume_device_renumber_keeps_the_same_rollout_identity() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 4_022);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-22",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let first = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("load source");
+    publish_loaded_state(&store, thread_id, &first).await;
+
+    let journal_path = crate::local::append_generation::journal_path(&store, thread_id);
+    let mut journal: serde_json::Value = serde_json::from_slice(
+        std::fs::read(journal_path.as_path())
+            .expect("read append generation")
+            .as_slice(),
+    )
+    .expect("decode append generation");
+    let file_identity = journal["stable"]["position"]["file_identity"]
+        .as_str()
+        .expect("file identity");
+    let (_, inode) = file_identity.split_once(':').expect("device and inode");
+    let inode = inode.parse::<u64>().expect("numeric inode");
+    journal["stable"]["position"]["file_identity"] =
+        serde_json::Value::String(format!("987654321:{inode}"));
+    std::fs::write(
+        journal_path.as_path(),
+        serde_json::to_vec(&journal).expect("encode append generation"),
+    )
+    .expect("write append generation");
+
+    let resumed = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("resume after macOS volume device renumber");
+    assert_eq!(resumed.diagnostics.outcome, ResumeCheckpointOutcome::Hit);
+
+    journal["stable"]["position"]["file_identity"] =
+        serde_json::Value::String(format!("987654321:{}", inode.saturating_add(1)));
+    std::fs::write(
+        journal_path.as_path(),
+        serde_json::to_vec(&journal).expect("encode changed file identity"),
+    )
+    .expect("write changed file identity");
+    let error = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path),
+        },
+    )
+    .await
+    .expect_err("a different inode must still fail");
+    assert!(
+        error
+            .to_string()
+            .contains("outside the canonical append-generation contract"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn canonical_append_reads_only_suffix_plus_bounded_fences() {
     let home = TempDir::new().expect("temp dir");

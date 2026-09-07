@@ -567,7 +567,10 @@ fn rollback_pending_suffix(
     io.add_source_bytes(recovered.source_bytes);
     if recovered.position.end_byte_offset != journal.stable.position.end_byte_offset
         || recovered.position.end_ordinal_exclusive != journal.stable.position.end_ordinal_exclusive
-        || recovered.position.file_identity != journal.stable.position.file_identity
+        || !file_identities_equal(
+            recovered.position.file_identity.as_str(),
+            journal.stable.position.file_identity.as_str(),
+        )
         || recovered.position.prefix_head_sha256 != journal.stable.position.prefix_head_sha256
         || recovered.position.prefix_middle_sha256 != journal.stable.position.prefix_middle_sha256
         || recovered.position.prefix_tail_sha256 != journal.stable.position.prefix_tail_sha256
@@ -646,6 +649,33 @@ fn positions_equal(left: &SourcePosition, right: &SourcePosition) -> bool {
             && left.prefix_middle_sha256 == right.prefix_middle_sha256
             && left.prefix_tail_sha256 == right.prefix_tail_sha256;
     }
+    left.end_byte_offset == right.end_byte_offset
+        && left.end_ordinal_exclusive == right.end_ordinal_exclusive
+        && left.modified_unix_nanos == right.modified_unix_nanos
+        && file_identities_equal(left.file_identity.as_str(), right.file_identity.as_str())
+        && left.change_marker == right.change_marker
+        && left.prefix_head_sha256 == right.prefix_head_sha256
+        && left.prefix_middle_sha256 == right.prefix_middle_sha256
+        && left.prefix_tail_sha256 == right.prefix_tail_sha256
+}
+
+#[cfg(target_os = "macos")]
+fn file_identities_equal(left: &str, right: &str) -> bool {
+    matches!(
+        (macos_inode(left), macos_inode(right)),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_inode(identity: &str) -> Option<u64> {
+    let (device, inode) = identity.split_once(':')?;
+    device.parse::<u64>().ok()?;
+    inode.parse::<u64>().ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn file_identities_equal(left: &str, right: &str) -> bool {
     left == right
 }
 
@@ -719,7 +749,7 @@ fn validate_stored_prefix(
     }
     let before_generation = platform_file_generation(&before)?;
     let file_identity = before_generation.0.as_str();
-    if file_identity != stored.file_identity {
+    if !file_identities_equal(file_identity, stored.file_identity.as_str()) {
         return Err(invalid(
             "pending append replaced the stored source file identity",
         ));
