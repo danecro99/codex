@@ -1097,6 +1097,95 @@ async fn forged_generation_or_foreign_checkpoint_ancestry_anchor_is_loud() {
 }
 
 #[tokio::test]
+async fn a_large_compaction_is_verified_replayed_and_followed_by_another_append() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(4_030);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-30",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write session file");
+    let store = LocalThreadStore::new(test_config(home.path()), None);
+    let params = LoadModelContextParams {
+        thread_id,
+        include_archived: false,
+        rollout_path: Some(path.clone()),
+    };
+    let loaded = load_latest_model_context(&store, params.clone())
+        .await
+        .expect("load source");
+    publish_loaded_state(&store, thread_id, &loaded).await;
+
+    // Compaction persists a whole replacement history in one record, not one message per line.
+    // This is valid writer output above the migration reader's unrelated 16-MiB line bound.
+    let RolloutItem::ResponseItem(replacement) = user_message("x".repeat(17 * 1024 * 1024)) else {
+        unreachable!("user_message creates a response item");
+    };
+    let compacted = RolloutItem::Compacted(codex_rollout::CompactedItem {
+        message: "large replacement history".to_string(),
+        replacement_history: Some(vec![replacement]),
+        guardian_history: None,
+        mcp_resource_origins: None,
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
+    });
+    append_with_generation(
+        &store,
+        thread_id,
+        &path,
+        ThreadHistoryMode::Paginated,
+        &compacted,
+    )
+    .await;
+    let resumed = load_latest_model_context(&store, params.clone())
+        .await
+        .expect("replay the complete large compaction from the checkpoint suffix");
+    assert_eq!(resumed.diagnostics.outcome, ResumeCheckpointOutcome::Hit);
+    assert_eq!(resumed.diagnostics.suffix_items, 1);
+    assert!(
+        serde_json::to_value(resumed.items.last()).expect("resumed compaction")
+            == serde_json::to_value(durable_readback_form(&compacted))
+                .expect("expected compaction")
+    );
+
+    let next = user_message("after the large compaction".to_string());
+    append_with_generation(
+        &store,
+        thread_id,
+        &path,
+        ThreadHistoryMode::Paginated,
+        &next,
+    )
+    .await;
+    let resumed = load_latest_model_context(&store, params)
+        .await
+        .expect("resume both verified appends");
+    assert_eq!(resumed.diagnostics.suffix_items, 2);
+    assert_eq!(
+        serde_json::to_value(resumed.items.last()).expect("resumed last item"),
+        serde_json::to_value(durable_readback_form(&next)).expect("expected last item")
+    );
+    let terminal = crate::local::append_generation::read_terminal_rollout_line(
+        &path,
+        std::fs::metadata(&path).expect("rollout metadata").len(),
+    )
+    .expect("read newest record without reading the large earlier one")
+    .expect("terminal record");
+    assert_eq!(
+        serde_json::to_value(terminal.line.item).expect("terminal item"),
+        serde_json::to_value(durable_readback_form(&next)).expect("expected terminal item")
+    );
+    assert!(terminal.bytes_read <= 64 * 1024);
+}
+
+#[tokio::test]
 async fn torn_canonical_append_rolls_back_and_allows_the_next_operation() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 4_013);

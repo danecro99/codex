@@ -937,6 +937,33 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
 }
 
 #[tokio::test]
+async fn canonical_record_limit_is_rejected_before_any_file_write() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let path = home.path().join("rollout.jsonl");
+    let mut writer = JsonlWriter {
+        file: tokio::fs::File::create(&path).await?,
+    };
+    writer.write_line(&"stable prefix").await?;
+    let stable = fs::read(&path)?;
+    // The JSON quotes and terminating newline also belong to the record's byte contract.
+    let oversized = "x".repeat(crate::MAX_CANONICAL_ROLLOUT_RECORD_BYTES);
+    let error = writer
+        .write_line(&oversized)
+        .await
+        .expect_err("oversized canonical record must fail before touching the file");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("canonical record limit"));
+    assert_eq!(fs::read(&path)?, stable);
+    drop(oversized);
+    writer.write_line(&"next record").await?;
+    assert_eq!(
+        fs::read_to_string(&path)?,
+        "\"stable prefix\"\n\"next record\"\n"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn writer_state_retries_write_error_before_reporting_flush_success() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let rollout_path = home.path().join("rollout.jsonl");

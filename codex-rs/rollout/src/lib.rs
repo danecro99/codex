@@ -76,6 +76,14 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
 
 pub const SESSIONS_SUBDIR: &str = "sessions";
 pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
+/// Maximum encoded canonical JSONL record size, including its terminating newline.
+///
+/// A compaction stores the complete replacement and guardian histories in one record. Its
+/// resource envelope must therefore accommodate a materialized resume state (up to 512 MiB),
+/// not the much smaller per-line limit used when importing legacy transcripts. The writer,
+/// append verifier, and checkpoint suffix reader share this allocation boundary.
+pub const MAX_CANONICAL_ROLLOUT_RECORD_BYTES: usize = 512 * 1024 * 1024;
+
 pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock::new(|| {
     vec![
         SessionSource::Cli,

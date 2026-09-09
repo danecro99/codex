@@ -13,6 +13,7 @@ use std::time::UNIX_EPOCH;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::MAX_CANONICAL_ROLLOUT_RECORD_BYTES;
 use codex_rollout::MaterializedResumeAppendGeneration;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
@@ -22,7 +23,6 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use super::LocalThreadStore;
-use super::rollout_migration::MAX_ROLLOUT_LINE_BYTES;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
@@ -832,50 +832,62 @@ pub(super) struct TerminalRolloutLine {
 
 /// Reads the newest record of a plain JSONL rollout prefix under an explicit size bound.
 ///
-/// The canonical writer never emits a record larger than [`MAX_ROLLOUT_LINE_BYTES`], so a terminal
-/// record above that bound is a torn or foreign write. Rejecting it keeps a fence from silently
-/// binding to an older record, and keeps the read bounded regardless of transcript size.
+/// Use the writer's record bound, not the legacy migration line bound. Grow the terminal window
+/// only when the newest record requires it; ordinary appends must not read hundreds of MiB just
+/// because a previous compaction may be large. An oversized or invalid newest record is rejected,
+/// never skipped in favor of an older ordinal.
 pub(super) fn read_terminal_rollout_line(
     path: &Path,
     end_byte_offset: u64,
 ) -> Result<Option<TerminalRolloutLine>, String> {
-    let window_len = end_byte_offset.min(MAX_ROLLOUT_LINE_BYTES.saturating_add(2) as u64);
+    let max_window_len = end_byte_offset.min(MAX_CANONICAL_ROLLOUT_RECORD_BYTES as u64 + 1);
+    let mut window_len = max_window_len.min(FENCE_SAMPLE_BYTES as u64);
+    let mut bytes_read = 0_u64;
     let mut file = codex_rollout::open_rollout_seekable_reader(path)
         .map_err(|err| format!("failed to open source: {err}"))?;
-    file.seek(SeekFrom::Start(end_byte_offset.saturating_sub(window_len)))
-        .map_err(|err| format!("failed to seek source: {err}"))?;
-    let mut window = vec![0_u8; usize::try_from(window_len).map_err(|err| err.to_string())?];
-    file.read_exact(window.as_mut_slice())
-        .map_err(|err| format!("failed to read source terminal window: {err}"))?;
-    let covers_whole_prefix = window_len == end_byte_offset;
-
-    let trimmed_len = window
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map(|position| position + 1);
-    let Some(trimmed_len) = trimmed_len else {
-        if covers_whole_prefix {
+    let mut window = Vec::new();
+    loop {
+        file.seek(SeekFrom::Start(end_byte_offset - window_len))
+            .map_err(|err| format!("failed to seek source: {err}"))?;
+        window.resize(
+            usize::try_from(window_len).map_err(|err| err.to_string())?,
+            0,
+        );
+        file.read_exact(window.as_mut_slice())
+            .map_err(|err| format!("failed to read source terminal window: {err}"))?;
+        bytes_read += window_len;
+        let covers_whole_prefix = window_len == end_byte_offset;
+        let trimmed_len = window
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map(|position| position + 1);
+        if let Some(trimmed_len) = trimmed_len {
+            let trimmed = &window[..trimmed_len];
+            let record = match trimmed.iter().rposition(|byte| *byte == b'\n') {
+                Some(position) => Some(&trimmed[position + 1..]),
+                None if covers_whole_prefix => Some(trimmed),
+                None => None,
+            };
+            if let Some(record) = record {
+                if record.len() + 1 > MAX_CANONICAL_ROLLOUT_RECORD_BYTES {
+                    return Err(
+                        "source terminal record exceeds the rollout record limit".to_string()
+                    );
+                }
+                let value = serde_json::from_slice(record)
+                    .map_err(|err| format!("source terminal record is corrupt: {err}"))?;
+                let line = codex_rollout::decode_rollout_line(value)
+                    .map_err(|err| format!("source terminal record is invalid: {err}"))?;
+                return Ok(Some(TerminalRolloutLine { line, bytes_read }));
+            }
+        } else if covers_whole_prefix {
             return Ok(None);
         }
-        return Err("source terminal record exceeds the rollout record limit".to_string());
-    };
-    let trimmed = &window[..trimmed_len];
-    let record = match trimmed.iter().rposition(|byte| *byte == b'\n') {
-        Some(position) => &trimmed[position + 1..],
-        None if covers_whole_prefix => trimmed,
-        None => return Err("source terminal record exceeds the rollout record limit".to_string()),
-    };
-    if record.len() > MAX_ROLLOUT_LINE_BYTES {
-        return Err("source terminal record exceeds the rollout record limit".to_string());
+        if window_len == max_window_len {
+            return Err("source terminal record exceeds the rollout record limit".to_string());
+        }
+        window_len = window_len.saturating_mul(2).min(max_window_len);
     }
-    let value = serde_json::from_slice(record)
-        .map_err(|err| format!("source terminal record is corrupt: {err}"))?;
-    let line = codex_rollout::decode_rollout_line(value)
-        .map_err(|err| format!("source terminal record is invalid: {err}"))?;
-    Ok(Some(TerminalRolloutLine {
-        line,
-        bytes_read: window_len,
-    }))
 }
 
 fn middle_sample_start(end_byte_offset: u64) -> u64 {
@@ -908,13 +920,13 @@ fn summarize_suffix(
     loop {
         let mut line = Vec::new();
         let read = Read::by_ref(&mut reader)
-            .take(MAX_ROLLOUT_LINE_BYTES.saturating_add(1) as u64)
+            .take(MAX_CANONICAL_ROLLOUT_RECORD_BYTES.saturating_add(1) as u64)
             .read_until(b'\n', &mut line)
             .map_err(source_error)?;
         if read == 0 {
             break;
         }
-        if read > MAX_ROLLOUT_LINE_BYTES || !line.ends_with(b"\n") {
+        if read > MAX_CANONICAL_ROLLOUT_RECORD_BYTES || !line.ends_with(b"\n") {
             return Err(invalid(
                 "pending append contains an invalid rollout record boundary",
             ));

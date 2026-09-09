@@ -2039,6 +2039,15 @@ impl JsonlWriter {
     async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
         let mut json = serde_json::to_string(item)?;
         json.push('\n');
+        if json.len() > crate::MAX_CANONICAL_ROLLOUT_RECORD_BYTES {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "rollout record exceeds the {}-byte canonical record limit",
+                    crate::MAX_CANONICAL_ROLLOUT_RECORD_BYTES
+                ),
+            ));
+        }
         self.file.write_all(json.as_bytes()).await?;
         self.file.flush().await?;
         Ok(())

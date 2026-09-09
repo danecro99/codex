@@ -11,6 +11,7 @@ use std::time::Instant;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::MAX_CANONICAL_ROLLOUT_RECORD_BYTES;
 use codex_rollout::ModelContextScan;
 use codex_rollout::ModelContextScanProgress;
 use codex_rollout::ReverseJsonlScanner;
@@ -22,7 +23,6 @@ use super::helpers::rollout_path_is_archived;
 use super::materialized_resume;
 use super::read_thread;
 use super::rollout_lineage::RolloutLineage;
-use super::rollout_migration::MAX_ROLLOUT_LINE_BYTES;
 use super::thread_rollout_resolver;
 use crate::LoadModelContextParams;
 use crate::ResumeCheckpointOutcome;
@@ -498,7 +498,7 @@ fn read_suffix_segments(
         loop {
             let mut line = Vec::new();
             let read = Read::by_ref(&mut reader)
-                .take(MAX_ROLLOUT_LINE_BYTES.saturating_add(1) as u64)
+                .take(MAX_CANONICAL_ROLLOUT_RECORD_BYTES.saturating_add(1) as u64)
                 .read_until(b'\n', &mut line)
                 .map_err(|err| {
                     materialized_resume::invalid_checkpoint(format!(
@@ -508,9 +508,9 @@ fn read_suffix_segments(
             if read == 0 {
                 break;
             }
-            if read > MAX_ROLLOUT_LINE_BYTES {
+            if read > MAX_CANONICAL_ROLLOUT_RECORD_BYTES {
                 return Err(materialized_resume::invalid_checkpoint(format!(
-                    "source suffix record exceeds the {MAX_ROLLOUT_LINE_BYTES}-byte rollout limit"
+                    "source suffix record exceeds the {MAX_CANONICAL_ROLLOUT_RECORD_BYTES}-byte rollout limit"
                 )));
             }
             segment_consumed =
