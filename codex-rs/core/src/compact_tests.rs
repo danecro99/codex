@@ -25,8 +25,9 @@ async fn process_compacted_history_with_test_session(
             .await
             .expect("world state should build"),
     );
+    let (_, window_ids) = session.prepare_auto_compact_window().await;
     let initial_context = session
-        .build_initial_context_with_world_state(&turn_context, world_state.as_ref())
+        .build_initial_context_for_window(&turn_context, world_state.as_ref(), window_ids)
         .await;
     let initial_context_injection = InitialContextInjection::BeforeLastUserMessage {
         world_state,
@@ -36,6 +37,7 @@ async fn process_compacted_history_with_test_session(
         &session,
         compacted_history,
         &initial_context_injection,
+        window_ids,
     )
     .await;
     (refreshed, initial_context)

@@ -448,6 +448,13 @@ async fn write_and_project(
             if items.is_empty() {
                 return Ok(());
             }
+            // Reject the entire batch before publishing pending evidence or queueing an item.
+            // Invalid input does not make the writer's durable position uncertain.
+            codex_rollout::validate_canonical_rollout_items(&items).map_err(|err| {
+                ThreadStoreError::InvalidRequest {
+                    message: err.to_string(),
+                }
+            })?;
             RolloutWriteOp::AppendItems(items)
         }
         RolloutWriteOp::Persist => RolloutWriteOp::Persist,

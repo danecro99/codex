@@ -927,9 +927,10 @@ fn summarize_suffix(
             break;
         }
         if read > MAX_CANONICAL_ROLLOUT_RECORD_BYTES || !line.ends_with(b"\n") {
-            return Err(invalid(
-                "pending append contains an invalid rollout record boundary",
-            ));
+            return Err(invalid(format!(
+                "pending append contains an invalid rollout record boundary: observed_bytes={read}, limit_bytes={MAX_CANONICAL_ROLLOUT_RECORD_BYTES}, newline_terminated={}",
+                line.ends_with(b"\n")
+            )));
         }
         let value = serde_json::from_slice(line.as_slice())
             .map_err(|err| invalid(format!("pending append is corrupt: {err}")))?;

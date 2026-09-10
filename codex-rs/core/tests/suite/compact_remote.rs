@@ -751,6 +751,94 @@ async fn remote_compact_v2_records_usage_before_output_validation() -> Result<()
     Ok(())
 }
 
+#[cfg(unix)]
+#[test_case(true; "remote_v2")]
+#[test_case(false; "local")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_storage_failure_is_reported_without_completion(remote: bool) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let harness = TestCodexHarness::with_auto_env_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(move |config| {
+                config
+                    .features
+                    .enable(Feature::RemoteCompactionV2)
+                    .expect("enable remote compaction v2");
+                if !remote {
+                    config.model_provider.name = "OpenAI (test)".to_string();
+                }
+            }),
+    )
+    .await?;
+    responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![responses::ev_completed("before-compact")]),
+            sse(vec![
+                if remote {
+                    json!({
+                        "type": "response.output_item.done",
+                        "item": {"type": "compaction", "encrypted_content": "VALID_SUMMARY"}
+                    })
+                } else {
+                    responses::ev_assistant_message("summary", "VALID_SUMMARY")
+                },
+                responses::ev_completed("compact-response"),
+            ]),
+        ],
+    )
+    .await;
+    harness
+        .test()
+        .submit_turn("retain original authorization")
+        .await?;
+    let codex = &harness.test().codex;
+    let journal_dir = harness
+        .test()
+        .codex_home_path()
+        .join("rollout_append_generation_v5");
+    // atomic_write restores directory permissions itself. Use a real non-directory boundary
+    // so the refusal cannot disappear when the writer secures its private parent directory.
+    let parked_journal = journal_dir.with_extension("parked");
+    fs::rename(&journal_dir, &parked_journal)?;
+    fs::write(&journal_dir, b"blocked journal directory")?;
+    let submitted = codex.submit(Op::Compact).await;
+    if let Err(err) = submitted {
+        fs::remove_file(&journal_dir)?;
+        fs::rename(&parked_journal, &journal_dir)?;
+        return Err(err.into());
+    }
+    let mut error = None;
+    let mut completed_compaction = false;
+    wait_for_event(codex, |event| {
+        match event {
+            EventMsg::Error(event) => error = Some(event.message.clone()),
+            EventMsg::ItemCompleted(event)
+                if matches!(event.item, TurnItem::ContextCompaction(_)) =>
+            {
+                completed_compaction = true;
+            }
+            _ => {}
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    fs::remove_file(&journal_dir)?;
+    fs::rename(&parked_journal, &journal_dir)?;
+    assert!(
+        !completed_compaction,
+        "a failed checkpoint must not complete compaction"
+    );
+    let error = error.context("storage failure must reach the client as a compaction error")?;
+    assert!(
+        error.contains("failed to persist compaction checkpoint"),
+        "{error}"
+    );
+    codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint() -> Result<()> {
     skip_if_no_network!(Ok(()));

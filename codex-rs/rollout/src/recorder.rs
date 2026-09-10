@@ -2008,12 +2008,12 @@ struct JsonlWriter {
 }
 
 #[derive(serde::Serialize)]
-struct RolloutLineRef<'a> {
-    timestamp: String,
+pub(crate) struct RolloutLineRef<'a> {
+    pub(crate) timestamp: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ordinal: Option<u64>,
+    pub(crate) ordinal: Option<u64>,
     #[serde(flatten)]
-    item: &'a RolloutItem,
+    pub(crate) item: &'a RolloutItem,
 }
 
 impl JsonlWriter {

@@ -320,9 +320,10 @@ async fn run_remote_compact_task_inner_impl(
         },
     );
     analytics_details.retained_image_count = Some(retained_images);
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+    let (window_number, window_ids) = sess.prepare_auto_compact_window().await;
     let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
+        build_compaction_initial_context(sess.as_ref(), &initial_context_injection, window_ids)
+            .await;
     let new_history =
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
 
@@ -348,12 +349,12 @@ async fn run_remote_compact_task_inner_impl(
         world_state_baseline,
         CompactedHistoryMetadata {
             message: String::new(),
-            window_number: new_window_number,
-            window_ids: new_window_ids,
+            window_number,
+            window_ids,
             compaction_response_id: Some(compaction_response_id),
         },
     )
-    .await;
+    .await?;
     sess.recompute_token_usage(compaction_turn_context).await;
 
     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)

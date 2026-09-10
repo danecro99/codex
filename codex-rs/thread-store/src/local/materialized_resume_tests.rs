@@ -1097,6 +1097,74 @@ async fn forged_generation_or_foreign_checkpoint_ancestry_anchor_is_loud() {
 }
 
 #[tokio::test]
+async fn oversized_batch_is_rejected_without_a_partial_append_or_stopped_writer() {
+    let home = TempDir::new().expect("temp dir");
+    let thread_id = ThreadId::new();
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T15-00-30",
+        Uuid::parse_str(&thread_id.to_string()).expect("thread uuid"),
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("source");
+    let store = LocalThreadStore::new(test_config(home.path()), None);
+    store
+        .resume_thread(ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(path.clone()),
+            history: None,
+            include_archived: false,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("live writer");
+    let loaded = load_latest_model_context(
+        &store,
+        LoadModelContextParams {
+            thread_id,
+            include_archived: false,
+            rollout_path: Some(path.clone()),
+        },
+    )
+    .await
+    .expect("load source");
+    publish_loaded_state(&store, thread_id, &loaded).await;
+    let journal = crate::local::append_generation::journal_path(&store, thread_id);
+    let stable_bytes = std::fs::read(&path).expect("stable rollout");
+    let stable_journal = std::fs::read(&journal).expect("stable journal");
+    let error = store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                user_message("must not become a partial append".to_string()),
+                user_message("x".repeat(codex_rollout::MAX_CANONICAL_ROLLOUT_RECORD_BYTES)),
+            ],
+        })
+        .await
+        .expect_err("the whole batch must be refused");
+    assert_eq!(
+        std::fs::read(&path).expect("unchanged rollout"),
+        stable_bytes
+    );
+    assert_eq!(
+        std::fs::read(&journal).expect("unchanged journal"),
+        stable_journal
+    );
+    assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![user_message("valid following append".to_string())],
+        })
+        .await
+        .expect("input rejection must leave the live writer usable");
+}
+
+#[tokio::test]
 async fn a_large_compaction_is_verified_replayed_and_followed_by_another_append() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(4_030);

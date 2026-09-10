@@ -267,9 +267,14 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         trace_input_history,
     } = attempt;
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    let (new_history, world_state_baseline) =
-        process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await;
+    let (window_number, window_ids) = sess.prepare_auto_compact_window().await;
+    let (new_history, world_state_baseline) = process_compacted_history(
+        sess.as_ref(),
+        new_history,
+        &initial_context_injection,
+        window_ids,
+    )
+    .await;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -298,12 +303,12 @@ async fn run_remote_compact_task_inner_impl(
         world_state_baseline,
         CompactedHistoryMetadata {
             message: String::new(),
-            window_number: new_window_number,
-            window_ids: new_window_ids,
+            window_number,
+            window_ids,
             compaction_response_id: None,
         },
     )
-    .await;
+    .await?;
     sess.recompute_token_usage(compaction_turn_context).await;
 
     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
@@ -315,14 +320,19 @@ pub(crate) async fn process_compacted_history(
     sess: &Session,
     compacted_history: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
+    window_ids: crate::state::AutoCompactWindowIds,
 ) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
     let compacted_history = compacted_history
         .into_iter()
         .map(ResponseItemEnvelope::new)
         .collect();
-    let (compacted_history, world_state_baseline) =
-        process_annotated_compacted_history(sess, compacted_history, initial_context_injection)
-            .await;
+    let (compacted_history, world_state_baseline) = process_annotated_compacted_history(
+        sess,
+        compacted_history,
+        initial_context_injection,
+        window_ids,
+    )
+    .await;
     (
         compacted_history
             .into_iter()
@@ -337,12 +347,13 @@ pub(crate) async fn process_annotated_compacted_history(
     sess: &Session,
     compacted_history: Vec<ResponseItemEnvelope>,
     initial_context_injection: &InitialContextInjection,
+    window_ids: crate::state::AutoCompactWindowIds,
 ) -> (Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>) {
     // Mid-turn compaction is the only path that must inject initial context above the last user
     // message in the replacement history. Pre-turn compaction instead injects context after the
     // compaction item, but mid-turn compaction keeps the compaction item last for model training.
     let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(sess, initial_context_injection).await;
+        build_compaction_initial_context(sess, initial_context_injection, window_ids).await;
 
     let compacted_history = history_item_groups(compacted_history)
         .filter(|group| should_keep_compacted_history_item(&group.source.item))

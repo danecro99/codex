@@ -3513,7 +3513,8 @@ async fn start_new_context_window_persists_checkpoint_state() {
 
     session
         .start_new_context_window(&step_context, world_state)
-        .await;
+        .await
+        .expect("persist new context window");
 
     let live_history = session.clone_history().await;
     assert!(live_history.raw_items().next().is_some());
@@ -6110,7 +6111,7 @@ async fn compaction_checkpoint_waits_for_accepted_settings_persistence() {
     assert!(futures::poll!(update.as_mut()).is_pending());
     let committed = session.thread_settings_snapshot().await;
     let history_before = session.clone_history().await;
-    let (window_number, window_ids) = session.advance_auto_compact_window().await;
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
     let mut checkpoint = Box::pin(tokio::task::unconstrained(
         session.replace_compacted_history(
             vec![ResponseItemEnvelope::new(user_message("compacted history"))],
@@ -6146,7 +6147,7 @@ async fn compaction_checkpoint_waits_for_accepted_settings_persistence() {
     assert_ne!(committed, restored);
     drop(refresh_guard);
     update.await.expect("accepted settings update");
-    checkpoint.await;
+    checkpoint.await.expect("persist compaction checkpoint");
 
     session.flush_rollout().await.expect("flush checkpoint");
     let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path)
@@ -6869,6 +6870,54 @@ async fn make_session_and_context_and_event_rx()
     );
     session.mark_mcp_runtime_dirty();
     (session, turn_context, rx_event)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_compaction_preserves_live_history_and_guardian_checkpoint() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut session, _turn_context, _rx) = make_session_and_context_and_event_rx().await;
+    let config = session.get_config().await;
+    open_thread_persistence(&mut session).await;
+    session
+        .replace_history(vec![user_message("retain original authorization")], None)
+        .await;
+    let before = session.clone_history().await;
+    let window_before = session.current_window().await;
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
+    let sessions = config.codex_home.to_path_buf().join("sessions");
+    std::fs::create_dir_all(&sessions)?;
+    let permissions = std::fs::metadata(&sessions)?.permissions();
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o555))?;
+    let result = session
+        .replace_compacted_history(
+            vec![ResponseItemEnvelope::new(user_message(
+                "replacement must not become live",
+            ))],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: "summary".to_string(),
+                window_number,
+                window_ids,
+                compaction_response_id: None,
+            },
+        )
+        .await;
+    std::fs::set_permissions(&sessions, permissions)?;
+    assert!(
+        result.is_err(),
+        "a rejected checkpoint must fail compaction"
+    );
+    let after = session.clone_history().await;
+    assert_eq!(after.annotated_items(), before.annotated_items());
+    assert_eq!(
+        after.guardian_history_checkpoint(),
+        before.guardian_history_checkpoint()
+    );
+    assert_eq!(session.current_window().await, window_before);
+    Ok(())
 }
 
 /// The first failing conversation-item append must reach the client, and must not end the turn.

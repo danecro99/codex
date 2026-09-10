@@ -4100,68 +4100,79 @@ impl Session {
         state.replace_history(items, reference_context_item);
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the checkpoint and its live history must commit atomically; ThreadStore append never acquires SessionState"
+    )]
     pub(crate) async fn replace_compacted_history(
         &self,
         mut items: Vec<ResponseItemEnvelope>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
         metadata: CompactedHistoryMetadata,
-    ) {
+    ) -> CodexResult<u64> {
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
-        let mut compacted_item = CompactedItem {
+        // Freeze settings and history until the durable replacement has committed. The store
+        // append does not acquire SessionState; reporting errors while holding it would.
+        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
+        let settings_event = thread_settings::applied_event(self).await;
+        let mut state = self.state.lock().await;
+        let window_number = metadata.window_number;
+        let window_ids = metadata.window_ids;
+        let current_ids = state.auto_compact_window_ids();
+        if window_number != state.auto_compact_window_number().saturating_add(1)
+            || window_ids.previous_window_id != Some(current_ids.window_id)
+            || window_ids.first_window_id != current_ids.first_window_id
+        {
+            return Err(CodexErr::Fatal(
+                "compaction checkpoint targets a stale context window".to_string(),
+            ));
+        }
+        let mut candidate_history = state.clone_history();
+        candidate_history.replace_compacted(items.clone());
+        let compacted_item = CompactedItem {
             message: metadata.message,
             replacement_history: Some(items.clone()),
-            guardian_history: None,
+            guardian_history: candidate_history.guardian_history_checkpoint(),
             mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
-            window_number: Some(metadata.window_number),
-            first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
-            previous_window_id: metadata
-                .window_ids
-                .previous_window_id
-                .map(|id| id.to_string()),
-            window_id: Some(metadata.window_ids.window_id.to_string()),
+            window_number: Some(window_number),
+            first_window_id: Some(window_ids.first_window_id.to_string()),
+            previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+            window_id: Some(window_ids.window_id.to_string()),
             compaction_response_id: metadata.compaction_response_id,
-            latest_token_usage_record: self.state.lock().await.latest_token_usage_record.clone(),
+            latest_token_usage_record: state.latest_token_usage_record.clone(),
         };
-        // Wait for accepted updates to finish persisting, then keep later updates from
-        // overtaking the current settings snapshot while its checkpoint is written.
-        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
-        // Compaction starts a new history window, so its WorldState baseline must be full.
-        let mut world_state_item = None;
-        {
-            let mut state = self.state.lock().await;
-            state.replace_annotated_history(
-                items,
-                reference_context_item.clone(),
-                HistoryReplacement::Compaction,
-            );
-            compacted_item.guardian_history = state.history.guardian_history_checkpoint();
-            if let Some(world_state) = world_state_baseline {
-                let snapshot = world_state.snapshot();
-                world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
-                state.history.set_world_state_baseline(snapshot);
-            }
-        }
-
+        let world_state_snapshot = world_state_baseline.map(|world_state| world_state.snapshot());
         let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
         // Persist the baseline after the replacement history that established it.
-        if let Some(world_state_item) = world_state_item {
-            rollout_items.push(RolloutItem::WorldState(world_state_item));
+        if let Some(snapshot) = &world_state_snapshot {
+            rollout_items.push(RolloutItem::WorldState(WorldStateItem::full(
+                snapshot.clone().into_object(),
+            )));
         }
-        if let Some(turn_context_item) = reference_context_item {
-            rollout_items.push(RolloutItem::TurnContext(turn_context_item));
+        if let Some(turn_context_item) = &reference_context_item {
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item.clone()));
         }
         // The frozen turn context must not override current settings in persisted metadata.
-        rollout_items.push(RolloutItem::EventMsg(
-            thread_settings::applied_event(self).await,
-        ));
-        self.persist_rollout_items(&rollout_items).await;
-        {
-            let mut state = self.state.lock().await;
-            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+        rollout_items.push(RolloutItem::EventMsg(settings_event));
+        self.try_persist_rollout_items(&rollout_items)
+            .await
+            .map_err(|err| {
+                CodexErr::Fatal(format!("failed to persist compaction checkpoint: {err:#}"))
+            })?;
+        state.replace_annotated_history(
+            items,
+            reference_context_item,
+            HistoryReplacement::Compaction,
+        );
+        if let Some(snapshot) = world_state_snapshot {
+            state.history.set_world_state_baseline(snapshot);
         }
+        state.commit_auto_compact_window(window_number, window_ids);
+        state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+        Ok(window_number)
     }
 
     pub fn enabled(&self, feature: Feature) -> bool {
@@ -4251,16 +4262,24 @@ impl Session {
         turn_context: &TurnContext,
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
+        let window_ids = self.state.lock().await.auto_compact_window_ids();
+        self.build_initial_context_for_window(turn_context, world_state, window_ids)
+            .await
+    }
+
+    pub(crate) async fn build_initial_context_for_window(
+        &self,
+        turn_context: &TurnContext,
+        world_state: &WorldState,
+        auto_compact_window_ids: AutoCompactWindowIds,
+    ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<RenderedFragment>::with_capacity(8);
         let mut contextual_user_sections = Vec::<RenderedFragment>::with_capacity(2);
         let mut separate_developer_sections = Vec::<RenderedFragment>::new();
         let mut context_window_hints = Vec::new();
-        let (session_source, auto_compact_window_ids) = {
+        let session_source = {
             let state = self.state.lock().await;
-            (
-                state.session_configuration.session_source.clone(),
-                state.auto_compact_window_ids(),
-            )
+            state.session_configuration.session_source.clone()
         };
         let separate_guardian_developer_message =
             crate::guardian::is_basic_session_source(&session_source);
@@ -4537,9 +4556,14 @@ impl Session {
         )
     }
 
+    #[cfg(test)]
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
         let mut state = self.state.lock().await;
         state.advance_auto_compact_window()
+    }
+
+    pub(crate) async fn prepare_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
+        self.state.lock().await.prepare_auto_compact_window()
     }
 
     pub(crate) async fn request_new_context_window(&self) {
@@ -4556,7 +4580,7 @@ impl Session {
         &self,
         step_context: &StepContext,
         world_state: Arc<WorldState>,
-    ) -> u64 {
+    ) -> CodexResult<u64> {
         let turn_context = step_context.turn.as_ref();
         let retained_client_developer_messages =
             if self.enabled(Feature::RetainClientDeveloperMessages) {
@@ -4575,33 +4599,30 @@ impl Session {
             } else {
                 Vec::new()
             };
-        let window = {
-            let mut state = self.state.lock().await;
-            state.start_new_context_window()
-        };
-        let (window_number, window_ids) = window;
+        let (window_number, window_ids) = self.prepare_auto_compact_window().await;
         let context_items = self
-            .build_initial_context_with_world_state(turn_context, world_state.as_ref())
+            .build_initial_context_for_window(turn_context, world_state.as_ref(), window_ids)
             .await
             .into_iter()
             .map(ResponseItemEnvelope::new)
             .chain(retained_client_developer_messages)
             .collect();
         let turn_context_item = turn_context.to_turn_context_item();
-        self.replace_compacted_history(
-            context_items,
-            Some(turn_context_item),
-            Some(world_state),
-            CompactedHistoryMetadata {
-                message: String::new(),
-                window_number,
-                window_ids,
-                compaction_response_id: None,
-            },
-        )
-        .await;
+        let window_number = self
+            .replace_compacted_history(
+                context_items,
+                Some(turn_context_item),
+                Some(world_state),
+                CompactedHistoryMetadata {
+                    message: String::new(),
+                    window_number,
+                    window_ids,
+                    compaction_response_id: None,
+                },
+            )
+            .await?;
         self.recompute_token_usage(turn_context).await;
-        window_number
+        Ok(window_number)
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
