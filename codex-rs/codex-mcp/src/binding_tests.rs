@@ -46,6 +46,7 @@ impl InProcessTransportFactory for TestInProcessTransportFactory {
 struct TestStep {
     step: Arc<McpBinding>,
     client: Arc<RmcpClient>,
+    managed_client: Arc<ManagedClient>,
     tool_catalog_revision: Arc<tokio::sync::RwLock<u64>>,
 }
 
@@ -134,6 +135,7 @@ async fn test_step(
     let calls = HashMap::from([((SERVER_NAME.to_string(), TOOL_NAME.to_string()), prepared)]);
 
     TestStep {
+        managed_client: Arc::clone(&managed_client),
         step: Arc::new(McpBinding::new(
             connections,
             clients,
@@ -386,11 +388,7 @@ async fn refreshed_catalog_stays_with_the_reused_managed_client() {
         /*supports_sandbox_state_meta*/ true,
     )
     .await;
-    let managed = step
-        .step
-        .clients
-        .client(SERVER_NAME)
-        .expect("binding retains the exact managed client");
+    let managed = Arc::clone(&step.managed_client);
     let mut replacement = managed.listed_tools();
     replacement[0].tool.description = Some("refreshed catalog".to_string());
     managed.replace_listed_tools(replacement);
