@@ -16,6 +16,7 @@ use std::env;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -114,6 +115,7 @@ pub(crate) struct ManagedClient {
     pub(crate) client: Arc<RmcpClient>,
     pub(crate) server_info: McpServerInfo,
     pub(crate) tools: Vec<ToolInfo>,
+    pub(crate) refreshed_tools: Arc<StdRwLock<Option<Vec<ToolInfo>>>>,
     pub(crate) tool_timeout: Option<Duration>,
     pub(crate) server_instructions: Option<String>,
     pub(crate) server_supports_sandbox_state_meta_capability: bool,
@@ -144,7 +146,18 @@ impl ManagedClient {
             );
         }
 
-        self.tools.clone()
+        self.refreshed_tools
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| self.tools.clone())
+    }
+
+    pub(crate) fn replace_listed_tools(&self, tools: Vec<ToolInfo>) {
+        *self
+            .refreshed_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tools);
     }
 }
 
@@ -978,6 +991,7 @@ async fn start_server_task(
         client: Arc::clone(&client),
         server_info,
         tools: client_tools,
+        refreshed_tools: Arc::new(StdRwLock::new(None)),
         tool_timeout: None,
         server_instructions: initialize_result.instructions,
         server_supports_sandbox_state_meta_capability,

@@ -91,7 +91,7 @@ impl McpConnectionSet {
     )]
     pub(crate) async fn refresh_changed_tool_catalogs(&self) {
         let mut revision = self.tool_catalog_revision.write().await;
-        let mut replacements = Vec::new();
+        let mut changed = false;
         for (server_name, view) in &self.servers {
             if !view.connection.client.take_tool_list_changed() {
                 continue;
@@ -111,19 +111,18 @@ impl McpConnectionSet {
                 view.catalog_item_limit,
                 client.server_instructions.as_deref(),
             ).await {
-                Ok(tools) => replacements.push((server_name.clone(), tools)),
+                Ok(tools) => {
+                    client.replace_listed_tools(tools);
+                    changed = true;
+                }
                 Err(error) => {
                     client.client.mark_tool_list_changed();
                     trace!(server_name, "MCP tools/list after notification failed: {error:#}");
                 }
             }
         }
-        if replacements.is_empty() {
+        if !changed {
             return;
-        }
-        let mut overrides = self.tool_catalog_overrides.write().await;
-        for (server_name, tools) in replacements {
-            overrides.insert(server_name, tools);
         }
         *revision += 1;
     }
@@ -142,19 +141,9 @@ impl McpConnectionSet {
                 .client
                 .startup_complete
                 .load(Ordering::Acquire);
-            let catalog_override = match self
-                .tool_catalog_overrides
-                .read()
-                .await
-                .get(server_name)
-                .cloned()
-            {
-                Some(tools) => Some(tools),
-                None if server_name == CODEX_APPS_MCP_SERVER_NAME => {
-                    self.codex_apps_tools_override.read().await.clone()
-                }
-                None => None,
-            };
+            let catalog_override = if server_name == CODEX_APPS_MCP_SERVER_NAME {
+                self.codex_apps_tools_override.read().await.clone()
+            } else { None };
             let server_tools = async {
                 match catalog_override {
                     Some(tools) => {
@@ -311,20 +300,10 @@ impl McpConnectionSet {
                     return None;
                 };
                 client.tool_timeout = view.tool_timeout;
-                let catalog_override = match self
-                    .tool_catalog_overrides
-                    .read()
-                    .await
-                    .get(server_name)
-                    .cloned()
-                {
-                    Some(tools) => Some(tools),
-                    None if server_name == CODEX_APPS_MCP_SERVER_NAME => {
-                        self.codex_apps_tools_override.read().await.clone()
-                    }
-                    None => None,
-                };
-                let server_tools = catalog_override.unwrap_or_else(|| client.tools.clone());
+                let catalog_override = if server_name == CODEX_APPS_MCP_SERVER_NAME {
+                    self.codex_apps_tools_override.read().await.clone()
+                } else { None };
+                let server_tools = catalog_override.unwrap_or_else(|| client.listed_tools());
                 (Some(Arc::new(client)), server_tools)
             };
             let server_tools = filter_tools(server_tools, &view.tool_filter);

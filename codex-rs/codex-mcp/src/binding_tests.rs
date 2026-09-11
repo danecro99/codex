@@ -87,6 +87,7 @@ async fn test_step(
             website_url: None,
         },
         tools: vec![tool.clone()],
+        refreshed_tools: Arc::new(std::sync::RwLock::new(None)),
         tool_timeout: None,
         server_instructions: None,
         server_supports_sandbox_state_meta_capability: supports_sandbox_state_meta,

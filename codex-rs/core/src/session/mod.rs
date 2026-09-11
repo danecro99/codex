@@ -2247,13 +2247,6 @@ impl Session {
         self.schedule_mcp_prewarm();
     }
 
-    /// Explicit App Server MCP refreshes request fresh transports on the next
-    /// runtime publication. Notification-driven catalog updates stay scoped to
-    /// their one already-connected server.
-    pub(crate) fn reconnect_mcp_on_next_refresh(&self) {
-        self.services.mcp_runtime.reconnect_on_next_refresh();
-    }
-
     fn emit_config_changed_contributors(
         &self,
         previous_config: Option<&Config>,

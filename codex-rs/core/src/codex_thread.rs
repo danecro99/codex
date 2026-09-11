@@ -845,11 +845,6 @@ impl CodexThread {
         self.session.refresh_mcp_config(next_config).await;
     }
 
-    /// Request a fresh MCP transport set during the next runtime publication.
-    pub fn reconnect_mcp_on_next_refresh(&self) {
-        self.session.reconnect_mcp_on_next_refresh();
-    }
-
     pub async fn environment_selections(&self) -> Vec<TurnEnvironmentSelection> {
         self.session.services.turn_environments.selections()
     }
