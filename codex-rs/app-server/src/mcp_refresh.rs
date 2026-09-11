@@ -24,6 +24,7 @@ pub(crate) async fn reload_mcp_config(
     }
     for (thread, config) in refreshes {
         thread.refresh_mcp_config(config).await;
+        thread.reconnect_mcp_on_next_refresh();
     }
     Ok(())
 }
@@ -48,6 +49,7 @@ pub(crate) async fn reload_mcp_config_best_effort(
             }
         };
         thread.refresh_mcp_config(config).await;
+        thread.reconnect_mcp_on_next_refresh();
     }
 }
 

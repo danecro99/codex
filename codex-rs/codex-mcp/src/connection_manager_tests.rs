@@ -109,6 +109,7 @@ impl McpConnectionSet {
             required_servers: Vec::new(),
             optional_startup_deadline: OnceLock::new(),
             tool_catalog_revision: Arc::new(RwLock::new(0)),
+            tool_catalog_overrides: RwLock::new(HashMap::new()),
             codex_apps_tools_override: RwLock::new(None),
             codex_apps_refresh_lock: Mutex::new(()),
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),

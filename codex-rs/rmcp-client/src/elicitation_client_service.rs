@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use codex_protocol::mcp::OPENAI_ELICITATION_EXTENSION_ID;
 
@@ -64,6 +65,7 @@ impl ElicitationClientService {
         client_info: ClientInfo,
         send_elicitation: SendElicitation,
         pause_state: ElicitationPauseState,
+        tool_list_changed: Arc<AtomicBool>,
     ) -> Self {
         let supports_openai_form = client_info
             .capabilities
@@ -82,6 +84,7 @@ impl ElicitationClientService {
             handler: LoggingClientHandler::new(
                 client_info,
                 clone_send_elicitation(Arc::clone(&send_elicitation)),
+                tool_list_changed,
             ),
             supports_openai_form,
             supports_openai_elicitation_form,

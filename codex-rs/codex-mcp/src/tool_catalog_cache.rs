@@ -186,6 +186,14 @@ impl McpToolCatalogCacheContext {
         state.snapshot = None;
     }
 
+    /// A live session announced a new form. It must not lend its old form to
+    /// a replacement connection while the owner performs the required relist.
+    pub(crate) fn invalidate(&self) {
+        let mut state = lock_unpoisoned(&self.entry.state);
+        state.snapshot = None;
+        state.optional_startup_deadline = None;
+    }
+
     pub(crate) fn publish_if_newest(&self, ticket: McpToolCatalogFetchTicket, tools: &[ToolInfo]) {
         let mut state = lock_unpoisoned(&self.entry.state);
         if state.disabled_by_server || ticket.generation <= state.last_accepted_generation {

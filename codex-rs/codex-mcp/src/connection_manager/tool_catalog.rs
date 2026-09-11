@@ -81,6 +81,53 @@ impl McpConnectionSet {
         Some(*self.tool_catalog_revision.read().await)
     }
 
+    /// Consume server-originated tools/list_changed notifications at the model
+    /// boundary. One write lock makes the relist, replacement, and revision
+    /// publication one catalog transition; current prepared calls therefore
+    /// either finish under their captured revision or fail before dispatch.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "catalog replacement is serialized with captured tool calls"
+    )]
+    pub(crate) async fn refresh_changed_tool_catalogs(&self) {
+        let mut revision = self.tool_catalog_revision.write().await;
+        let mut replacements = Vec::new();
+        for (server_name, view) in &self.servers {
+            if !view.connection.client.take_tool_list_changed() {
+                continue;
+            }
+            let Ok(client) = view.connection.client().await else {
+                continue;
+            };
+            if let Some(cache) = view.connection.client.tool_catalog_cache_context.as_ref() {
+                cache.invalidate();
+            }
+            match list_tools_for_client_uncached(
+                server_name,
+                view.connection.client.is_codex_apps_mcp_server,
+                "notification",
+                &client.client,
+                view.tool_timeout,
+                view.catalog_item_limit,
+                client.server_instructions.as_deref(),
+            ).await {
+                Ok(tools) => replacements.push((server_name.clone(), tools)),
+                Err(error) => {
+                    client.client.mark_tool_list_changed();
+                    trace!(server_name, "MCP tools/list after notification failed: {error:#}");
+                }
+            }
+        }
+        if replacements.is_empty() {
+            return;
+        }
+        let mut overrides = self.tool_catalog_overrides.write().await;
+        for (server_name, tools) in replacements {
+            overrides.insert(server_name, tools);
+        }
+        *revision += 1;
+    }
+
     /// Returns all tools with model-visible names normalized.
     #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.servers.len()))]
     pub async fn list_all_tools(&self) -> Vec<ToolInfo> {
@@ -95,10 +142,18 @@ impl McpConnectionSet {
                 .client
                 .startup_complete
                 .load(Ordering::Acquire);
-            let catalog_override = if server_name == CODEX_APPS_MCP_SERVER_NAME {
-                self.codex_apps_tools_override.read().await.clone()
-            } else {
-                None
+            let catalog_override = match self
+                .tool_catalog_overrides
+                .read()
+                .await
+                .get(server_name)
+                .cloned()
+            {
+                Some(tools) => Some(tools),
+                None if server_name == CODEX_APPS_MCP_SERVER_NAME => {
+                    self.codex_apps_tools_override.read().await.clone()
+                }
+                None => None,
             };
             let server_tools = async {
                 match catalog_override {
@@ -256,10 +311,18 @@ impl McpConnectionSet {
                     return None;
                 };
                 client.tool_timeout = view.tool_timeout;
-                let catalog_override = if server_name == CODEX_APPS_MCP_SERVER_NAME {
-                    self.codex_apps_tools_override.read().await.clone()
-                } else {
-                    None
+                let catalog_override = match self
+                    .tool_catalog_overrides
+                    .read()
+                    .await
+                    .get(server_name)
+                    .cloned()
+                {
+                    Some(tools) => Some(tools),
+                    None if server_name == CODEX_APPS_MCP_SERVER_NAME => {
+                        self.codex_apps_tools_override.read().await.clone()
+                    }
+                    None => None,
                 };
                 let server_tools = catalog_override.unwrap_or_else(|| client.tools.clone());
                 (Some(Arc::new(client)), server_tools)

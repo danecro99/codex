@@ -525,6 +525,11 @@ impl AsyncManagedClient {
         self.ready_client().map(|client| client.client)
     }
 
+    pub(crate) fn take_tool_list_changed(&self) -> bool {
+        self.ready_transport()
+            .is_some_and(|client| client.take_tool_list_changed())
+    }
+
     pub(crate) async fn reconnect_failed_startup(&self) {
         let Some(startup_reconnect) = self.startup_reconnect.as_ref() else {
             return;
