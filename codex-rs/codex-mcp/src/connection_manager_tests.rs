@@ -449,14 +449,15 @@ async fn legacy_tool_catalog_does_not_follow_pagination_cursor() -> anyhow::Resu
 }
 
 async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {
+    let client = Arc::new(
+        RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
+            .await
+            .expect("create in-process RMCP client"),
+    );
     ManagedClient {
-        client: Arc::new(
-            RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
-                .await
-                .expect("create in-process RMCP client"),
-        ),
+        client: Arc::clone(&client),
         server_info: create_test_server_info("Ready"),
-        tool_catalog: Arc::new(ClientToolCatalog::new(tools)),
+        tool_catalog: Arc::new(ClientToolCatalog::new(tools, client)),
         tool_timeout: None,
         server_instructions: None,
         server_supports_sandbox_state_meta_capability: false,
@@ -753,9 +754,9 @@ pub(crate) async fn create_test_manager_with_ready_apps_client(
         .await?;
 
     let managed_client = ManagedClient {
-        client,
+        client: Arc::clone(&client),
         server_info: create_test_server_info("Codex Apps"),
-        tool_catalog: Arc::new(ClientToolCatalog::new(vec![tool])),
+        tool_catalog: Arc::new(ClientToolCatalog::new(vec![tool], client)),
         tool_timeout: Some(Duration::from_secs(5)),
         server_instructions: None,
         server_supports_sandbox_state_meta_capability: false,
@@ -3492,7 +3493,7 @@ async fn cancelling_startup_does_not_disable_a_ready_client() {
     assert_eq!(
         managed
             .tool_catalog
-            .read(|catalog| model_tool_names(&catalog.tools))
+            .read(|catalog| model_tool_names(catalog.tools.as_ref().expect("valid catalog")))
             .await,
         HashSet::from([ToolName::namespaced("ready", "search")])
     );
@@ -4977,9 +4978,9 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
     )
     .await?;
     let managed_client = ManagedClient {
-        client,
+        client: Arc::clone(&client),
         server_info: create_test_server_info("Mutable tools"),
-        tool_catalog: Arc::new(ClientToolCatalog::new(initial_tools)),
+        tool_catalog: Arc::new(ClientToolCatalog::new(initial_tools, Arc::clone(&client))),
         tool_timeout: None,
         server_instructions: initialize.instructions,
         server_supports_sandbox_state_meta_capability: false,

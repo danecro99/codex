@@ -58,6 +58,36 @@ pub fn tool_is_model_visible(tool: &ToolInfo) -> bool {
 }
 
 impl McpConnectionSet {
+    /// Re-list changed catalogs through the existing client, never by restarting
+    /// the provider or replaying a tool call. Each client serializes its own fetch.
+    pub(crate) async fn refresh_notified_tool_catalogs(&self) {
+        join_all(self.servers.iter().map(|(server_name, view)| async move {
+            let Some(client) = view.connection.client.ready_client() else {
+                return;
+            };
+            client
+                .tool_catalog
+                .refresh_notified(|| async {
+                    if let Some(cache) = &view.connection.client.tool_catalog_cache_context {
+                        cache.invalidate();
+                    }
+                    list_tools_for_client_uncached(
+                        server_name,
+                        view.connection.client.is_codex_apps_mcp_server,
+                        "tools_list_changed",
+                        &client.client,
+                        view.tool_timeout,
+                        view.catalog_item_limit,
+                        client.server_instructions.as_deref(),
+                    )
+                    .await
+                    .with_context(|| format!("tools/list failed for MCP server '{server_name}'"))
+                })
+                .await;
+        }))
+        .await;
+    }
+
     pub(crate) async fn stable_catalog_revisions(
         &self,
     ) -> Option<HashMap<String, ClientToolCatalogRevision>> {
@@ -80,7 +110,9 @@ impl McpConnectionSet {
                 }
                 return None;
             };
-            if client.client.is_closed().await {
+            if client.client.is_closed().await
+                || client.tool_catalog.has_pending_notification().await
+            {
                 return None;
             }
             let revision = client.tool_catalog.read(|catalog| catalog.revision).await;
@@ -119,14 +151,15 @@ impl McpConnectionSet {
                 ))
                 .await;
             match server_tools {
-                Some(server_tools) => Some(
+                Ok(server_tools) => Some(
                     server_tools
                         .into_iter()
                         .map(|tool| Self::with_server_metadata(tool, &view.metadata))
                         .collect::<Vec<_>>(),
                 ),
-                None => {
-                    trace!(
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
                         server_name = %server_name,
                         has_cached_tools,
                         startup_complete,
@@ -168,6 +201,7 @@ impl McpConnectionSet {
     ) -> McpBinding {
         let mut listed_tools = Vec::new();
         let mut clients = HashMap::new();
+        let mut catalog_errors = std::collections::BTreeMap::new();
         let optional_mcp_startup_grace = config.optional_mcp_startup_grace;
         let server_snapshots = join_all(self.servers.iter().map(|(server_name, view)| async move {
             if !view
@@ -250,10 +284,11 @@ impl McpConnectionSet {
                     return None;
                 };
                 client.tool_timeout = view.tool_timeout;
-                let (revision, server_tools) = client
-                    .tool_catalog
-                    .read(|catalog| (catalog.revision, catalog.tools.clone()))
-                    .await;
+                let (revision, server_tools) = client.tool_catalog.snapshot().await;
+                let server_tools = match server_tools {
+                    Ok(tools) => tools,
+                    Err(error) => return Some(Err((server_name.clone(), error))),
+                };
                 (Some((Arc::new(client), revision)), server_tools)
             };
             let server_tools = filter_tools(server_tools, &view.tool_filter);
@@ -276,10 +311,17 @@ impl McpConnectionSet {
                     Self::with_server_metadata(tool, &view.metadata)
                 })
                 .collect::<Vec<_>>();
-            Some((server_name.clone(), client, server_tools))
+            Some(Ok((server_name.clone(), client, server_tools)))
         }))
         .await;
-        for (server_name, client, server_tools) in server_results.into_iter().flatten() {
+        for result in server_results.into_iter().flatten() {
+            let (server_name, client, server_tools) = match result {
+                Ok(result) => result,
+                Err((server_name, error)) => {
+                    catalog_errors.insert(server_name, error);
+                    continue;
+                }
+            };
             if let Some((client, revision)) = client {
                 clients.insert(server_name, (client, revision));
             }
@@ -338,6 +380,7 @@ impl McpConnectionSet {
             tools,
             calls,
         )
+        .with_catalog_errors(catalog_errors)
     }
 
     fn prepare_call(

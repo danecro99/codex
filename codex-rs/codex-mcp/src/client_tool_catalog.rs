@@ -10,6 +10,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Result;
+use codex_rmcp_client::RmcpClient;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
@@ -25,6 +26,7 @@ pub struct CodexAppsToolSnapshot {
 }
 
 pub(crate) struct ClientToolCatalog {
+    client: Arc<RmcpClient>,
     current: RwLock<ToolCatalogSnapshot>,
     /// Serialize fetches without blocking calls against the current catalog.
     refresh_lock: Mutex<()>,
@@ -33,15 +35,68 @@ pub(crate) struct ClientToolCatalog {
 pub(crate) struct ToolCatalogSnapshot {
     /// Zero is the startup catalog; successful explicit refreshes advance it.
     pub(crate) revision: u64,
-    pub(crate) tools: Vec<ToolInfo>,
+    pub(crate) tools: Result<Vec<ToolInfo>, String>,
+    notification_revision: u64,
 }
 
 impl ClientToolCatalog {
-    pub(crate) fn new(tools: Vec<ToolInfo>) -> Self {
+    pub(crate) fn new(tools: Vec<ToolInfo>, client: Arc<RmcpClient>) -> Self {
         Self {
-            current: RwLock::new(ToolCatalogSnapshot { revision: 0, tools }),
+            client,
+            current: RwLock::new(ToolCatalogSnapshot {
+                revision: 0,
+                tools: Ok(tools),
+                notification_revision: 0,
+            }),
             refresh_lock: Mutex::new(()),
         }
+    }
+
+    pub(crate) async fn has_pending_notification(&self) -> bool {
+        self.read(|snapshot| {
+            snapshot.notification_revision != self.client.tool_list_change_revision()
+        })
+        .await
+    }
+
+    /// A known change makes old definitions unusable, including during a failed
+    /// refresh. One attempt per notification revision; no automatic call replay
+    /// or repeated protocol-error retry. Cancellation leaves the change pending.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "serialize one client's catalog refresh"
+    )]
+    pub(crate) async fn refresh_notified<F, Fut>(&self, fetch: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<ToolInfo>>>,
+    {
+        let _refresh = self.refresh_lock.lock().await;
+        let notification_revision = self.client.tool_list_change_revision();
+        if self
+            .read(|snapshot| snapshot.notification_revision == notification_revision)
+            .await
+        {
+            return;
+        }
+        let tools = fetch()
+            .await
+            .map_err(|error| format!("needs_mcp_tool_catalog_refresh: {error:#}"));
+        let mut current = self.current.write().await;
+        current.tools = tools;
+        current.notification_revision = notification_revision;
+        current.revision += 1;
+    }
+
+    pub(crate) async fn snapshot(&self) -> (u64, Result<Vec<ToolInfo>, String>) {
+        self.read(|snapshot| {
+            let tools = if snapshot.notification_revision != self.client.tool_list_change_revision() {
+                Err("needs_mcp_tool_catalog_refresh: another tools/list_changed arrived during catalog capture".to_string())
+            } else {
+                snapshot.tools.clone()
+            };
+            (snapshot.revision, tools)
+        }).await
     }
 
     pub(crate) async fn read<R>(&self, read: impl FnOnce(&ToolCatalogSnapshot) -> R) -> R {
@@ -62,10 +117,12 @@ impl ClientToolCatalog {
         P: FnOnce(&[ToolInfo], C) -> R,
     {
         let _refresh = self.refresh_lock.lock().await;
+        let notification_revision = self.client.tool_list_change_revision();
         let (tools, context) = fetch().await?;
         let mut current = self.current.write().await;
         let result = publish(&tools, context);
-        current.tools = tools;
+        current.tools = Ok(tools);
+        current.notification_revision = notification_revision;
         current.revision += 1;
         Ok(result)
     }
@@ -85,7 +142,10 @@ impl ClientToolCatalog {
         Fut: Future<Output = R>,
     {
         let current = self.current.read().await;
-        if current.revision != expected_revision {
+        if current.revision != expected_revision
+            || current.notification_revision != self.client.tool_list_change_revision()
+            || current.tools.is_err()
+        {
             return None;
         }
         let result = run().await;

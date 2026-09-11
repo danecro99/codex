@@ -1,5 +1,6 @@
 //! Immutable MCP catalog and execution handles.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -35,6 +36,7 @@ pub struct McpBinding {
     plugins_available: bool,
     tools: Vec<ToolInfo>,
     calls: HashMap<(String, String), PreparedMcpCall>,
+    catalog_errors: BTreeMap<String, String>,
 }
 
 impl McpBinding {
@@ -65,6 +67,7 @@ impl McpBinding {
             plugins_available,
             tools,
             calls,
+            catalog_errors: BTreeMap::new(),
         }
     }
 
@@ -79,6 +82,17 @@ impl McpBinding {
     /// Returns the frozen model-visible catalog captured for this binding.
     pub fn tools(&self) -> &[ToolInfo] {
         &self.tools
+    }
+
+    pub(crate) fn with_catalog_errors(mut self, errors: BTreeMap<String, String>) -> Self {
+        self.catalog_errors = errors;
+        self
+    }
+
+    /// Failed re-listing is not an empty catalog. Consumers must surface these
+    /// errors while using the remaining servers' independently valid tools.
+    pub fn catalog_errors(&self) -> &BTreeMap<String, String> {
+        &self.catalog_errors
     }
 
     /// Returns permitted tool metadata, including app-only tools.

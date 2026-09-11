@@ -8,6 +8,9 @@ use tokio::sync::SemaphorePermit;
 pub(super) struct McpRefresh {
     pending: AtomicBool,
     gate: Semaphore,
+    /// Last error context written to history, not a second tool catalog.
+    pub(super) reported_catalog_errors:
+        tokio::sync::Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 impl McpRefresh {
@@ -15,6 +18,7 @@ impl McpRefresh {
         Self {
             pending: AtomicBool::new(false),
             gate: Semaphore::new(/*permits*/ 1),
+            reported_catalog_errors: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 

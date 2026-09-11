@@ -5,6 +5,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -43,6 +44,7 @@ struct TestToolServer {
     resources: Arc<Vec<Resource>>,
     resource_templates: Arc<Vec<ResourceTemplate>>,
     supports_openai_form_elicitation: Arc<AtomicBool>,
+    catalog_revision: Arc<AtomicUsize>,
 }
 
 const MEMO_URI: &str = "memo://codex/example-note";
@@ -181,6 +183,7 @@ impl TestToolServer {
             resources: Arc::new(resources),
             resource_templates: Arc::new(resource_templates),
             supports_openai_form_elicitation: Arc::new(AtomicBool::new(false)),
+            catalog_revision: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -563,6 +566,48 @@ impl ServerHandler for TestToolServer {
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         let tools = self.tools.clone();
         async move {
+            if std::env::var_os("MCP_TEST_CATALOG_UPDATES").is_some() {
+                let revision = self.catalog_revision.load(Ordering::Acquire);
+                if revision == 2 {
+                    return Err(McpError::internal_error(
+                        "catalog fixture unavailable",
+                        None,
+                    ));
+                }
+                if revision == 3 {
+                    return Ok(ListToolsResult::with_all_items(Vec::new()));
+                }
+                let schema = |value| -> Result<Arc<JsonObject>, McpError> {
+                    serde_json::from_value::<JsonObject>(value)
+                        .map(Arc::new)
+                        .map_err(|error| McpError::internal_error(error.to_string(), None))
+                };
+                return Ok(ListToolsResult::with_all_items(vec![
+                    Tool::new(
+                        "switch_catalog",
+                        "Change this test session's catalog and notify the client",
+                        schema(
+                            json!({"type":"object","properties":{"revision":{"type":"integer"}},"required":["revision"]}),
+                        )?,
+                    ),
+                    Tool::new(
+                        "echo",
+                        if revision == 0 {
+                            "old echo"
+                        } else {
+                            "new echo"
+                        },
+                        schema(
+                            json!({"type":"object","properties":{"message":{"type": if revision == 0 {"string"} else {"integer"}}},"required":["message"]}),
+                        )?,
+                    ),
+                    Tool::new(
+                        if revision == 0 { "removed" } else { "added" },
+                        "fixture tool",
+                        schema(json!({"type":"object","properties":{}}))?,
+                    ),
+                ]));
+            }
             let mut tools = (*tools).clone();
             if let Some(marker_file) = std::env::var_os(APP_ONLY_CWD_MARKER_FILE_ENV)
                 && std::path::Path::new(&marker_file).is_file()
@@ -641,6 +686,28 @@ impl ServerHandler for TestToolServer {
         request: CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        if request.name == "switch_catalog"
+            && std::env::var_os("MCP_TEST_CATALOG_UPDATES").is_some()
+        {
+            let revision = request
+                .arguments
+                .as_ref()
+                .and_then(|args| args.get("revision"))
+                .and_then(serde_json::Value::as_u64)
+                .filter(|value| (1..=3).contains(value))
+                .ok_or_else(|| McpError::invalid_params("revision must be 1, 2 or 3", None))?;
+            self.catalog_revision
+                .store(revision as usize, Ordering::Release);
+            context
+                .peer
+                .notify_tool_list_changed()
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            return Ok(CallToolResult::structured(
+                json!({"pid":std::process::id(),"revision":revision}),
+            )
+            .into());
+        }
         match request.name.as_ref() {
             "js" => {
                 let args = Self::parse_call_args::<JsArgs>(&request, "js")?;

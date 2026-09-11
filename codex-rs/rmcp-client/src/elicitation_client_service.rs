@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 
 use codex_protocol::mcp::OPENAI_ELICITATION_EXTENSION_ID;
 
@@ -65,7 +65,7 @@ impl ElicitationClientService {
         client_info: ClientInfo,
         send_elicitation: SendElicitation,
         pause_state: ElicitationPauseState,
-        tool_list_changed: Arc<AtomicBool>,
+        tool_list_changed: Arc<AtomicU64>,
     ) -> Self {
         let supports_openai_form = client_info
             .capabilities

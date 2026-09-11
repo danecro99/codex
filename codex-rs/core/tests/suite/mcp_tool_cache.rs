@@ -56,6 +56,154 @@ use super::rmcp_client::remote_aware_stdio_server_bin;
 const SERVER_NAME: &str = "cached_rmcp";
 const NAMESPACE: &str = "mcp__cached_rmcp";
 
+#[test_case(1; "changed_names_and_schema")]
+#[test_case(2; "failed_relist_is_visible")]
+#[test_case(3; "valid_empty_catalog")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notified_catalog_rebinds_the_next_model_request_without_restart(
+    revision: u64,
+) -> anyhow::Result<()> {
+    skip_if_wine_exec!(Ok(()), "requires test_stdio_server");
+    skip_if_no_network!(Ok(()));
+    let responses_server = responses::start_mock_server().await;
+    let command = remote_aware_stdio_server_bin()?;
+    let environment_id = remote_aware_environment_id();
+    let environment = test_env().await?;
+    let server: McpServerConfig = serde_json::from_value(json!({
+        "command": command, "environment_id": environment_id, "cwd": environment.cwd(),
+        "env": {"MCP_TEST_CATALOG_UPDATES":"1", "MCP_TEST_DYNAMIC_SERVER_METADATA":"1"},
+        "startup_timeout_sec":10, "tool_timeout_sec":10
+    }))?;
+    let fixture = test_codex()
+        .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
+        .with_config(move |config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+            assert!(
+                config
+                    .permissions
+                    .set_permission_profile(PermissionProfile::Disabled)
+                    .is_ok()
+            );
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(SERVER_NAME.to_string(), server);
+            assert!(config.mcp_servers.set(servers).is_ok());
+        })
+        .build_with_environment(&responses_server, environment)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, SERVER_NAME).await?;
+    let before = mount_sse_once(
+        &responses_server,
+        responses::sse(vec![
+            responses::ev_response_created("before"),
+            responses::ev_function_call_with_namespace(
+                "update",
+                NAMESPACE,
+                "switch_catalog",
+                &json!({"revision":revision}).to_string(),
+            ),
+            responses::ev_completed("before"),
+        ]),
+    )
+    .await;
+    let after = mount_sse_once(
+        &responses_server,
+        responses::sse(vec![
+            responses::ev_response_created("after"),
+            responses::ev_assistant_message("finished", "done"),
+            responses::ev_completed("after"),
+        ]),
+    )
+    .await;
+    fixture
+        .codex
+        .start_or_steer_turn(user_turn(
+            "Update the catalog once, then report the available tools.",
+        ))
+        .await?;
+    let EventMsg::McpToolCallEnd(end) = wait_for_event(
+        &fixture.codex,
+        |event| matches!(event, EventMsg::McpToolCallEnd(end) if end.call_id == "update"),
+    )
+    .await
+    else {
+        unreachable!()
+    };
+    let receipt = end
+        .result
+        .map_err(anyhow::Error::msg)
+        .context("catalog update call failed")?
+        .structured_content
+        .context("missing update receipt")?;
+    let pid = receipt["pid"].as_u64().context("missing fixture PID")?;
+    wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let first = before.single_request();
+    let next = after.single_request();
+    let first_body = first.body_json();
+    let next_body = next.body_json();
+    assert!(first.tool_by_name(NAMESPACE, "removed").is_some());
+    assert_eq!(
+        first
+            .tool_by_name(NAMESPACE, "echo")
+            .context("missing original echo")?["parameters"]["properties"]["message"]["type"],
+        "string"
+    );
+    assert!(next.tool_by_name(NAMESPACE, "removed").is_none());
+    if revision == 1 {
+        assert!(next.tool_by_name(NAMESPACE, "added").is_some());
+        let echo = next
+            .tool_by_name(NAMESPACE, "echo")
+            .context("missing refreshed echo")?;
+        assert_eq!(echo["description"], "new echo");
+        assert_eq!(
+            echo["parameters"]["properties"]["message"]["type"],
+            "integer"
+        );
+        let namespace = |body: &Value| -> anyhow::Result<Value> {
+            Ok(body["tools"]
+                .as_array()
+                .context("missing tools array")?
+                .iter()
+                .find(|tool| tool["name"] == NAMESPACE)
+                .context("missing MCP namespace")?
+                .clone())
+        };
+        assert_eq!(
+            namespace(&first_body)?["description"],
+            namespace(&next_body)?["description"]
+        );
+        assert!(
+            namespace(&next_body)?["description"]
+                .as_str()
+                .context("missing namespace description")?
+                .contains(&pid.to_string()),
+            "the exact original MCP process must survive"
+        );
+    } else {
+        assert!(next.tool_by_name(NAMESPACE, "echo").is_none());
+        assert!(next.tool_by_name(NAMESPACE, "switch_catalog").is_none());
+    }
+    let input = next_body["input"].to_string();
+    assert_eq!(
+        input.contains("needs_mcp_tool_catalog_refresh"),
+        revision == 2
+    );
+    assert_eq!(input.contains("catalog fixture unavailable"), revision == 2);
+    let results = next_body["input"]
+        .as_array()
+        .context("missing next model input")?
+        .iter()
+        .filter(|item| item["type"] == "function_call_output" && item["call_id"] == "update")
+        .count();
+    assert_eq!(
+        results, 1,
+        "the catalog update must not replay the tool call"
+    );
+    Ok(())
+}
+
 fn user_turn(prompt: &str) -> TurnInputRequest {
     TurnInputRequest::user_input(vec![UserInput::Text {
         text: prompt.to_string(),

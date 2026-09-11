@@ -114,6 +114,23 @@ impl Default for ToolCatalogCacheEntry {
     }
 }
 
+#[test]
+fn invalidation_fences_fetches_that_started_before_the_notification() {
+    let cache = McpToolCatalogCacheContext {
+        entry: Arc::new(ToolCatalogCacheEntry::default()),
+    };
+    let old = cache.begin_fetch();
+    cache.invalidate();
+    cache.publish_if_newest(old, &[]);
+    assert!(
+        cache.current_tools().is_none(),
+        "an old in-flight fetch must not resurrect invalidated tools"
+    );
+    let current = cache.begin_fetch();
+    cache.publish_if_newest(current, &[]);
+    assert_eq!(cache.current_tools().map(|tools| tools.len()), Some(0));
+}
+
 impl McpToolCatalogCacheContext {
     pub(crate) fn has_tools(&self) -> bool {
         self.current_tools().is_some_and(|tools| !tools.is_empty())
@@ -190,6 +207,11 @@ impl McpToolCatalogCacheContext {
     /// a replacement connection while the owner performs the required relist.
     pub(crate) fn invalidate(&self) {
         let mut state = lock_unpoisoned(&self.entry.state);
+        state.last_accepted_generation = self
+            .entry
+            .next_fetch_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
         state.snapshot = None;
         state.optional_startup_deadline = None;
     }

@@ -32,6 +32,62 @@ use crate::tools::ToolInfo;
 const SERVER_NAME: &str = "docs";
 const TOOL_NAME: &str = "search";
 
+#[tokio::test]
+async fn notification_during_fetch_is_not_consumed_and_failed_catalog_is_not_empty() {
+    let fixture = test_step("notified", AppToolApproval::Approve, false).await;
+    fixture.client.mark_tool_list_changed();
+    fixture
+        .tool_catalog
+        .refresh_notified(|| async {
+            fixture.client.mark_tool_list_changed();
+            Ok(Vec::new())
+        })
+        .await;
+    assert!(fixture.tool_catalog.has_pending_notification().await);
+    assert!(fixture.tool_catalog.snapshot().await.1.is_err());
+    fixture
+        .tool_catalog
+        .refresh_notified(|| async { Err(anyhow::anyhow!("malformed tools/list reply")) })
+        .await;
+    assert!(!fixture.tool_catalog.has_pending_notification().await);
+    let failed = fixture.tool_catalog.snapshot().await;
+    assert!(
+        failed
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("malformed tools/list reply")
+    );
+    fixture
+        .tool_catalog
+        .refresh_notified(|| async { panic!("unchanged protocol failure must not be retried") })
+        .await;
+    assert_eq!(fixture.tool_catalog.snapshot().await.0, failed.0);
+    fixture.client.mark_tool_list_changed();
+    fixture
+        .tool_catalog
+        .refresh_notified(|| async { Ok(Vec::new()) })
+        .await;
+    assert!(fixture.tool_catalog.snapshot().await.1.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn notification_rejects_prepared_call_before_relisting_or_preparation() {
+    let fixture = test_step("notified", AppToolApproval::Approve, false).await;
+    let call = fixture.step.prepare_call(SERVER_NAME, TOOL_NAME).unwrap();
+    fixture.client.mark_tool_list_changed();
+    let prepared = std::sync::atomic::AtomicBool::new(false);
+    let error = call
+        .call_with_preparation(None, || async {
+            prepared.store(true, std::sync::atomic::Ordering::Release);
+            Ok((None, None))
+        })
+        .await
+        .unwrap_err();
+    assert!(!prepared.load(std::sync::atomic::Ordering::Acquire));
+    assert!(error.to_string().contains("catalog changed"), "{error:#}");
+}
+
 struct TestInProcessTransportFactory;
 
 impl InProcessTransportFactory for TestInProcessTransportFactory {
@@ -77,7 +133,10 @@ async fn test_step(
             .await
             .expect("create in-process MCP client"),
     );
-    let tool_catalog = Arc::new(ClientToolCatalog::new(vec![tool.clone()]));
+    let tool_catalog = Arc::new(ClientToolCatalog::new(
+        vec![tool.clone()],
+        Arc::clone(&client),
+    ));
     let managed_client = Arc::new(ManagedClient {
         client: Arc::clone(&client),
         server_info: McpServerInfo {

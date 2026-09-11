@@ -122,28 +122,26 @@ pub(crate) struct ManagedClient {
 }
 
 impl ManagedClient {
-    pub(crate) async fn listed_tools(&self) -> Vec<ToolInfo> {
+    pub(crate) async fn listed_tools(&self) -> Result<Vec<ToolInfo>> {
         let total_start = Instant::now();
-        self.tool_catalog
-            .read(|catalog| {
-                // Discovery may use the shared cache until this client is refreshed.
-                // Executable bindings always capture this client's own catalog.
-                if catalog.revision == 0
-                    && let Some(cache_context) = &self.codex_apps_tools_cache_context
-                {
-                    let tools = cache_context.current_tools();
-                    emit_duration(
-                        MCP_TOOLS_LIST_DURATION_METRIC,
-                        total_start.elapsed(),
-                        &[("cache", if tools.is_some() { "hit" } else { "miss" })],
-                    );
-                    if let Some(tools) = tools {
-                        return tools;
-                    }
-                }
-                catalog.tools.clone()
-            })
-            .await
+        let (revision, tools) = self.tool_catalog.snapshot().await;
+        let tools = tools.map_err(anyhow::Error::msg)?;
+        // Discovery may use the shared cache until this client is refreshed.
+        // Executable bindings always capture this client's own catalog.
+        if revision == 0
+            && let Some(cache_context) = &self.codex_apps_tools_cache_context
+        {
+            let tools = cache_context.current_tools();
+            emit_duration(
+                MCP_TOOLS_LIST_DURATION_METRIC,
+                total_start.elapsed(),
+                &[("cache", if tools.is_some() { "hit" } else { "miss" })],
+            );
+            if let Some(tools) = tools {
+                return Ok(tools);
+            }
+        }
+        Ok(tools)
     }
 }
 
@@ -572,17 +570,22 @@ impl AsyncManagedClient {
             })
     }
 
-    pub(crate) async fn listed_tools(&self) -> Option<Vec<ToolInfo>> {
+    pub(crate) async fn listed_tools(&self) -> Result<Vec<ToolInfo>> {
         // Plugin provenance is resolved per-session rather than stored in shared cache payloads.
         if !self.startup_complete.load(Ordering::Acquire)
             && let Some(startup_tools) = self.cached_tools()
         {
-            Some(startup_tools)
+            Ok(startup_tools)
         } else {
             match self.client().await {
-                Ok(client) => Some(client.listed_tools().await),
-                Err(_) if self.is_codex_apps_mcp_server => self.cached_tools(),
-                Err(_) => None,
+                Ok(client) => client.listed_tools().await,
+                // Preserve Apps' existing startup-only discovery cache. This
+                // branch has no ready client and cannot authorize execution;
+                // errors refreshing an established client never enter it.
+                Err(error) if self.is_codex_apps_mcp_server => {
+                    self.cached_tools().ok_or_else(|| error.into())
+                }
+                Err(error) => Err(error.into()),
             }
         }
     }
@@ -971,7 +974,7 @@ async fn start_server_task(
     let managed = ManagedClient {
         client: Arc::clone(&client),
         server_info,
-        tool_catalog: Arc::new(ClientToolCatalog::new(client_tools)),
+        tool_catalog: Arc::new(ClientToolCatalog::new(client_tools, Arc::clone(&client))),
         tool_timeout: None,
         server_instructions: initialize_result.instructions,
         server_supports_sandbox_state_meta_capability,

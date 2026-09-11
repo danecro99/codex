@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use rmcp::ClientHandler;
@@ -28,14 +28,14 @@ use crate::rmcp_client::SendElicitation;
 pub(crate) struct LoggingClientHandler {
     client_info: ClientInfo,
     send_elicitation: Arc<SendElicitation>,
-    tool_list_changed: Arc<AtomicBool>,
+    tool_list_changed: Arc<AtomicU64>,
 }
 
 impl LoggingClientHandler {
     pub(crate) fn new(
         client_info: ClientInfo,
         send_elicitation: SendElicitation,
-        tool_list_changed: Arc<AtomicBool>,
+        tool_list_changed: Arc<AtomicU64>,
     ) -> Self {
         Self {
             client_info,
@@ -93,7 +93,7 @@ impl ClientHandler for LoggingClientHandler {
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
         info!("MCP server tool list changed");
-        self.tool_list_changed.store(true, Ordering::Release);
+        self.tool_list_changed.fetch_add(1, Ordering::AcqRel);
     }
 
     async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {

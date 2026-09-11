@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -385,18 +385,17 @@ pub struct RmcpClient {
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery_lock: Semaphore,
     elicitation_pause_state: ElicitationPauseState,
-    tool_list_changed: Arc<AtomicBool>,
+    tool_list_changed: Arc<AtomicU64>,
 }
 
 impl RmcpClient {
-    /// Returns and clears a server-issued tools/list_changed notification.
-    /// The MCP owner must relist before publishing a new model binding.
-    pub fn take_tool_list_changed(&self) -> bool {
-        self.tool_list_changed.swap(false, Ordering::AcqRel)
+    /// Monotonic notification revision. Reading never consumes a concurrent change.
+    pub fn tool_list_change_revision(&self) -> u64 {
+        self.tool_list_changed.load(Ordering::Acquire)
     }
 
     pub fn mark_tool_list_changed(&self) {
-        self.tool_list_changed.store(true, Ordering::Release);
+        self.tool_list_changed.fetch_add(1, Ordering::AcqRel);
     }
     /// Returns the protocol compatibility policy captured when this client was created.
     pub fn protocol_mode(&self) -> McpProtocolMode {
@@ -421,7 +420,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
-            tool_list_changed: Arc::new(AtomicBool::new(false)),
+            tool_list_changed: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -495,7 +494,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
-            tool_list_changed: Arc::new(AtomicBool::new(false)),
+            tool_list_changed: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -595,7 +594,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
-            tool_list_changed: Arc::new(AtomicBool::new(false)),
+            tool_list_changed: Arc::new(AtomicU64::new(0)),
         })
     }
 

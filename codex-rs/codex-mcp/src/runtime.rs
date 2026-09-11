@@ -353,6 +353,7 @@ impl McpRuntime {
         required_servers: &[String],
     ) -> Option<Arc<McpBinding>> {
         let config = Arc::clone(current.config.as_ref()?);
+        current.connections.refresh_notified_tool_catalogs().await;
         let stable_catalog_revisions = current.connections.stable_catalog_revisions().await;
         if let Some(catalog_revisions) = &stable_catalog_revisions {
             let cached = current
