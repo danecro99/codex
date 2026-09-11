@@ -10,6 +10,7 @@ use futures::future::join_all;
 use tracing::Instrument;
 use tracing::instrument;
 use tracing::trace;
+use tracing::warn;
 use tracing::trace_span;
 
 use super::McpConnectionSet;
@@ -96,8 +97,20 @@ impl McpConnectionSet {
             if !view.connection.client.take_tool_list_changed() {
                 continue;
             }
-            let Ok(client) = view.connection.client().await else {
-                continue;
+            let client = match view.connection.client().await {
+                Ok(client) => client,
+                Err(error) => {
+                    // A notification came from this exact transport, so its
+                    // formerly published form cannot remain authoritative.
+                    // Publish an unavailable affected server and advance the
+                    // revision; other servers keep their current bindings.
+                    if let Some(ready) = view.connection.client.ready_client() {
+                        ready.replace_listed_tools(Vec::new());
+                    }
+                    changed = true;
+                    warn!(server_name, "MCP tools/list_changed server is no longer ready: {error:#}");
+                    continue;
+                }
             };
             if let Some(cache) = view.connection.client.tool_catalog_cache_context.as_ref() {
                 cache.invalidate();
@@ -116,8 +129,14 @@ impl McpConnectionSet {
                     changed = true;
                 }
                 Err(error) => {
+                    // Do not let a previously captured catalog survive a known
+                    // failed refresh. The next model binding omits only this
+                    // server, invalidates its cached definition, and retries
+                    // the relist from this same client on its next boundary.
+                    client.replace_listed_tools(Vec::new());
                     client.client.mark_tool_list_changed();
-                    trace!(server_name, "MCP tools/list after notification failed: {error:#}");
+                    changed = true;
+                    warn!(server_name, "MCP tools/list after notification failed: {error:#}");
                 }
             }
         }

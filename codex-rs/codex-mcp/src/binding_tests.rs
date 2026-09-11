@@ -377,3 +377,29 @@ async fn preparation_holds_catalog_authority_until_it_finishes() {
         .expect_err("the test preparation should stop the call");
     assert!(step.tool_catalog_revision.try_write().is_ok());
 }
+
+#[tokio::test]
+async fn refreshed_catalog_stays_with_the_reused_managed_client() {
+    let step = test_step(
+        "old",
+        AppToolApproval::Prompt,
+        /*supports_sandbox_state_meta*/ true,
+    )
+    .await;
+    let managed = step
+        .step
+        .clients
+        .client(SERVER_NAME)
+        .expect("binding retains the exact managed client");
+    let mut replacement = managed.listed_tools();
+    replacement[0].tool.description = Some("refreshed catalog".to_string());
+    managed.replace_listed_tools(replacement);
+
+    // Configuration reconciliation may publish a fresh connection set while
+    // retaining this exact ManagedClient. Its catalog is client-owned, not a
+    // transient connection-set override.
+    assert_eq!(
+        managed.listed_tools()[0].tool.description.as_deref(),
+        Some("refreshed catalog")
+    );
+}
