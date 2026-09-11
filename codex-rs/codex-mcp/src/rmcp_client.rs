@@ -16,12 +16,12 @@ use std::env;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::client_tool_catalog::ClientToolCatalog;
 use crate::codex_apps::normalize_codex_apps_callable_name;
 use crate::codex_apps::normalize_codex_apps_callable_namespace;
 use crate::codex_apps::normalize_codex_apps_tool_title;
@@ -114,8 +114,7 @@ const UNTRUSTED_CONNECTOR_META_KEYS: &[&str] = &[
 pub(crate) struct ManagedClient {
     pub(crate) client: Arc<RmcpClient>,
     pub(crate) server_info: McpServerInfo,
-    pub(crate) tools: Vec<ToolInfo>,
-    pub(crate) refreshed_tools: Arc<StdRwLock<Option<Vec<ToolInfo>>>>,
+    pub(crate) tool_catalog: Arc<ClientToolCatalog>,
     pub(crate) tool_timeout: Option<Duration>,
     pub(crate) server_instructions: Option<String>,
     pub(crate) server_supports_sandbox_state_meta_capability: bool,
@@ -123,41 +122,28 @@ pub(crate) struct ManagedClient {
 }
 
 impl ManagedClient {
-    pub(crate) fn listed_tools(&self) -> Vec<ToolInfo> {
+    pub(crate) async fn listed_tools(&self) -> Vec<ToolInfo> {
         let total_start = Instant::now();
-        if let Some(tools) = self
-            .codex_apps_tools_cache_context
-            .as_ref()
-            .and_then(ConnectorRuntimeContext::current_tools)
-        {
-            emit_duration(
-                MCP_TOOLS_LIST_DURATION_METRIC,
-                total_start.elapsed(),
-                &[("cache", "hit")],
-            );
-            return tools;
-        }
-
-        if self.codex_apps_tools_cache_context.is_some() {
-            emit_duration(
-                MCP_TOOLS_LIST_DURATION_METRIC,
-                total_start.elapsed(),
-                &[("cache", "miss")],
-            );
-        }
-
-        self.refreshed_tools
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .unwrap_or_else(|| self.tools.clone())
-    }
-
-    pub(crate) fn replace_listed_tools(&self, tools: Vec<ToolInfo>) {
-        *self
-            .refreshed_tools
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tools);
+        self.tool_catalog
+            .read(|catalog| {
+                // Discovery may use the shared cache until this client is refreshed.
+                // Executable bindings always capture this client's own catalog.
+                if catalog.revision == 0
+                    && let Some(cache_context) = &self.codex_apps_tools_cache_context
+                {
+                    let tools = cache_context.current_tools();
+                    emit_duration(
+                        MCP_TOOLS_LIST_DURATION_METRIC,
+                        total_start.elapsed(),
+                        &[("cache", if tools.is_some() { "hit" } else { "miss" })],
+                    );
+                    if let Some(tools) = tools {
+                        return tools;
+                    }
+                }
+                catalog.tools.clone()
+            })
+            .await
     }
 }
 
@@ -538,11 +524,6 @@ impl AsyncManagedClient {
         self.ready_client().map(|client| client.client)
     }
 
-    pub(crate) fn take_tool_list_changed(&self) -> bool {
-        self.ready_transport()
-            .is_some_and(|client| client.take_tool_list_changed())
-    }
-
     pub(crate) async fn reconnect_failed_startup(&self) {
         let Some(startup_reconnect) = self.startup_reconnect.as_ref() else {
             return;
@@ -599,7 +580,7 @@ impl AsyncManagedClient {
             Some(startup_tools)
         } else {
             match self.client().await {
-                Ok(client) => Some(client.listed_tools()),
+                Ok(client) => Some(client.listed_tools().await),
                 Err(_) if self.is_codex_apps_mcp_server => self.cached_tools(),
                 Err(_) => None,
             }
@@ -990,8 +971,7 @@ async fn start_server_task(
     let managed = ManagedClient {
         client: Arc::clone(&client),
         server_info,
-        tools: client_tools,
-        refreshed_tools: Arc::new(StdRwLock::new(None)),
+        tool_catalog: Arc::new(ClientToolCatalog::new(client_tools)),
         tool_timeout: None,
         server_instructions: initialize_result.instructions,
         server_supports_sandbox_state_meta_capability,
