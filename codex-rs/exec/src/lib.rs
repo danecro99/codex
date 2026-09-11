@@ -3,6 +3,8 @@
 // - In --json mode, stdout must be valid JSONL, one event per line.
 // For both modes, any other output must be written to stderr.
 #![deny(clippy::print_stdout)]
+// Match App Server's type-layout budget for its in-process async dispatch.
+#![recursion_limit = "256"]
 
 mod cli;
 mod event_processor;

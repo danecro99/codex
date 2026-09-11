@@ -1,3 +1,6 @@
+// This binary instantiates the same App Server futures as Exec and TUI.
+#![recursion_limit = "256"]
+
 use clap::Args;
 use clap::CommandFactory;
 use clap::Parser;

@@ -368,10 +368,7 @@ impl Session {
             .current_binding_with_required_servers(&required_servers)
             .await
         {
-            // Keep the history-write future behind an indirection here. Embedding
-            // it in the MCP capture future overflows async layout recursion in
-            // the macOS App Server consumers (Exec and TUI).
-            Box::pin(self.record_mcp_catalog_errors(turn_context, &binding)).await;
+            self.record_mcp_catalog_errors(turn_context, &binding).await;
             return binding;
         }
         let config = Arc::new(self.runtime_mcp_config(&turn_context.config).await);
