@@ -24,9 +24,6 @@ use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::RolloutItem;
 use codex_rollout::ScanOutcome;
 
-#[cfg(test)]
-use codex_rollout::RolloutLine;
-
 const MAX_TRANSCRIPT_PREVIEW_LINES: usize = 6;
 const TRANSCRIPT_PREVIEW_ITEMS_PAGE_SIZE: u32 = 6;
 const MAX_LEGACY_TRANSCRIPT_PREVIEW_SCAN_BYTES: usize = 1024 * 1024;
@@ -79,6 +76,7 @@ pub(crate) async fn load_transcript_preview(
                     /*turn_cursor*/ None,
                     /*item_cursor*/ None,
                     /*config*/ None,
+                    /*local_settings*/ None,
                     HistoryHydrationScope::Initial,
                 )
                 .await

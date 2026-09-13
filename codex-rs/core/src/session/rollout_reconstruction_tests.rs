@@ -1113,6 +1113,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
@@ -1178,6 +1179,7 @@ async fn record_initial_history_requires_surviving_full_snapshot_without_user_tu
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(Vec::new()),
+                retained_context: None,
                 guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: None,
@@ -1215,6 +1217,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
@@ -1290,6 +1293,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: Some(2),
@@ -1329,6 +1333,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(Vec::new()),
+                retained_context: None,
                 guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: Some(1),
@@ -1394,6 +1399,7 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions() {
                     replacement_history: Some(annotated(vec![assistant_message(&format!(
                         "summary-{window_number}"
                     ))])),
+                    retained_context: None,
                     guardian_history: Some(codex_history::GuardianHistoryCheckpoint(vec![
                         user_message("original task"),
                     ])),
@@ -1505,6 +1511,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
@@ -1532,12 +1539,28 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
 async fn reconstruct_history_legacy_compaction_without_replacement_history_does_not_inject_current_initial_context()
  {
     let (session, turn_context) = make_session_and_context().await;
+    let answer = codex_history::RetainedContextEvent::VerifiedAnswer {
+        answer: codex_history::VerifiedAnswer {
+            turn_id: "legacy-turn".to_owned(),
+            call_id: "ask-1".to_owned(),
+            questions: vec![codex_history::VerifiedQuestionAnswer {
+                question: "Upload?".to_owned(),
+                answer: "Only privately.".to_owned(),
+            }],
+        },
+        acceptance_order: None,
+    };
+    let mut retained = codex_history::RetainedContext::default();
+    retained.mark_user_messages_incomplete();
+    retained.record(&answer);
     let rollout_items = vec![
         RolloutItem::ResponseItem(user_message("before compact").into()),
         RolloutItem::ResponseItem(assistant_message("assistant reply").into()),
+        RolloutItem::RetainedContext(answer),
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
@@ -1561,6 +1584,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
         ])
     );
     assert!(reconstructed.reference_context_item.is_none());
+    assert_eq!(reconstructed.retained_context, retained);
 }
 
 #[tokio::test]
@@ -1577,6 +1601,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
@@ -1685,6 +1710,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
@@ -1859,6 +1885,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
@@ -2121,6 +2148,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
@@ -2303,6 +2331,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
@@ -2429,6 +2458,7 @@ async fn checkpoint_suffix_replay_is_equivalent_and_rollback_crossing_fence_is_l
         RolloutItem::Compacted(CompactedItem {
             message: "summary".to_string(),
             replacement_history: Some(first_history),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: Some(mcp_resource_origins.clone()),
             window_number: Some(3),
@@ -2532,14 +2562,32 @@ async fn checkpoint_suffix_replay_is_equivalent_and_rollback_crossing_fence_is_l
         )),
     ];
 
+    let retained_event = codex_history::RetainedContextEvent::VerifiedAnswer {
+        answer: codex_history::VerifiedAnswer {
+            turn_id: "turn-1".to_string(),
+            call_id: "approval-before-checkpoint".to_string(),
+            questions: vec![codex_history::VerifiedQuestionAnswer {
+                question: "May the scoped operation proceed?".to_string(),
+                answer: "Only for this fixture.".to_string(),
+            }],
+        },
+        acceptance_order: Some(3),
+    };
+    let mut prefix = prefix;
+    prefix.push(RolloutItem::RetainedContext(retained_event));
     let prefix_state = session
         .reconstruct_resume_state(&turn_context, &prefix, None)
         .await
         .expect("reconstruct checkpoint prefix");
+    assert_ne!(
+        prefix_state.retained_context,
+        codex_history::RetainedContext::default()
+    );
     let materialized_state = MaterializedResumeState {
         version: MATERIALIZED_RESUME_STATE_VERSION,
         materialized_model: "test-model".to_string(),
         history: Arc::clone(&prefix_state.history),
+        retained_context: prefix_state.retained_context.clone(),
         guardian_history: prefix_state.guardian_history.clone(),
         previous_turn_settings: prefix_state
             .previous_turn_settings
@@ -2669,6 +2717,7 @@ async fn materialized_prefill_is_consumed_for_body_after_prefix_scope() {
         version: MATERIALIZED_RESUME_STATE_VERSION,
         materialized_model: "test-model".to_string(),
         history: Arc::new(Vec::new()),
+        retained_context: Default::default(),
         guardian_history: None,
         previous_turn_settings: None,
         reference_context_item: None,

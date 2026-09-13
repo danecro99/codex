@@ -1,9 +1,10 @@
 # Live MCP catalog refresh: custom implementation contract
 
-This custom 0.153.4 change preserves the existing private auth-home, runtime
-MCP, durable history and compaction contracts. It backports OpenAI commit
-`32351a7b1ae3d6106fb2b7adccfbd6051e375ce6`'s client-owned catalog foundation;
-it is not an upgrade to the complete 0.154 release.
+This implementation is integrated with the complete upstream 0.154.0 release
+(`rust-v0.154.0`, `6b9826e3aa83b1a5947db50f4332cb9c65f1b340`). It preserves
+the private auth-home, runtime MCP, durable history and compaction contracts.
+The client-owned catalog foundation is now upstream; notification-driven
+refresh and fail-closed revision binding below remain our explicit extension.
 
 ## Ownership and update boundary
 

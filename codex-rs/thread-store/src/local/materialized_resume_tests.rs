@@ -159,6 +159,7 @@ fn state() -> MaterializedResumeState {
         version: MATERIALIZED_RESUME_STATE_VERSION,
         materialized_model: "test-model".to_string(),
         history: Arc::new(Vec::new()),
+        retained_context: Default::default(),
         guardian_history: None,
         previous_turn_settings: None,
         reference_context_item: None,
@@ -1195,6 +1196,7 @@ async fn a_large_compaction_is_verified_replayed_and_followed_by_another_append(
     let compacted = RolloutItem::Compacted(codex_rollout::CompactedItem {
         message: "large replacement history".to_string(),
         replacement_history: Some(vec![replacement]),
+        retained_context: None,
         guardian_history: None,
         mcp_resource_origins: None,
         window_number: None,
@@ -2020,6 +2022,10 @@ async fn obsolete_resume_namespaces_are_an_explicit_first_use_miss() {
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     for (directory, contents) in [
         ("materialized_resume_state_v1", b"obsolete-state".as_slice()),
+        (
+            "materialized_resume_state_v5",
+            b"no-retained-context".as_slice(),
+        ),
         (
             "materialized_resume_state_v4",
             b"superseded-state".as_slice(),

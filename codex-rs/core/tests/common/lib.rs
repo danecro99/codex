@@ -95,7 +95,7 @@ pub fn discard_derived_resume_state(rollout_path: &Path) {
         )
     });
     for directory in [
-        "materialized_resume_state_v5",
+        "materialized_resume_state_v6",
         "rollout_append_generation_v5",
     ] {
         let path = codex_home.join(directory);

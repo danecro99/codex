@@ -1,4 +1,6 @@
 use anyhow::Result;
+use codex_protocol::models::ConfigurationReasoning;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -61,6 +63,7 @@ fn checkpoint_suffix_does_not_advertise_complete_initial_messages() {
                 version: MATERIALIZED_RESUME_STATE_VERSION,
                 materialized_model: "test-model".to_string(),
                 history: Arc::new(Vec::new()),
+                retained_context: RetainedContext::default(),
                 guardian_history: None,
                 previous_turn_settings: None,
                 reference_context_item: None,
@@ -104,7 +107,11 @@ fn response_item_rollout_line_preserves_shape() -> Result<()> {
         },
     });
 
-    let line = serde_json::from_value::<RolloutLine>(legacy_line.clone())?;
+    let line = RolloutLine {
+        timestamp: "2025-01-03T12:00:00.000Z".to_string(),
+        ordinal: Some(7),
+        item: serde_json::from_value(legacy_line.clone())?,
+    };
     let RolloutItem::ResponseItem(envelope) = &line.item else {
         panic!("expected response item");
     };
@@ -126,6 +133,8 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
                 fallback_token_limit_override: Some(20_000),
+                inherited_user_message: true,
+                ..Default::default()
             }),
         }),
     };
@@ -138,13 +147,17 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             "ordinal": 7,
             "type": "response_item",
             "payload": response_item,
-            "metadata": { "client_authored": true, "fallback_token_limit_override": 20_000 },
+            "metadata": {
+                "client_authored": true,
+                "fallback_token_limit_override": 20_000,
+                "inherited_user_message": true,
+            },
         })
     );
     assert_eq!(serialized["payload"].get("metadata"), None);
 
-    let restored = serde_json::from_value::<RolloutLine>(serialized)?;
-    let RolloutItem::ResponseItem(envelope) = restored.item else {
+    let restored = serde_json::from_value(serialized)?;
+    let RolloutItem::ResponseItem(envelope) = restored else {
         panic!("expected response item");
     };
     assert_eq!(
@@ -152,7 +165,55 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
         Some(CodexHarnessMetadata {
             client_authored: true,
             fallback_token_limit_override: Some(20_000),
+            inherited_user_message: true,
+            ..Default::default()
         })
+    );
+    Ok(())
+}
+
+#[test]
+fn response_item_envelope_preserves_harness_authored_configuration_provenance() -> Result<()> {
+    let response_item = ResponseItem::ConfigurationUpdate {
+        reasoning: ConfigurationReasoning {
+            effort: ReasoningEffort::High,
+        },
+    };
+    let metadata = CodexHarnessMetadata {
+        harness_authored_configuration: true,
+        ..Default::default()
+    };
+    let rollout_item = RolloutItem::ResponseItem(ResponseItemEnvelope {
+        item: response_item.clone(),
+        metadata: Some(metadata.clone()),
+    });
+
+    let serialized = serde_json::to_value(&rollout_item)?;
+    assert_eq!(
+        serialized,
+        json!({
+            "type": "response_item",
+            "payload": {
+                "type": "configuration_update",
+                "reasoning": { "effort": "high" },
+            },
+            "metadata": {
+                "client_authored": false,
+                "harness_authored_configuration": true,
+            },
+        })
+    );
+
+    let restored = serde_json::from_value::<RolloutItem>(serialized)?;
+    let RolloutItem::ResponseItem(envelope) = restored else {
+        panic!("expected response item");
+    };
+    assert_eq!(
+        envelope,
+        ResponseItemEnvelope {
+            item: response_item,
+            metadata: Some(metadata),
+        }
     );
     Ok(())
 }
@@ -160,7 +221,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
 #[test]
 /// Keeps future metadata fields from making older binaries reject persisted items.
 fn response_item_envelope_ignores_unknown_harness_metadata_fields() -> Result<()> {
-    let line = serde_json::from_value::<RolloutLine>(json!({
+    let line = serde_json::from_value(json!({
         "timestamp": "2025-01-03T12:00:00.000Z",
         "ordinal": 7,
         "type": "response_item",
@@ -177,7 +238,7 @@ fn response_item_envelope_ignores_unknown_harness_metadata_fields() -> Result<()
         },
     }))?;
 
-    let RolloutItem::ResponseItem(envelope) = line.item else {
+    let RolloutItem::ResponseItem(envelope) = line else {
         panic!("expected response item");
     };
     assert_eq!(envelope.metadata, Some(CodexHarnessMetadata::default()));
@@ -247,6 +308,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
             },
             ResponseItemEnvelope::new(compaction_item.clone()),
         ]),
+        retained_context: None,
         guardian_history: None,
         mcp_resource_origins: None,
         window_number: None,
@@ -357,6 +419,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
     let compacted_line = serde_json::to_value(RolloutItem::Compacted(CompactedItem {
         message: "summary".to_string(),
         replacement_history: Some(vec![envelope]),
+        retained_context: None,
         guardian_history: Some(checkpoint.clone()),
         mcp_resource_origins: Some(McpResourceOriginCheckpoint::default()),
         window_number: None,
@@ -481,6 +544,15 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
             "payload": { "type": "warning", "message": "heads up" },
         }),
         json!({
+            "type": "retained_context",
+            "payload": {
+                "type": "verified_answer",
+                "turn_id": "turn-1",
+                "call_id": "ask-1",
+                "questions": [{"question": "Publish?", "answer": "Only privately."}],
+            },
+        }),
+        json!({
             "type": "realtime_item",
             "payload": {
                 "id": "segment-1",
@@ -504,7 +576,7 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
 fn rollout_item_schema_matches_tagged_payload_and_sibling_metadata() -> Result<()> {
     let schema = serde_json::to_value(schemars::schema_for!(RolloutItem))?;
     let variants = schema["oneOf"].as_array().expect("rollout variants");
-    assert_eq!(variants.len(), 11);
+    assert_eq!(variants.len(), 12);
 
     for variant in variants {
         let required = variant["required"].as_array().expect("required fields");
@@ -555,6 +627,7 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
     let item = CompactedItem {
         message: "summary".to_string(),
         replacement_history: None,
+        retained_context: None,
         guardian_history: None,
         mcp_resource_origins: None,
         window_number: Some(3),
@@ -593,6 +666,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
         CompactedItem {
             message: "summary".to_string(),
             replacement_history: None,
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: Some(3),

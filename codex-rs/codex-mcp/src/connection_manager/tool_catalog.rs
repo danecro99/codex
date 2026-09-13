@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -87,7 +88,6 @@ impl McpConnectionSet {
         }))
         .await;
     }
-
     pub(crate) async fn stable_catalog_revisions(
         &self,
     ) -> Option<HashMap<String, ClientToolCatalogRevision>> {
@@ -128,9 +128,14 @@ impl McpConnectionSet {
     }
 
     /// Returns all tools with model-visible names normalized.
-    #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.servers.len()))]
     pub async fn list_all_tools(&self) -> Vec<ToolInfo> {
+        self.list_tools_with_errors().await.0
+    }
+
+    #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.servers.len()))]
+    pub(crate) async fn list_tools_with_errors(&self) -> (Vec<ToolInfo>, HashMap<String, String>) {
         let mut tools = Vec::new();
+        let mut errors = HashMap::new();
         let mut available_server_count = 0;
         let mut unavailable_server_count = 0;
         let server_results = join_all(self.servers.iter().map(|(server_name, view)| async move {
@@ -150,13 +155,11 @@ impl McpConnectionSet {
                     startup_complete
                 ))
                 .await;
-            match server_tools {
-                Ok(server_tools) => Some(
-                    server_tools
-                        .into_iter()
-                        .map(|tool| Self::with_server_metadata(tool, &view.metadata))
-                        .collect::<Vec<_>>(),
-                ),
+            let result = match server_tools {
+                Ok(server_tools) => Ok(server_tools
+                    .into_iter()
+                    .map(|tool| Self::with_server_metadata(tool, &view.metadata))
+                    .collect::<Vec<_>>()),
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
@@ -165,18 +168,22 @@ impl McpConnectionSet {
                         startup_complete,
                         "MCP server tools unavailable while building tool list"
                     );
-                    None
+                    Err(error)
                 }
-            }
+            };
+            (server_name, result)
         }))
         .await;
-        for server_tools in server_results {
+        for (server_name, server_tools) in server_results {
             match server_tools {
-                Some(server_tools) => {
+                Ok(server_tools) => {
                     available_server_count += 1;
                     tools.extend(server_tools);
                 }
-                None => unavailable_server_count += 1,
+                Err(error) => {
+                    unavailable_server_count += 1;
+                    errors.insert(server_name.clone(), error.to_string());
+                }
             }
         }
         let tools = normalize_tools_for_model_with_prefix(
@@ -190,7 +197,7 @@ impl McpConnectionSet {
             tool_count = tools.len(),
             "built MCP tool list"
         );
-        tools
+        (tools, errors)
     }
 
     pub(crate) async fn capture_binding_with_metadata(
@@ -198,6 +205,7 @@ impl McpConnectionSet {
         config: Arc<crate::McpConfig>,
         plugins_available: bool,
         required_servers: &[String],
+        required_plugins: &HashSet<String>,
     ) -> McpBinding {
         let mut listed_tools = Vec::new();
         let mut clients = HashMap::new();
@@ -218,10 +226,13 @@ impl McpConnectionSet {
                 let has_cached_tools = cached_tools.is_some();
                 let must_wait_for_startup = (required
                     && (!view.connection.startup_is_dormant() || !has_cached_tools))
-                    || self.is_selected_plugin_mcp_server(server_name)
                     || required_servers
                         .iter()
                         .any(|required| required == server_name)
+                    || (self.is_selected_plugin_mcp_server(server_name)
+                        && self
+                            .plugin_id_for_mcp_server_name(server_name)
+                            .is_some_and(|plugin_id| required_plugins.contains(plugin_id)))
                     || (server_name == CODEX_APPS_MCP_SERVER_NAME && !has_cached_tools);
                 if !must_wait_for_startup && has_cached_tools {
                     return (server_name, view, cached_tools);

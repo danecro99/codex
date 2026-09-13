@@ -6,6 +6,7 @@
 //! [`crate::connection_manager`].
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -337,20 +338,29 @@ impl McpRuntime {
 
     /// Captures the latest published configuration and live client handles.
     pub async fn current_binding(&self) -> Option<Arc<McpBinding>> {
-        self.current_binding_with_required_servers(&[]).await
+        self.current_binding_with_requirements(&[], &HashSet::new())
+            .await
     }
 
-    /// Captures the latest runtime, waiting for servers explicitly required by this turn.
-    pub async fn current_binding_with_required_servers(
+    /// Captures one runtime, waiting for explicitly required servers and selected plugins.
+    /// Plugin IDs are resolved by the captured connection set, even if a refresh publishes later.
+    pub async fn current_binding_with_requirements(
         &self,
         required_servers: &[String],
+        required_plugins: &HashSet<String>,
     ) -> Option<Arc<McpBinding>> {
-        Self::binding_from_published_runtime(self.current.load_full(), required_servers).await
+        Self::binding_from_published_runtime(
+            self.current.load_full(),
+            required_servers,
+            required_plugins,
+        )
+        .await
     }
 
     async fn binding_from_published_runtime(
         current: Arc<PublishedMcpRuntime>,
         required_servers: &[String],
+        required_plugins: &HashSet<String>,
     ) -> Option<Arc<McpBinding>> {
         let config = Arc::clone(current.config.as_ref()?);
         current.connections.refresh_notified_tool_catalogs().await;
@@ -370,7 +380,12 @@ impl McpRuntime {
         let binding = Arc::new(
             current
                 .connections
-                .capture_binding_with_metadata(config, current.plugins_available, required_servers)
+                .capture_binding_with_metadata(
+                    config,
+                    current.plugins_available,
+                    required_servers,
+                    required_plugins,
+                )
                 .await,
         );
         if let Some(catalog_revisions) = stable_catalog_revisions
@@ -453,7 +468,12 @@ impl McpRuntime {
         if !current.connections.wait_for_server_startup(server).await {
             return None;
         }
-        Self::binding_from_published_runtime(current, /*required_servers*/ &[]).await
+        Self::binding_from_published_runtime(
+            current,
+            /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
+        )
+        .await
     }
 
     /// Returns the latest published configuration without waiting for clients.
@@ -918,12 +938,14 @@ mod tests {
         let before = McpRuntime::binding_from_published_runtime(
             Arc::clone(&published),
             /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
         )
         .await
         .expect("initial binding");
         let repeated = McpRuntime::binding_from_published_runtime(
             Arc::clone(&published),
             /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
         )
         .await
         .expect("cached initial binding");
@@ -934,6 +956,7 @@ mod tests {
         let refreshed = McpRuntime::binding_from_published_runtime(
             Arc::clone(&published),
             /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
         )
         .await
         .expect("refreshed binding");
@@ -952,10 +975,13 @@ mod tests {
                 .to_string()
                 .contains("reached refreshed call preparation")
         );
-        let repeated =
-            McpRuntime::binding_from_published_runtime(published, /*required_servers*/ &[])
-                .await
-                .expect("cached refreshed binding");
+        let repeated = McpRuntime::binding_from_published_runtime(
+            published,
+            /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
+        )
+        .await
+        .expect("cached refreshed binding");
         assert!(Arc::ptr_eq(&refreshed, &repeated));
         Ok(())
     }
@@ -977,12 +1003,14 @@ mod tests {
         let first = McpRuntime::binding_from_published_runtime(
             Arc::clone(&published),
             /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
         )
         .await
         .expect("first binding");
         let repeated = McpRuntime::binding_from_published_runtime(
             Arc::clone(&published),
             /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
         )
         .await
         .expect("repeated binding");
@@ -993,10 +1021,13 @@ mod tests {
             cached_binding: Mutex::new(None),
             ..previous
         });
-        let refreshed =
-            McpRuntime::binding_from_published_runtime(republished, /*required_servers*/ &[])
-                .await
-                .expect("republished binding");
+        let refreshed = McpRuntime::binding_from_published_runtime(
+            republished,
+            /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
+        )
+        .await
+        .expect("republished binding");
         assert!(!Arc::ptr_eq(&first, &refreshed));
     }
 

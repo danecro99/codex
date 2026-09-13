@@ -33,3 +33,36 @@ implementations may live outside this repository.
 
 New metadata observation semantics should live above `ThreadStore`. Stores
 persist explicit metadata fields, but raw history appends remain history-only.
+
+## Private resume state in the 0.154.0 integration
+
+`MaterializedResumeState` version 6 stores the upstream `RetainedContext` alongside
+model history and the remaining exact resume state. The canonical source is still
+the rollout, including retained-context events and compaction snapshots. Both full
+reconstruction and checkpoint-plus-suffix reconstruction must produce the same
+retained review evidence. Compaction persists this evidence with its checkpoint
+before replacing live session history.
+
+Reconstruction keeps upstream's two distinct boundaries: surviving provider-turn
+segments determine resume metadata and the newest surviving compaction; model
+history is folded from that checkpoint's original suffix through `ContextManager`,
+including its instruction-level rollback operation. A later steer in the same
+provider turn must not erase an earlier retained answer. Reverse-filtering those
+source items before the history fold would lose that evidence. A materialized
+checkpoint seeds the same fold, not a second transcript or an alternative reader.
+
+The current derived-state namespace is `materialized_resume_state_v6`. No previous
+namespace is read, rewritten, or treated as version 6. The existing first-use-miss
+path reconstructs from the canonical transcript and publishes a newly fenced
+version 6 checkpoint. Diagnostics report `Miss` for this first reconstruction;
+subsequent matching resumes can report `Hit`. Invalid data in the current namespace
+is an error, not permission to silently discard it and retry through another path.
+Original transcripts and append-generation journals are not migrated or truncated.
+
+The resume writer uses the upstream canonical reverse JSON decoder. For paginated
+history it must read the actual terminal record, including floating-point token
+counts, and assign the next ordinal. An invalid terminal record is refused before
+even newline repair; it is never skipped in favor of an older valid ordinal.
+Compaction cannot repair an already stopped writer. That runtime must only be
+replaced after preserving its available evidence; unsaved in-memory conversation
+content is not falsely promised as durable history.

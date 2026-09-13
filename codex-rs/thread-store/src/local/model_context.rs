@@ -402,7 +402,7 @@ fn scan_model_context_from_lineage_blocking(
         };
         loop {
             let before = scanner.bytes_read();
-            let outcome = scanner.scan_next::<serde_json::Value>()?;
+            let outcome = scanner.scan_next_rollout_line()?;
             source_bytes = source_bytes.saturating_add(scanner.bytes_read().saturating_sub(before));
             let Some(outcome) = outcome else {
                 break;
@@ -417,9 +417,7 @@ fn scan_model_context_from_lineage_blocking(
                 )
             };
             let line = match outcome {
-                ScanOutcome::Parsed(value) => {
-                    codex_rollout::decode_rollout_line(value).map_err(invalid_record)?
-                }
+                ScanOutcome::Parsed(line) => line,
                 ScanOutcome::Rejected(err) => return Err(invalid_record(err)),
             };
             source_items = source_items.saturating_add(1);

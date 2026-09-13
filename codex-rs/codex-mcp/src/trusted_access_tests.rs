@@ -534,7 +534,12 @@ async fn uses_the_checked_auth_snapshot_for_request_headers() -> anyhow::Result<
         /*status*/ 200,
         cyber_response("inactive", json!([])),
     ));
-    let context = context(chatgpt_auth("account-a"), client.clone());
+    let auth_home = tempfile::tempdir()?;
+    let mut context = context(chatgpt_auth("account-a"), client.clone());
+    context.auth_manager = AuthManager::from_auth_for_testing_with_home(
+        context.auth.clone(),
+        auth_home.path().to_path_buf(),
+    );
     let refreshed = CodexAuth::from_external_chatgpt_tokens(
         "header.e30.refreshed",
         "account-a",
@@ -612,7 +617,12 @@ async fn rejects_identity_changes_while_request_is_in_flight() -> anyhow::Result
         client.response_gate = Some((Notify::new(), Notify::new()));
         let client = Arc::new(client);
         let request_is_fedramp = initial_auth.is_fedramp_account();
-        let context = context(initial_auth, client.clone());
+        let auth_home = tempfile::tempdir()?;
+        let mut context = context(initial_auth, client.clone());
+        context.auth_manager = AuthManager::from_auth_for_testing_with_home(
+            context.auth.clone(),
+            auth_home.path().to_path_buf(),
+        );
         let auth_manager = &context.auth_manager;
         auth_manager
             .set_external_auth(Arc::new(StaticExternalAuth(context.auth.clone())))

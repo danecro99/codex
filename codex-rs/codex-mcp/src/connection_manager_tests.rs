@@ -229,6 +229,7 @@ async fn capture_binding(manager: &Arc<McpConnectionSet>) -> McpBinding {
             Arc::new(config),
             /*plugins_available*/ false,
             /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
         )
         .await
 }
@@ -455,6 +456,7 @@ async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {
             .expect("create in-process RMCP client"),
     );
     ManagedClient {
+        _auth_change_notifications: None,
         client: Arc::clone(&client),
         server_info: create_test_server_info("Ready"),
         tool_catalog: Arc::new(ClientToolCatalog::new(tools, client)),
@@ -754,6 +756,7 @@ pub(crate) async fn create_test_manager_with_ready_apps_client(
         .await?;
 
     let managed_client = ManagedClient {
+        _auth_change_notifications: None,
         client: Arc::clone(&client),
         server_info: create_test_server_info("Codex Apps"),
         tool_catalog: Arc::new(ClientToolCatalog::new(vec![tool], client)),
@@ -905,7 +908,11 @@ async fn disabled_permissions_auto_accept_elicitation_with_empty_form_schema() {
         ElicitationRequestRouter::default(),
     );
     let (tx_event, _rx_event) = async_channel::bounded(1);
-    let sender = manager.make_sender("server".to_string(), Some(tx_event));
+    let sender = manager.make_sender(
+        "server".to_string(),
+        Some(tx_event),
+        &ClientMcpExtensions::default(),
+    );
 
     let response = sender(
         NumberOrString::Number(1),
@@ -939,7 +946,11 @@ async fn disabled_permissions_do_not_auto_accept_elicitation_with_requested_fiel
         ElicitationRequestRouter::default(),
     );
     let (tx_event, _rx_event) = async_channel::bounded(1);
-    let sender = manager.make_sender("server".to_string(), Some(tx_event));
+    let sender = manager.make_sender(
+        "server".to_string(),
+        Some(tx_event),
+        &ClientMcpExtensions::default(),
+    );
 
     let response = sender(
         NumberOrString::Number(1),
@@ -1030,7 +1041,11 @@ async fn assert_elicitation_declined_with_reviewer_calls(
         full_access_form_input_enabled_router(),
     );
     let (tx_event, rx_event) = async_channel::bounded(1);
-    let sender = manager.make_sender(server_name.to_string(), Some(tx_event));
+    let sender = manager.make_sender(
+        server_name.to_string(),
+        Some(tx_event),
+        &ClientMcpExtensions::default(),
+    );
 
     let response = tokio::select! {
         biased;
@@ -1070,7 +1085,11 @@ async fn assert_requested_user_input_is_declined(
         router,
     );
     let (tx_event, rx_event) = async_channel::bounded(1);
-    let sender = manager.make_sender("server".to_string(), Some(tx_event));
+    let sender = manager.make_sender(
+        "server".to_string(),
+        Some(tx_event),
+        &ClientMcpExtensions::default(),
+    );
 
     let response = tokio::select! {
         biased;
@@ -1157,7 +1176,11 @@ async fn assert_disabled_permissions_surface_requested_user_input(
         router.clone(),
     );
     let (tx_event, rx_event) = async_channel::bounded(1);
-    let sender = manager.make_sender("server".to_string(), Some(tx_event));
+    let sender = manager.make_sender(
+        "server".to_string(),
+        Some(tx_event),
+        &ClientMcpExtensions::default(),
+    );
     let requested_schema = requested_user_input_schema();
     let mut pending = tokio::spawn(sender(
         NumberOrString::Number(1),
@@ -1302,7 +1325,11 @@ async fn disabled_permissions_decline_user_input_without_an_event_channel() {
         /*lifecycle*/ None,
         full_access_form_input_enabled_router(),
     );
-    let sender = manager.make_sender("server".to_string(), /*tx_event*/ None);
+    let sender = manager.make_sender(
+        "server".to_string(),
+        /*tx_event*/ None,
+        &ClientMcpExtensions::default(),
+    );
 
     let response = sender(
         NumberOrString::Number(1),
@@ -1360,7 +1387,11 @@ async fn concurrent_authority_updates_never_auto_approve_mixed_policy() {
             ));
         }
     });
-    let sender = manager.make_sender("server".to_string(), /*tx_event*/ None);
+    let sender = manager.make_sender(
+        "server".to_string(),
+        /*tx_event*/ None,
+        &ClientMcpExtensions::default(),
+    );
     let elicitation =
         codex_rmcp_client::Elicitation::Mcp(ElicitRequestParams::FormElicitationParams {
             meta: None,
@@ -1427,8 +1458,16 @@ async fn shared_elicitation_router_targets_the_exact_pending_request() {
         router.clone(),
     );
     let (tx_event, rx_event) = async_channel::bounded(2);
-    let sender_a = manager_a.make_sender("server".to_string(), Some(tx_event.clone()));
-    let sender_b = manager_b.make_sender("server".to_string(), Some(tx_event));
+    let sender_a = manager_a.make_sender(
+        "server".to_string(),
+        Some(tx_event.clone()),
+        &ClientMcpExtensions::default(),
+    );
+    let sender_b = manager_b.make_sender(
+        "server".to_string(),
+        Some(tx_event),
+        &ClientMcpExtensions::default(),
+    );
     let elicitation =
         codex_rmcp_client::Elicitation::Mcp(ElicitRequestParams::FormElicitationParams {
             meta: None,
@@ -1523,7 +1562,11 @@ async fn cancelled_elicitation_is_removed_without_affecting_other_pending_reques
         router.clone(),
     );
     let (tx_event, rx_event) = async_channel::bounded(2);
-    let sender = manager.make_sender("server".to_string(), Some(tx_event));
+    let sender = manager.make_sender(
+        "server".to_string(),
+        Some(tx_event),
+        &ClientMcpExtensions::default(),
+    );
     let elicitation =
         codex_rmcp_client::Elicitation::Mcp(ElicitRequestParams::FormElicitationParams {
             meta: None,
@@ -2648,10 +2691,17 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
         serde_json::from_value(serde_json::json!({ "command": "optional-plugin" }))
             .expect("optional plugin MCP config"),
     ));
+    catalog.register(crate::McpServerRegistration::from_selected_plugin(
+        "pending-selected".to_string(),
+        crate::McpPluginAttribution::new("selected-plugin".to_string(), "Selected".to_string()),
+        /*selection_order*/ 0,
+        serde_json::from_value(serde_json::json!({ "command": "selected-plugin" }))
+            .expect("selected plugin MCP config"),
+    ));
     plugin_config.mcp_server_catalog = catalog.build();
     plugin_config.optional_mcp_startup_grace = Duration::from_millis(250);
     manager.tool_plugin_provenance = Arc::new(crate::tool_plugin_provenance(&plugin_config));
-    for server_name in ["pending-one", "pending-two"] {
+    for server_name in ["pending-one", "pending-two", "pending-selected"] {
         manager.insert_test_client(
             server_name.to_string(),
             AsyncManagedClient {
@@ -2669,19 +2719,34 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
         );
     }
 
+    let mut required_manager = McpConnectionSet::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    required_manager.tool_plugin_provenance = Arc::clone(&manager.tool_plugin_provenance);
+    required_manager.insert_test_client(
+        "pending-selected",
+        manager.test_client("pending-selected").clone(),
+    );
+    required_manager.required_servers = vec!["pending-selected".to_string()];
+
     let manager = Arc::new(manager);
     assert!(manager.stable_catalog_revisions().await.is_none());
+    let started = tokio::time::Instant::now();
     let binding = tokio::time::timeout(
         Duration::from_millis(500),
         manager.capture_binding_with_metadata(
             Arc::new(plugin_config),
             /*plugins_available*/ false,
             /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
         ),
     )
     .await
     .expect("all optional servers should share the configured startup grace");
     assert!(binding.tools().is_empty());
+    assert_eq!(started.elapsed(), Duration::from_millis(250));
 
     let binding = tokio::time::timeout(Duration::from_millis(1), capture_binding(&manager))
         .await
@@ -2707,17 +2772,52 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
         "resource discovery must not wait for an omitted optional server"
     );
 
-    let required_servers = vec!["pending-one".to_string()];
-    let binding = tokio::time::timeout(
-        Duration::from_millis(1),
-        manager.capture_binding_with_metadata(
-            Arc::new(crate::mcp::tests::test_mcp_config(std::env::temp_dir())),
-            /*plugins_available*/ false,
-            &required_servers,
-        ),
-    )
-    .await;
-    assert!(binding.is_err(), "explicitly requested servers must wait");
+    for server_name in ["pending-one", "pending-selected"] {
+        let required_servers = vec![server_name.to_string()];
+        let binding = tokio::time::timeout(
+            Duration::from_millis(1),
+            manager.capture_binding_with_metadata(
+                Arc::new(crate::mcp::tests::test_mcp_config(std::env::temp_dir())),
+                /*plugins_available*/ false,
+                &required_servers,
+                /*required_plugins*/ &HashSet::new(),
+            ),
+        )
+        .await;
+        assert!(binding.is_err(), "explicitly requested servers must wait");
+    }
+    // A plugin mention must still require startup after the optional grace has elapsed.
+    for (plugin_id, must_wait) in [
+        ("selected-plugin", true),
+        ("optional-plugin", false),
+        ("selected-plugin-other", false),
+    ] {
+        let required_plugins = HashSet::from([plugin_id.to_string()]);
+        let binding = tokio::time::timeout(
+            Duration::from_millis(1),
+            manager.capture_binding_with_metadata(
+                Arc::new(crate::mcp::tests::test_mcp_config(std::env::temp_dir())),
+                /*plugins_available*/ false,
+                /*required_servers*/ &[],
+                &required_plugins,
+            ),
+        )
+        .await;
+        assert_eq!(
+            binding.is_err(),
+            must_wait,
+            "plugin requirement {plugin_id}"
+        );
+    }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(1500),
+            capture_binding(&Arc::new(required_manager)),
+        )
+        .await
+        .is_err(),
+        "configured-required selected plugin servers must wait beyond the optional grace"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -2746,6 +2846,7 @@ async fn capture_binding_waits_for_optional_startup_when_shared_grace_is_disable
                 Arc::new(config),
                 /*plugins_available*/ false,
                 /*required_servers*/ &[],
+                /*required_plugins*/ &HashSet::new(),
             )
             .await
     });
@@ -2874,6 +2975,7 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
                 Arc::new(disabled_config),
                 /*plugins_available*/ false,
                 /*required_servers*/ &[],
+                /*required_plugins*/ &HashSet::new(),
             ),
         )
         .await
@@ -2901,6 +3003,7 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
             Arc::new(updated_config),
             /*plugins_available*/ false,
             /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
         ),
     )
     .await
@@ -4978,6 +5081,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
     )
     .await?;
     let managed_client = ManagedClient {
+        _auth_change_notifications: None,
         client: Arc::clone(&client),
         server_info: create_test_server_info("Mutable tools"),
         tool_catalog: Arc::new(ClientToolCatalog::new(initial_tools, Arc::clone(&client))),

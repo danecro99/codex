@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::*;
+use crate::compact;
+use crate::context::GuardianContextMode;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_history::GuardianHistoryCheckpoint;
@@ -23,6 +25,7 @@ const NEEDS_COMPACTION: &str = "codex_resume_state_needs_compaction";
 pub(super) struct RolloutReconstruction {
     pub(super) history: Arc<Vec<ResponseItemEnvelope>>,
     pub(super) guardian_history: Option<GuardianHistoryCheckpoint>,
+    pub(super) retained_context: codex_history::RetainedContext,
     pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
@@ -92,7 +95,6 @@ struct ResumeReplayReducer {
     mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
     owned_startup_cwd: Option<PathBuf>,
     thread_id: ThreadId,
-    truncation_policy: TruncationPolicy,
     checkpoint_suffix: bool,
     legacy_compaction_count: u64,
     saw_legacy_window: bool,
@@ -136,10 +138,12 @@ impl SeededResumeState {
 impl ResumeReplayReducer {
     fn new(
         thread_id: ThreadId,
-        truncation_policy: TruncationPolicy,
         materialized_state: Option<&MaterializedResumeState>,
+        guardian_context_mode: GuardianContextMode,
+        session_source: &SessionSource,
     ) -> anyhow::Result<Self> {
-        let mut history = ContextManager::new();
+        let mut history =
+            ContextManager::with_guardian_context_mode(guardian_context_mode, session_source);
         let seeded = match materialized_state {
             Some(state) => Self::seed_from_materialized_state(&mut history, state)?,
             None => SeededResumeState::empty(),
@@ -157,7 +161,6 @@ impl ResumeReplayReducer {
             mcp_resource_origins: seeded.mcp_resource_origins,
             owned_startup_cwd: seeded.owned_startup_cwd,
             thread_id,
-            truncation_policy,
             checkpoint_suffix: materialized_state.is_some(),
             legacy_compaction_count: 0,
             saw_legacy_window: false,
@@ -179,7 +182,10 @@ impl ResumeReplayReducer {
             );
         }
         history.replace_annotated_arc(Arc::clone(&state.history));
-        history.restore_guardian_history(state.guardian_history.as_ref());
+        history.restore_review_context(
+            Some(&state.retained_context),
+            state.guardian_history.as_ref(),
+        );
         let world_state_baseline = state
             .world_state_baseline
             .as_ref()
@@ -232,6 +238,7 @@ impl ResumeReplayReducer {
 
     fn apply(&mut self, item: &RolloutItem) -> anyhow::Result<()> {
         match item {
+            RolloutItem::RetainedContext(_) => {}
             RolloutItem::SessionMeta(session_meta) => {
                 if !self.checkpoint_suffix && self.window.is_none() {
                     self.window = session_meta
@@ -245,17 +252,10 @@ impl ResumeReplayReducer {
                 let is_user_turn = is_user_turn_boundary(&response_item.item);
                 self.active_segment().counts_as_user_turn |= is_user_turn;
                 self.has_prior_user_turns |= is_user_turn;
-                self.history.record_annotated_items(
-                    std::slice::from_ref(response_item),
-                    self.truncation_policy,
-                );
             }
-            RolloutItem::InterAgentCommunication(communication) => {
+            RolloutItem::InterAgentCommunication(_) => {
                 self.active_segment().counts_as_user_turn = true;
                 self.has_prior_user_turns = true;
-                let response_item = communication.to_model_input_item();
-                self.history
-                    .record_items(std::iter::once(&response_item), self.truncation_policy);
             }
             RolloutItem::InterAgentCommunicationMetadata { .. } => {}
             RolloutItem::TokenUsageRecord(record) => {
@@ -282,32 +282,14 @@ impl ResumeReplayReducer {
                         );
                     }
                 }
-                if let Some(replacement_history) = &compacted.replacement_history {
-                    self.history.replace_annotated(replacement_history.clone());
-                    self.history
-                        .restore_guardian_history(compacted.guardian_history.as_ref());
+                if compacted.replacement_history.is_some() {
                     self.has_prior_user_turns = true;
                 } else if self.checkpoint_suffix {
                     anyhow::bail!(
                         "{NEEDS_COMPACTION}: suffix contains a legacy compaction without replacement history"
                     );
                 } else {
-                    // Legacy rollouts without `replacement_history` should rebuild the historical
-                    // TurnContext at the correct insertion point from persisted
-                    // `TurnContextItem`s. These are rare enough that we currently just clear
-                    // `reference_context_item`, reinject canonical context at the end of the
-                    // resumed conversation, and accept the temporary out-of-distribution prompt
-                    // shape.
                     self.saw_legacy_compaction_without_replacement_history = true;
-                    let user_messages = crate::compact::collect_annotated_user_messages(
-                        self.history.annotated_items(),
-                    );
-                    let rebuilt = crate::compact::build_compacted_history(
-                        Vec::new(),
-                        &user_messages,
-                        &compacted.message,
-                    );
-                    self.history.replace_annotated(rebuilt);
                     self.has_prior_user_turns = true;
                 }
                 if let Some(active_segment) = self.active_segment.as_mut() {
@@ -474,6 +456,7 @@ impl ResumeReplayReducer {
             self.reference_context_item
         };
         RolloutReconstruction {
+            retained_context: self.history.retained_context().clone(),
             guardian_history: self.history.guardian_history_checkpoint(),
             history: self.history.into_annotated_items_arc(),
             previous_turn_settings: self.previous_turn_settings,
@@ -512,7 +495,7 @@ impl ReverseReplaySegment {
 fn surviving_replay_items(
     rollout_items: &[RolloutItem],
     checkpoint_suffix: bool,
-) -> anyhow::Result<Vec<&RolloutItem>> {
+) -> anyhow::Result<Vec<(usize, &RolloutItem)>> {
     let mut survives = vec![true; rollout_items.len()];
     let mut pending_rollback_turns = 0_usize;
     let mut active_segment: Option<ReverseReplaySegment> = None;
@@ -593,6 +576,7 @@ fn surviving_replay_items(
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -614,6 +598,7 @@ fn surviving_replay_items(
     }
     Ok(rollout_items
         .iter()
+        .enumerate()
         .zip(survives)
         .filter_map(|(item, survives)| survives.then_some(item))
         .collect())
@@ -653,10 +638,96 @@ impl Session {
             );
         }
         let replay_items = surviving_replay_items(rollout_items, materialized_state.is_some())?;
-        let mut reducer =
-            ResumeReplayReducer::new(self.thread_id(), truncation_policy, materialized_state)?;
-        for item in replay_items {
+        let mut reducer = ResumeReplayReducer::new(
+            self.thread_id(),
+            materialized_state,
+            self.guardian_context_mode,
+            &turn_context.session_source,
+        )?;
+        for (_, item) in &replay_items {
             reducer.apply(item)?;
+        }
+
+        // Reverse replay selects surviving provider turns for metadata, not user-instruction
+        // rollback semantics. As in upstream 0.154, seed the newest surviving compaction and
+        // fold its original suffix through ContextManager, including the rollback records.
+        // Removing entire provider turns here would also erase an earlier approved answer when
+        // only a later steer in the same turn was removed.
+        let base_compaction = replay_items.iter().rev().find_map(|(index, item)| {
+            if let RolloutItem::Compacted(compacted) = item
+                && let Some(items) = &compacted.replacement_history
+            {
+                Some((*index, compacted, items))
+            } else {
+                None
+            }
+        });
+        let history_suffix = if let Some((index, compacted, items)) = base_compaction {
+            reducer.history.replace_annotated(items.clone());
+            reducer.history.restore_review_context(
+                compacted.retained_context.as_ref(),
+                compacted.guardian_history.as_ref(),
+            );
+            &rollout_items[index + 1..]
+        } else {
+            rollout_items
+        };
+        for item in history_suffix {
+            match item {
+                RolloutItem::RetainedContext(event) => {
+                    reducer.history.record_retained_context(event);
+                }
+                RolloutItem::ResponseItem(response_item) => {
+                    reducer.history.record_annotated_items(
+                        std::slice::from_ref(response_item),
+                        truncation_policy,
+                    );
+                }
+                RolloutItem::InterAgentCommunication(communication) => {
+                    let response_item = communication.to_model_input_item();
+                    reducer
+                        .history
+                        .record_items(std::iter::once(&response_item), truncation_policy);
+                }
+                RolloutItem::Compacted(compacted) => {
+                    // Any replacement newer than the selected checkpoint belongs to a removed
+                    // turn; retain its source items so rollback can still find that boundary.
+                    if compacted.replacement_history.is_none() {
+                        reducer.saw_legacy_compaction_without_replacement_history = true;
+                        let identity =
+                            if self.guardian_context_mode == GuardianContextMode::ThreadOwned {
+                                compact::CompactedMessageIdentity::Preserve
+                            } else {
+                                compact::CompactedMessageIdentity::Regenerate
+                            };
+                        let user_messages = compact::collect_annotated_user_messages(
+                            reducer.history.annotated_items(),
+                            identity,
+                        );
+                        let rebuilt = compact::build_compacted_history(
+                            Vec::new(),
+                            &user_messages,
+                            &compacted.message,
+                        );
+                        let retained_context = reducer.history.retained_context().clone();
+                        reducer.history.replace_annotated(rebuilt);
+                        reducer
+                            .history
+                            .restore_retained_context(Some(&retained_context));
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    reducer.history.drop_last_n_user_turns(rollback.num_turns);
+                }
+                RolloutItem::EventMsg(_)
+                | RolloutItem::TurnContext(_)
+                | RolloutItem::RealtimeItem(_)
+                | RolloutItem::WorldState(_)
+                | RolloutItem::SecurityRiskScore(_)
+                | RolloutItem::TokenUsageRecord(_)
+                | RolloutItem::SessionMeta(_)
+                | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
+            }
         }
         Ok(reducer.finish())
     }

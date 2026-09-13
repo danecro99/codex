@@ -4,9 +4,9 @@ use std::io::Seek;
 use std::io::SeekFrom;
 
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use crate::RolloutLine;
-use crate::decode_rollout_line;
 
 const READ_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -83,18 +83,6 @@ where
     where
         T: DeserializeOwned,
     {
-        self.scan_next_with(|bytes| serde_json::from_slice(bytes))
-    }
-
-    /// Scans a persisted rollout through the same JSON decoder as its append journal.
-    pub fn scan_next_rollout_line(&mut self) -> io::Result<Option<ScanOutcome<RolloutLine>>> {
-        self.scan_next_with(|bytes| decode_rollout_line(serde_json::from_slice(bytes)?))
-    }
-
-    fn scan_next_with<T>(
-        &mut self,
-        decode: impl Fn(&[u8]) -> serde_json::Result<T>,
-    ) -> io::Result<Option<ScanOutcome<T>>> {
         loop {
             if self.chunk_position == 0 {
                 if self.next_chunk_end == 0 {
@@ -102,7 +90,7 @@ where
                         self.discarding_oversized_record = false;
                         return Ok(None);
                     }
-                    return Ok(self.finish_record(&decode));
+                    return Ok(self.finish_record());
                 }
 
                 let read_size = usize::try_from(self.next_chunk_end.min(READ_CHUNK_SIZE as u64))
@@ -132,7 +120,7 @@ where
                     self.discarding_oversized_record = false;
                     continue;
                 }
-                if let Some(outcome) = self.finish_record(&decode) {
+                if let Some(outcome) = self.finish_record() {
                     return Ok(Some(outcome));
                 }
             } else {
@@ -151,15 +139,26 @@ where
         }
     }
 
-    fn finish_record<T>(
-        &mut self,
-        decode: &impl Fn(&[u8]) -> serde_json::Result<T>,
-    ) -> Option<ScanOutcome<T>> {
+    /// Scans the next rollout record through the canonical persisted JSON decoder.
+    pub fn scan_next_rollout_line(&mut self) -> io::Result<Option<ScanOutcome<RolloutLine>>> {
+        Ok(self.scan_next::<Value>()?.map(|outcome| match outcome {
+            ScanOutcome::Parsed(value) => match crate::decode_rollout_line(value) {
+                Ok(line) => ScanOutcome::Parsed(line),
+                Err(error) => ScanOutcome::Rejected(error),
+            },
+            ScanOutcome::Rejected(error) => ScanOutcome::Rejected(error),
+        }))
+    }
+
+    fn finish_record<T>(&mut self) -> Option<ScanOutcome<T>>
+    where
+        T: DeserializeOwned,
+    {
         self.record_reversed.reverse();
         let outcome = if self.record_reversed.iter().all(u8::is_ascii_whitespace) {
             None
         } else {
-            Some(match decode(&self.record_reversed) {
+            Some(match serde_json::from_slice(&self.record_reversed) {
                 Ok(value) => ScanOutcome::Parsed(value),
                 Err(error) => ScanOutcome::Rejected(error),
             })

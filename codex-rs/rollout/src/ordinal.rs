@@ -10,7 +10,7 @@ use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
 
 use crate::RolloutItem;
-use crate::decode_rollout_line;
+
 use crate::reverse_jsonl_scanner::ReverseJsonlScanner;
 use crate::reverse_jsonl_scanner::ScanOutcome;
 
@@ -116,14 +116,12 @@ fn read_history_metadata(
         if line.trim().is_empty() {
             continue;
         }
-        let record = serde_json::from_str(line.as_str())
-            .and_then(decode_rollout_line)
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "failed to parse first rollout record at {}: {error}",
-                    path.display()
-                ))
-            })?;
+        let record = crate::parse_rollout_line(line.as_str()).map_err(|error| {
+            io::Error::other(format!(
+                "failed to parse first rollout record at {}: {error}",
+                path.display()
+            ))
+        })?;
         let RolloutItem::SessionMeta(session_meta) = record.item else {
             return Err(io::Error::other(format!(
                 "rollout at {} does not start with session metadata",

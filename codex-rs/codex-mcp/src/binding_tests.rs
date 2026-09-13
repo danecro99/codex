@@ -138,6 +138,7 @@ async fn test_step(
         Arc::clone(&client),
     ));
     let managed_client = Arc::new(ManagedClient {
+        _auth_change_notifications: None,
         client: Arc::clone(&client),
         server_info: McpServerInfo {
             name: label.to_string(),

@@ -306,6 +306,7 @@ async fn run_remote_compact_task_inner_impl(
             window_number,
             window_ids,
             compaction_response_id: None,
+            compaction_model_hash: compaction_turn_context.model_info().comp_hash.clone(),
         },
     )
     .await?;
@@ -394,7 +395,7 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         ResponseItem::Message { .. } => false,
         ResponseItem::AgentMessage { .. } => true,
         ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
-        ResponseItem::CompactionTrigger { .. } => false,
+        ResponseItem::ConfigurationUpdate { .. } | ResponseItem::CompactionTrigger { .. } => false,
         ResponseItem::AdditionalTools { .. }
         | ResponseItem::Reasoning { .. }
         | ResponseItem::LocalShellCall { .. }

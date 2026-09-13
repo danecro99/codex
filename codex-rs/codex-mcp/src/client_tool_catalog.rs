@@ -98,7 +98,6 @@ impl ClientToolCatalog {
             (snapshot.revision, tools)
         }).await
     }
-
     pub(crate) async fn read<R>(&self, read: impl FnOnce(&ToolCatalogSnapshot) -> R) -> R {
         let current = self.current.read().await;
         read(&current)
