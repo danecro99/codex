@@ -1022,8 +1022,120 @@ async fn resumed_paginated_rollout_continues_after_ordinal_gap() -> std::io::Res
     recorder.shutdown().await
 }
 
+fn write_floating_point_rollout_tail(path: &Path) -> std::io::Result<Vec<u8>> {
+    write_paginated_rollout(path, ThreadId::new(), &[4])?;
+    let tail = serde_json::json!({
+        "timestamp": "2026-09-12T18:28:21.440Z",
+        "ordinal": 5,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": null,
+            "rate_limits": {
+                "primary": {"used_percent": 32.0, "window_minutes": 10080,
+                            "resets_at": 1789805455}
+            }
+        }
+    });
+    // Validate the real persisted shape, including with the CLI's arbitrary_precision feature.
+    crate::decode_rollout_line(tail.clone())?;
+    writeln!(fs::OpenOptions::new().append(true).open(path)?, "{tail}")?;
+    fs::read(path)
+}
+
 #[tokio::test]
-async fn resumed_paginated_rollout_repairs_unsafe_tail() -> std::io::Result<()> {
+async fn resumed_paginated_rollout_preserves_floating_point_tail_ordinals() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let rollout_path = home.path().join("rollout.jsonl");
+    let before = write_floating_point_rollout_tail(&rollout_path)?;
+
+    for message in ["first resumed append", "second resumed append"] {
+        let recorder =
+            RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone()))
+                .await?;
+        recorder
+            .record_canonical_items(&[agent_message_item(message)])
+            .await?;
+        recorder.flush().await?;
+        recorder.shutdown().await?;
+    }
+
+    let after = fs::read_to_string(&rollout_path)?;
+    assert_eq!(&after.as_bytes()[..before.len()], before.as_slice());
+    let records = after
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["ordinal"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(4), Some(5), Some(6), Some(7)]
+    );
+    assert_eq!(records[4]["payload"]["message"], "second resumed append");
+    Ok(())
+}
+
+#[tokio::test]
+async fn unloaded_append_preserves_floating_point_tail_ordinal() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let before = write_floating_point_rollout_tail(&rollout_path)?;
+
+    append_rollout_item_to_path(&rollout_path, &agent_message_item("unloaded append")).await?;
+
+    let after = fs::read_to_string(&rollout_path)?;
+    assert_eq!(&after.as_bytes()[..before.len()], before.as_slice());
+    let records = after
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["ordinal"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(4), Some(5), Some(6)]
+    );
+    assert_eq!(records[3]["payload"]["message"], "unloaded append");
+    Ok(())
+}
+
+#[tokio::test]
+async fn paginated_resume_rejects_invalid_final_record_without_skipping() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let rollout_path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&rollout_path, ThreadId::new(), &[4])?;
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&rollout_path)?,
+        "{{\"timestamp\":\"invalid-final\",\"ordinal\":5,\"type\":\"unknown_record\"}}"
+    )?;
+    let before = fs::read(&rollout_path)?;
+
+    let result =
+        RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone())).await;
+    let error = match result {
+        Ok(recorder) => {
+            recorder.shutdown().await?;
+            panic!("invalid final record must not be skipped for an older ordinal");
+        }
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("final paginated rollout record"));
+    let error = append_rollout_item_to_path(&rollout_path, &agent_message_item("must not append"))
+        .await
+        .expect_err("unloaded append must reject the same invalid tail");
+    assert!(error.to_string().contains("final paginated rollout record"));
+    assert_eq!(fs::read(&rollout_path)?, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_paginated_rollout_terminates_valid_tail_and_rejects_invalid_tail()
+-> std::io::Result<()> {
     let valid_unterminated = serde_json::to_string(&RolloutLine {
         timestamp: "2026-07-09T00:00:05Z".to_string(),
         ordinal: Some(5),
@@ -1033,12 +1145,12 @@ async fn resumed_paginated_rollout_repairs_unsafe_tail() -> std::io::Result<()> 
         (
             "valid unterminated",
             valid_unterminated,
-            vec![Some(0), Some(4), Some(5), Some(6)],
+            Some(vec![Some(0), Some(4), Some(5), Some(6)]),
         ),
         (
             "invalid unterminated",
             "{\"timestamp\":\"unterminated\"".to_string(),
-            vec![Some(0), Some(4), Some(5)],
+            None,
         ),
     ] {
         let home = TempDir::new().expect("temp dir");
@@ -1048,10 +1160,24 @@ async fn resumed_paginated_rollout_repairs_unsafe_tail() -> std::io::Result<()> 
         let mut file = fs::OpenOptions::new().append(true).open(&rollout_path)?;
         write!(file, "{tail}")?;
         drop(file);
+        let before = fs::read(&rollout_path)?;
 
-        let recorder =
+        let result =
             RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone()))
-                .await?;
+                .await;
+        let Some(expected_ordinals) = expected_ordinals else {
+            let error = match result {
+                Ok(recorder) => {
+                    recorder.shutdown().await?;
+                    panic!("invalid unterminated tail must fail resume");
+                }
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("final paginated rollout record"));
+            assert_eq!(fs::read(&rollout_path)?, before);
+            continue;
+        };
+        let recorder = result?;
         recorder
             .record_canonical_items(&[agent_message_item("after-tail-repair")])
             .await?;

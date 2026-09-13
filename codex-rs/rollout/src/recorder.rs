@@ -1979,8 +1979,8 @@ async fn open_rollout_for_append(
         if refresh_modified_time {
             file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
         }
-        ensure_rollout_is_newline_terminated(&mut file)?;
         let ordinal_state = ordinal_state_for_rollout(&mut file, path_for_open.as_path())?;
+        ensure_rollout_is_newline_terminated(&mut file)?;
         Ok::<_, std::io::Error>((file, ordinal_state))
     })
     .await
