@@ -264,6 +264,27 @@ async fn explicit_app_mention_uses_the_current_account_after_an_account_switch()
             .single_request()
             .body_contains_text("Use $calendar.")
     );
+    let apps_request = server
+        .received_requests()
+        .await?
+        .into_iter()
+        .rev()
+        .find(|request| request.url.path() == "/api/codex/ps/mcp")
+        .expect("the current account should fetch the Apps catalog");
+    assert_eq!(
+        apps_request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer header.e30.account-b")
+    );
+    assert_eq!(
+        apps_request
+            .headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("account-b")
+    );
     Ok(())
 }
 
