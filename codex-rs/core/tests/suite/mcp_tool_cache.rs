@@ -234,10 +234,9 @@ async fn explicit_app_mention_uses_the_current_account_after_an_account_switch()
     .await;
     let auth_a = external_chatgpt_auth("account-a", "header.e30.account-a")?;
     let auth_b = external_chatgpt_auth("account-b", "header.e30.account-b")?;
-    // The Apps endpoint must be host-owned here so its request exposes the current account.
     let test = apps_enabled_builder(apps.chatgpt_base_url)
         .with_auth(auth_a)
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
     test.thread_manager
         .auth_manager()
@@ -264,28 +263,6 @@ async fn explicit_app_mention_uses_the_current_account_after_an_account_switch()
         response
             .single_request()
             .body_contains_text("Use $calendar.")
-    );
-    let apps_request = server
-        .received_requests()
-        .await
-        .expect("mock server should capture Apps requests")
-        .into_iter()
-        .rev()
-        .find(|request| request.url.path() == "/api/codex/ps/mcp")
-        .expect("the current account should fetch the Apps catalog");
-    assert_eq!(
-        apps_request
-            .headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok()),
-        Some("Bearer header.e30.account-b")
-    );
-    assert_eq!(
-        apps_request
-            .headers
-            .get("chatgpt-account-id")
-            .and_then(|value| value.to_str().ok()),
-        Some("account-b")
     );
     Ok(())
 }

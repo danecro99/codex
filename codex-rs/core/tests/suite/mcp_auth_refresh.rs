@@ -52,13 +52,13 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
     let server = start_mock_server().await;
     let apps_server = AppsTestServer::mount_hosted_plugin_runtime_searchable(&server).await?;
     let home = Arc::new(TempDir::new()?);
-    let expected_auth = CodexAuth::from_external_chatgpt_tokens(
-        "header.e30.first",
-        "test-account",
+    let initial_auth = CodexAuth::from_external_chatgpt_tokens(
+        "header.e30.account-a",
+        "account-a",
         /*chatgpt_plan_type*/ None,
     )?;
     let auth_manager = AuthManager::from_auth_for_testing_with_home(
-        expected_auth.clone(),
+        initial_auth.clone(),
         home.path().to_path_buf(),
     );
     // Build the hosted-plugin config directly so the local test origin can
@@ -105,9 +105,9 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
         ),
         codex_apps_tools_cache: CodexAppsToolsCache::default(),
         tool_catalog_cache: McpToolCatalogCache::default(),
-        codex_apps_tools_cache_key: codex_mcp::codex_apps_tools_cache_key(Some(&expected_auth)),
+        codex_apps_tools_cache_key: codex_mcp::codex_apps_tools_cache_key(Some(&initial_auth)),
         client_mcp_extensions: ClientMcpExtensions::default(),
-        auth: Some(expected_auth.clone()),
+        auth: Some(initial_auth.clone()),
         auth_manager: Some(Arc::clone(&auth_manager)),
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
@@ -119,16 +119,15 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
     auth_manager
         .set_external_auth(Arc::new(StaticExternalAuth(
             CodexAuth::from_external_chatgpt_tokens(
-                "header.e30.reloaded",
-                "test-account",
+                "header.e30.account-b",
+                "account-b",
                 /*chatgpt_plan_type*/ None,
             )?,
         )))
         .await?;
 
-    // The manager and its static fallback were created before the auth update,
-    // so this tool call only sees the new token if the Codex Apps provider
-    // reads the shared AuthManager at request time.
+    // The manager and its static fallback were created for account A. This call
+    // can use account B only if the Codex Apps provider reads the shared AuthManager.
     let tool_result = runtime
         .latest_call_tool(
             CODEX_APPS_MCP_SERVER_NAME,
@@ -165,7 +164,14 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
             .headers
             .get("authorization")
             .and_then(|value| value.to_str().ok()),
-        Some("Bearer header.e30.reloaded")
+        Some("Bearer header.e30.account-b")
+    );
+    assert_eq!(
+        tool_call_request
+            .headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("account-b")
     );
 
     Ok(())
