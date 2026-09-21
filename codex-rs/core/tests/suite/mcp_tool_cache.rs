@@ -266,7 +266,8 @@ async fn explicit_app_mention_uses_the_current_account_after_an_account_switch()
     );
     let apps_request = server
         .received_requests()
-        .await?
+        .await
+        .expect("mock server should capture Apps requests")
         .into_iter()
         .rev()
         .find(|request| request.url.path() == "/api/codex/ps/mcp")
@@ -350,7 +351,9 @@ async fn pending_explicit_app_mention_samples_with_a_cold_accessible_connectors_
             text_elements: Vec::new(),
         }]))
         .await?;
-    release_first_response.send(())?;
+    release_first_response
+        .send(())
+        .expect("first response gate should remain open");
 
     let event = wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
