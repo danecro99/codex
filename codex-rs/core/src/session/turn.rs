@@ -742,7 +742,11 @@ async fn required_mcp_servers_for_input(
         .collect::<Vec<_>>();
     let mentions = collect_tool_mentions_from_messages(&messages);
     let mention_auth = if turn_context.apps_enabled() && !mentions.plain_names.is_empty() {
-        sess.services.auth_manager.try_auth().await?
+        sess.services
+            .auth_manager
+            .try_auth()
+            .await
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?
     } else {
         None
     };
