@@ -46,7 +46,7 @@ impl ExternalAuth for StaticExternalAuth {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token() -> Result<()> {
+async fn hosted_plugin_runtime_ps_mcp_tool_calls_rebuild_for_the_current_account() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -90,19 +90,20 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
     config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
     let plugins_manager = plugins_manager_for_config(&config, Arc::clone(&auth_manager));
     let mcp_config = Arc::new(config.to_mcp_config(&plugins_manager).await);
-    let runtime = McpRuntime::new(McpRuntimeInput {
+    let runtime_context = McpRuntimeContext::new(
+        Arc::new(environment_manager_without_environments()),
+        home.path().to_path_buf(),
+    );
+    let runtime_a = McpRuntime::new(McpRuntimeInput {
         startup_policy: McpStartupPolicy::Eager,
-        config: mcp_config,
+        config: Arc::clone(&mcp_config),
         plugins_available: false,
         ready_selected_capability_roots: Vec::new(),
-        mcp_servers,
+        mcp_servers: mcp_servers.clone(),
         submit_id: "test".to_string(),
         tx_event: None,
         startup_cancellation_token: CancellationToken::new(),
-        runtime_context: McpRuntimeContext::new(
-            Arc::new(environment_manager_without_environments()),
-            home.path().to_path_buf(),
-        ),
+        runtime_context: runtime_context.clone(),
         codex_apps_tools_cache: CodexAppsToolsCache::default(),
         tool_catalog_cache: McpToolCatalogCache::default(),
         codex_apps_tools_cache_key: codex_mcp::codex_apps_tools_cache_key(Some(&initial_auth)),
@@ -116,19 +117,55 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
     // The model-provider test covers AuthManager reload behavior. Keep this
     // regression focused on core MCP wiring by updating the same shared
     // manager after the MCP client has been created.
+    let auth_b = CodexAuth::from_external_chatgpt_tokens(
+        "header.e30.account-b",
+        "account-b",
+        /*chatgpt_plan_type*/ None,
+    )?;
     auth_manager
-        .set_external_auth(Arc::new(StaticExternalAuth(
-            CodexAuth::from_external_chatgpt_tokens(
-                "header.e30.account-b",
-                "account-b",
-                /*chatgpt_plan_type*/ None,
-            )?,
-        )))
+        .set_external_auth(Arc::new(StaticExternalAuth(auth_b.clone())))
         .await?;
 
-    // The manager and its static fallback were created for account A. This call
-    // can use account B only if the Codex Apps provider reads the shared AuthManager.
-    let tool_result = runtime
+    // An A-bound runtime must not borrow B from the shared AuthManager.
+    let tool_result = runtime_a
+        .latest_call_tool(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "calendar_create_event",
+            /*environment_id*/ None,
+            Some(json!({
+                "title": "Lunch",
+                "starts_at": "2026-06-18T12:00:00Z",
+            })),
+            /*meta*/ None,
+            /*requested_timeout*/ None,
+            /*wait_for_server*/ true,
+        )
+        .await?;
+    assert_eq!(tool_result.is_error, Some(false));
+
+    // Rebuilding from the current session account must use B, without carrying
+    // A's client or credentials into the replacement runtime.
+    let runtime_b = McpRuntime::new(McpRuntimeInput {
+        startup_policy: McpStartupPolicy::Eager,
+        config: mcp_config,
+        plugins_available: false,
+        ready_selected_capability_roots: Vec::new(),
+        mcp_servers,
+        submit_id: "test".to_string(),
+        tx_event: None,
+        startup_cancellation_token: CancellationToken::new(),
+        runtime_context,
+        codex_apps_tools_cache: CodexAppsToolsCache::default(),
+        tool_catalog_cache: McpToolCatalogCache::default(),
+        codex_apps_tools_cache_key: codex_mcp::codex_apps_tools_cache_key(Some(&auth_b)),
+        client_mcp_extensions: ClientMcpExtensions::default(),
+        auth: Some(auth_b),
+        auth_manager: Some(Arc::clone(&auth_manager)),
+        elicitation_reviewer: None,
+        elicitation_lifecycle: None,
+    })
+    .await;
+    let tool_result = runtime_b
         .latest_call_tool(
             CODEX_APPS_MCP_SERVER_NAME,
             "calendar_create_event",
@@ -148,9 +185,9 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
         .received_requests()
         .await
         .expect("mock server should capture tool-call requests");
-    let tool_call_request = requests
+    let tool_call_requests = requests
         .iter()
-        .find(|request| {
+        .filter(|request| {
             request.url.path() == "/api/codex/ps/mcp"
                 && serde_json::from_slice::<Value>(&request.body)
                     .ok()
@@ -158,16 +195,35 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
                         body.get("method").and_then(Value::as_str) == Some("tools/call")
                     })
         })
-        .expect("Codex Apps should receive a tool call");
+        .collect::<Vec<_>>();
+    assert_eq!(tool_call_requests.len(), 2);
+
+    let stale_account_request = tool_call_requests[0];
     assert_eq!(
-        tool_call_request
+        stale_account_request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        None
+    );
+    assert_eq!(
+        stale_account_request
+            .headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok()),
+        None
+    );
+
+    let current_account_request = tool_call_requests[1];
+    assert_eq!(
+        current_account_request
             .headers
             .get("authorization")
             .and_then(|value| value.to_str().ok()),
         Some("Bearer header.e30.account-b")
     );
     assert_eq!(
-        tool_call_request
+        current_account_request
             .headers
             .get("chatgpt-account-id")
             .and_then(|value| value.to_str().ok()),
