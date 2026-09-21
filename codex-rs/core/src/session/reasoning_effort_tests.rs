@@ -17,6 +17,7 @@ use test_case::test_case;
     conversation_id: ThreadId::default(),
     history: Arc::new(Vec::new()),
     rollout_path: None,
+    materialized_resume: None,
 }); "resume")]
 #[tokio::test]
 async fn initial_replay_preserves_prewarmed_effort(history: InitialHistory) {
@@ -41,7 +42,10 @@ async fn initial_replay_preserves_prewarmed_effort(history: InitialHistory) {
             .await,
         Some(ReasoningEffort::Medium),
     );
-    session.record_initial_history(history).await;
+    session
+        .record_initial_history(history)
+        .await
+        .expect("initial replay should succeed");
 
     selected.collaboration_mode.settings.reasoning_effort = Some(ReasoningEffort::High);
     let turn_settings = ResolvedStepSettings::new(

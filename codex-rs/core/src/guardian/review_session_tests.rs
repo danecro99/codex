@@ -77,7 +77,7 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
         "type": "compaction", "id": "cmp_new", "encrypted_content": "new-checkpoint"
     }))
     .unwrap();
-    let (window_number, window_ids) = parent.advance_auto_compact_window().await;
+    let (window_number, window_ids) = parent.prepare_auto_compact_window().await;
     parent
         .replace_compacted_history(
             vec![checkpoint.into()],
@@ -91,7 +91,8 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
                 compaction_model_hash: Some("matching".to_owned()),
             },
         )
-        .await;
+        .await
+        .expect("compacted reviewer checkpoint should persist");
     let ((outcome, _), submitted_text) = tokio::join!(manager.review(prepared), async {
         let submission = rx_sub.recv().await.unwrap();
         let id = submission.id;

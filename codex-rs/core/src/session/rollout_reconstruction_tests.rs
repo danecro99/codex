@@ -2612,6 +2612,7 @@ async fn checkpoint_suffix_replay_is_equivalent_and_rollback_crossing_fence_is_l
             .map(|snapshot| WorldStateItem::full(snapshot.into_object())),
         mcp_resource_origins: prefix_state.mcp_resource_origins.clone(),
         owned_startup_cwd: prefix_state.owned_startup_cwd.clone(),
+        owned_runtime_workspace_roots: prefix_state.owned_runtime_workspace_roots.clone(),
         auto_compact_window: MaterializedAutoCompactWindow {
             window_number: prefix_state.window_number,
             first_window_id: prefix_state
@@ -2732,6 +2733,7 @@ async fn materialized_prefill_is_consumed_for_body_after_prefix_scope() {
         world_state_baseline: None,
         mcp_resource_origins: None,
         owned_startup_cwd: None,
+        owned_runtime_workspace_roots: None,
         auto_compact_window: MaterializedAutoCompactWindow {
             window_number: 0,
             first_window_id: window_id.to_string(),

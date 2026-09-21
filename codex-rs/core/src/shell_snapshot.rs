@@ -104,6 +104,7 @@ struct FailOpenAlias {
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3); // 3 days retention.
 const SNAPSHOT_DIR: &str = "shell_snapshots";
+const SNAPSHOT_EXPLICIT_BASH_ENV: &str = "CODEX_SNAPSHOT_EXPLICIT_BASH_ENV";
 
 impl ShellSnapshot {
     pub(crate) fn new(
@@ -892,7 +893,7 @@ async fn capture_snapshot(
     for (key, value) in &credential_env {
         let provider_metadata = credential_broker
             .network_proxy
-            .credential_broker_environment_for_text(value, &env);
+            .credential_broker_environment_for_text(value, &discovery_env);
         for context_key in provider_metadata.binding_keys {
             binding_context_credential_keys
                 .entry(context_key)
@@ -908,7 +909,10 @@ async fn capture_snapshot(
     }
     let context_env = context_credential_keys
         .keys()
-        .filter_map(|key| env_value(&env, key).map(|value| (key.clone(), value.clone())))
+        // Destination context is captured from the broker's trusted discovery environment. It
+        // may be intentionally excluded from the child environment policy and restored only as
+        // private broker context alongside the credential that depends on it.
+        .filter_map(|key| env_value(&discovery_env, key).map(|value| (key.clone(), value.clone())))
         .collect();
     Ok((
         snapshot,
@@ -1014,10 +1018,7 @@ async fn run_script_with_timeout(
 ) -> Result<String> {
     let suppress_startup_files =
         credential_broker.is_some() && matches!(shell_mode, SnapshotShellMode::Validation(_));
-    let mut args = shell.derive_exec_args(script, matches!(shell_mode, SnapshotShellMode::Login));
-    if suppress_startup_files && shell.shell_type == ShellType::Zsh {
-        args[1] = "-fc".to_string();
-    }
+    let mut script = script.to_string();
     let shell_name = shell.name();
     let mut prepared_env = None;
     if let Some(credential_broker) = credential_broker {
@@ -1027,8 +1028,33 @@ async fn run_script_with_timeout(
             env.remove("BASH_ENV");
             env.remove("ENV");
         }
+        // Source BASH_ENV explicitly for brokered non-login captures. Sandboxed launchers may
+        // run Bash in a security mode that ignores its implicit startup hook; removing BASH_ENV
+        // from the initial child environment avoids double execution on hosts where Bash would
+        // otherwise source it automatically.
+        if !suppress_startup_files
+            && shell.shell_type == ShellType::Bash
+            && matches!(shell_mode, SnapshotShellMode::NonLogin)
+            && let Some(bash_env) = env.remove("BASH_ENV")
+        {
+            env.insert(SNAPSHOT_EXPLICIT_BASH_ENV.to_string(), bash_env);
+            script.insert_str(
+                0,
+                "__codex_env_file=\"${CODEX_SNAPSHOT_EXPLICIT_BASH_ENV}\"\n\
+unset CODEX_SNAPSHOT_EXPLICIT_BASH_ENV\n\
+export BASH_ENV=\"$__codex_env_file\"\n\
+if [ -r \"$__codex_env_file\" ] && [ ! -d \"$__codex_env_file\" ]; then\n\
+  . \"$__codex_env_file\"\n\
+fi\n\
+unset __codex_env_file\n",
+            );
+        }
         credential_broker.network_proxy.apply_to_env(&mut env);
         prepared_env = Some(env);
+    }
+    let mut args = shell.derive_exec_args(&script, matches!(shell_mode, SnapshotShellMode::Login));
+    if suppress_startup_files && shell.shell_type == ShellType::Zsh {
+        args[1] = "-fc".to_string();
     }
     if let Some(sandbox) = sandbox {
         let snapshot_read_path = match shell_mode {

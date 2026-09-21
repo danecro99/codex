@@ -126,28 +126,26 @@ pub(crate) struct ManagedClient {
 }
 
 impl ManagedClient {
-    pub(crate) async fn listed_tools(&self) -> Vec<ToolInfo> {
+    pub(crate) async fn listed_tools(&self) -> Result<Vec<ToolInfo>> {
         let total_start = Instant::now();
-        self.tool_catalog
-            .read(|catalog| {
-                // Discovery may use the shared cache until this client is refreshed.
-                // Executable bindings always capture this client's own catalog.
-                if catalog.revision == 0
-                    && let Some(cache_context) = &self.codex_apps_tools_cache_context
-                {
-                    let tools = cache_context.current_tools();
-                    emit_duration(
-                        MCP_TOOLS_LIST_DURATION_METRIC,
-                        total_start.elapsed(),
-                        &[("cache", if tools.is_some() { "hit" } else { "miss" })],
-                    );
-                    if let Some(tools) = tools {
-                        return tools;
-                    }
-                }
-                catalog.tools.clone()
-            })
-            .await
+        let (revision, tools) = self.tool_catalog.snapshot().await;
+        let tools = tools.map_err(anyhow::Error::msg)?;
+        // Discovery may use the shared cache until this client is refreshed.
+        // Executable bindings always capture this client's own catalog.
+        if revision == 0
+            && let Some(cache_context) = &self.codex_apps_tools_cache_context
+        {
+            let tools = cache_context.current_tools();
+            emit_duration(
+                MCP_TOOLS_LIST_DURATION_METRIC,
+                total_start.elapsed(),
+                &[("cache", if tools.is_some() { "hit" } else { "miss" })],
+            );
+            if let Some(tools) = tools {
+                return Ok(tools);
+            }
+        }
+        Ok(tools)
     }
 }
 
@@ -593,7 +591,10 @@ impl AsyncManagedClient {
             Ok(startup_tools)
         } else {
             match self.client().await {
-                Ok(client) => Ok(client.listed_tools().await),
+                Ok(client) => client
+                    .listed_tools()
+                    .await
+                    .map_err(StartupOutcomeError::from),
                 Err(error) if self.is_codex_apps_mcp_server => self.cached_tools().ok_or(error),
                 Err(error) => Err(error),
             }
@@ -1007,6 +1008,7 @@ async fn start_server_task(
         server_info,
         tool_catalog: Arc::new(ClientToolCatalog::new(
             client_tools,
+            Arc::clone(&client),
             codex_apps_tools_cache_context
                 .as_ref()
                 .and_then(ConnectorRuntimeContext::subscribe),

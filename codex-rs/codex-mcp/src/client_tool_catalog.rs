@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use codex_connectors::ConnectorRuntimeSnapshot;
+use codex_rmcp_client::RmcpClient;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
@@ -28,9 +29,12 @@ pub struct CodexAppsToolSnapshot {
     /// Raw MCP tool names allowed by the same runtime's generic MCP policy.
     /// App-specific policy is applied by the caller.
     pub model_visible_tool_names: HashSet<String>,
+    /// Plugin connector IDs from the immutable configuration that owns `tools`.
+    pub connector_ids: Vec<String>,
 }
 
 pub(crate) struct ClientToolCatalog {
+    client: Arc<RmcpClient>,
     current: RwLock<ToolCatalogSnapshot>,
     /// Serialize fetches without blocking calls against the current catalog.
     refresh_lock: Mutex<()>,
@@ -39,12 +43,17 @@ pub(crate) struct ClientToolCatalog {
 pub(crate) struct ToolCatalogSnapshot {
     /// Advances on explicit refresh or adoption of changed live tools.
     pub(crate) revision: u64,
-    pub(crate) tools: Vec<ToolInfo>,
+    pub(crate) tools: Result<Vec<ToolInfo>, String>,
+    notification_revision: u64,
     updates: Option<ToolCatalogUpdates>,
 }
 
 impl ClientToolCatalog {
-    pub(crate) fn new(tools: Vec<ToolInfo>, mut updates: Option<ToolCatalogUpdates>) -> Self {
+    pub(crate) fn new(
+        tools: Vec<ToolInfo>,
+        client: Arc<RmcpClient>,
+        mut updates: Option<ToolCatalogUpdates>,
+    ) -> Self {
         let tools = updates
             .as_mut()
             .and_then(|updates| {
@@ -57,11 +66,59 @@ impl ClientToolCatalog {
         Self {
             current: RwLock::new(ToolCatalogSnapshot {
                 revision: 0,
-                tools,
+                tools: Ok(tools),
+                notification_revision: client.tool_list_change_revision(),
                 updates,
             }),
+            client,
             refresh_lock: Mutex::new(()),
         }
+    }
+
+    pub(crate) async fn has_pending_notification(&self) -> bool {
+        self.read(|snapshot| {
+            snapshot.notification_revision != self.client.tool_list_change_revision()
+        })
+        .await
+    }
+
+    /// A known change makes old definitions unusable, including during a failed
+    /// refresh. One attempt is made per notification revision; cancellation
+    /// leaves the change pending.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "serialize one client's catalog refresh"
+    )]
+    pub(crate) async fn refresh_notified<F, Fut>(&self, fetch: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<ToolInfo>>>,
+    {
+        let _refresh = self.refresh_lock.lock().await;
+        let notification_revision = self.client.tool_list_change_revision();
+        if self
+            .read(|snapshot| snapshot.notification_revision == notification_revision)
+            .await
+        {
+            return;
+        }
+        let tools = fetch()
+            .await
+            .map_err(|error| format!("needs_mcp_tool_catalog_refresh: {error:#}"));
+        let mut current = self.current.write().await;
+        current.tools = tools;
+        current.notification_revision = notification_revision;
+        current.revision += 1;
+    }
+
+    pub(crate) async fn snapshot(&self) -> (u64, Result<Vec<ToolInfo>, String>) {
+        let current = self.read_current().await;
+        let tools = if current.notification_revision != self.client.tool_list_change_revision() {
+            Err("needs_mcp_tool_catalog_refresh: another tools/list_changed arrived during catalog capture".to_string())
+        } else {
+            current.tools.clone()
+        };
+        (current.revision, tools)
     }
 
     pub(crate) async fn read<R>(&self, read: impl FnOnce(&ToolCatalogSnapshot) -> R) -> R {
@@ -86,11 +143,15 @@ impl ClientToolCatalog {
                 && updates.has_changed().unwrap_or(false)
             {
                 let snapshot = updates.borrow_and_update().clone();
-                if let Some(snapshot) = snapshot
-                    && current.tools != snapshot.tools()
-                {
-                    current.tools = snapshot.tools().to_vec();
-                    current.revision += 1;
+                if let Some(snapshot) = snapshot {
+                    let tools_changed = current
+                        .tools
+                        .as_ref()
+                        .map_or(true, |tools| tools != snapshot.tools());
+                    if tools_changed {
+                        current.tools = Ok(snapshot.tools().to_vec());
+                        current.revision += 1;
+                    }
                 }
             }
         }
@@ -109,10 +170,11 @@ impl ClientToolCatalog {
         P: FnOnce(&[ToolInfo], C) -> R,
     {
         let _refresh = self.refresh_lock.lock().await;
+        let notification_revision = self.client.tool_list_change_revision();
         let (tools, context) = fetch().await?;
         let mut current = self.current.write().await;
         let result = publish(&tools, context);
-        current.tools = current
+        current.tools = Ok(current
             .updates
             .as_mut()
             .and_then(|updates| {
@@ -121,7 +183,8 @@ impl ClientToolCatalog {
                     .as_ref()
                     .map(|snapshot| snapshot.tools().to_vec())
             })
-            .unwrap_or(tools);
+            .unwrap_or(tools));
+        current.notification_revision = notification_revision;
         current.revision += 1;
         Ok(result)
     }
@@ -141,7 +204,10 @@ impl ClientToolCatalog {
         Fut: Future<Output = R>,
     {
         let current = self.read_current().await;
-        if current.revision != expected_revision {
+        if current.revision != expected_revision
+            || current.notification_revision != self.client.tool_list_change_revision()
+            || current.tools.is_err()
+        {
             return None;
         }
         let result = run().await;

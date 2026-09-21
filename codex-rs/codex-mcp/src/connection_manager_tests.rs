@@ -46,6 +46,8 @@ use codex_exec_server_test_support::environment_manager_without_environments;
 use codex_login::AuthHeaders;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_plugin::AppConnectorId;
+use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::ToolName;
 use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::mcp::ClientMcpExtensions;
@@ -454,15 +456,16 @@ async fn legacy_tool_catalog_does_not_follow_pagination_cursor() -> anyhow::Resu
 }
 
 async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {
+    let client = Arc::new(
+        RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
+            .await
+            .expect("create in-process RMCP client"),
+    );
     ManagedClient {
         _auth_change_notifications: None,
-        client: Arc::new(
-            RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
-                .await
-                .expect("create in-process RMCP client"),
-        ),
+        client: Arc::clone(&client),
         server_info: create_test_server_info("Ready"),
-        tool_catalog: Arc::new(ClientToolCatalog::new(tools, /*updates*/ None)),
+        tool_catalog: Arc::new(ClientToolCatalog::new(tools, client, /*updates*/ None)),
         tool_timeout: None,
         server_instructions: None,
         server_supports_sandbox_state_meta_capability: false,
@@ -760,9 +763,13 @@ pub(crate) async fn create_test_manager_with_ready_apps_client(
 
     let managed_client = ManagedClient {
         _auth_change_notifications: None,
-        client,
+        client: Arc::clone(&client),
         server_info: create_test_server_info("Codex Apps"),
-        tool_catalog: Arc::new(ClientToolCatalog::new(vec![tool], /*updates*/ None)),
+        tool_catalog: Arc::new(ClientToolCatalog::new(
+            vec![tool],
+            client,
+            /*updates*/ None,
+        )),
         tool_timeout: Some(Duration::from_secs(5)),
         server_instructions: None,
         server_supports_sandbox_state_meta_capability: false,
@@ -2409,6 +2416,16 @@ async fn hard_refresh_keeps_client_catalog_local_when_shared_cache_loses_race() 
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         PermissionProfile::default(),
     );
+    config.connector_snapshot =
+        codex_connectors::ConnectorSnapshot::from_plugin_capability_summaries(&[
+            PluginCapabilitySummary {
+                config_name: "calendar@test".to_string(),
+                display_name: "calendar-plugin".to_string(),
+                plugin_namespace: None,
+                app_connector_ids: vec![AppConnectorId("calendar".to_string())],
+                ..PluginCapabilitySummary::default()
+            },
+        ]);
     let manager_a_for_refresh = Arc::clone(&manager_a);
     let config_for_refresh = config.clone();
     let refresh_a = tokio::spawn(async move {
@@ -2432,6 +2449,7 @@ async fn hard_refresh_keeps_client_catalog_local_when_shared_cache_loses_race() 
         snapshot_a.model_visible_tool_names,
         HashSet::from(["a_only".to_string()])
     );
+    assert_eq!(snapshot_a.connector_ids, vec!["calendar".to_string()]);
     assert_eq!(
         cache_context_a
             .current_tools()
@@ -3736,7 +3754,14 @@ async fn cancelling_startup_does_not_disable_a_ready_client() {
     assert_eq!(
         managed
             .tool_catalog
-            .read(|catalog| model_tool_names(&catalog.tools))
+            .read(|catalog| {
+                model_tool_names(
+                    catalog
+                        .tools
+                        .as_ref()
+                        .expect("ready client should have a usable tool catalog"),
+                )
+            })
             .await,
         HashSet::from([ToolName::namespaced("ready", "search")])
     );
@@ -5111,7 +5136,10 @@ async fn apps_catalog_broadcast_preserves_running_calls_and_rejects_stale_calls(
     .with_live_scope("apps".to_string());
     let original = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "original")];
     let updated = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "updated")];
-    let catalog = ClientToolCatalog::new(original.clone(), context.subscribe());
+    let client =
+        Arc::new(RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory)).await?);
+    let catalog =
+        ClientToolCatalog::new(original.clone(), Arc::clone(&client), context.subscribe());
 
     store_current_tools(&context, original.clone());
     assert_eq!(
@@ -5144,12 +5172,17 @@ async fn apps_catalog_broadcast_preserves_running_calls_and_rejects_stale_calls(
         catalog
             .read(|catalog| (catalog.revision, catalog.tools.clone()))
             .await,
-        (1, updated.clone())
+        (1, Ok(updated.clone()))
     );
 
     // A client whose startup finishes late adopts the already-published result.
-    let late = ClientToolCatalog::new(original, context.subscribe());
-    assert_eq!(late.read(|catalog| catalog.tools.clone()).await, updated);
+    let late = ClientToolCatalog::new(original, client, context.subscribe());
+    assert_eq!(
+        late.read(|catalog| catalog.tools.clone())
+            .await
+            .map_err(anyhow::Error::msg)?,
+        updated
+    );
     Ok(())
 }
 
@@ -5162,11 +5195,19 @@ async fn apps_catalog_broadcast_survives_an_older_local_refresh() -> anyhow::Res
         /*chatgpt_user_id*/ None,
     )
     .with_live_scope("apps".to_string());
-    let catalog = ClientToolCatalog::new(Vec::new(), context.subscribe());
+    let client =
+        Arc::new(RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory)).await?);
+    let catalog = ClientToolCatalog::new(Vec::new(), client, context.subscribe());
     let older_ticket = context.begin_fetch(ConnectorRuntimeFetchSource::HardRefresh);
     let newer = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "newer")];
     store_current_tools(&context, newer.clone());
-    assert_eq!(catalog.read(|catalog| catalog.tools.clone()).await, newer);
+    assert_eq!(
+        catalog
+            .read(|catalog| catalog.tools.clone())
+            .await
+            .map_err(anyhow::Error::msg)?,
+        newer
+    );
     catalog
         .refresh(
             || async { Ok((Vec::new(), older_ticket)) },
@@ -5179,7 +5220,13 @@ async fn apps_catalog_broadcast_survives_an_older_local_refresh() -> anyhow::Res
             },
         )
         .await?;
-    assert_eq!(catalog.read(|catalog| catalog.tools.clone()).await, newer);
+    assert_eq!(
+        catalog
+            .read(|catalog| catalog.tools.clone())
+            .await
+            .map_err(anyhow::Error::msg)?,
+        newer
+    );
     Ok(())
 }
 
@@ -5323,9 +5370,13 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
     .await?;
     let managed_client = ManagedClient {
         _auth_change_notifications: None,
-        client,
+        client: Arc::clone(&client),
         server_info: create_test_server_info("Mutable tools"),
-        tool_catalog: Arc::new(ClientToolCatalog::new(initial_tools, /*updates*/ None)),
+        tool_catalog: Arc::new(ClientToolCatalog::new(
+            initial_tools,
+            client,
+            /*updates*/ None,
+        )),
         tool_timeout: None,
         server_instructions: initialize.instructions,
         server_supports_sandbox_state_meta_capability: false,

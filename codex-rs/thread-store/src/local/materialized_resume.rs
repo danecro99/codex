@@ -30,7 +30,7 @@ use crate::ThreadStoreResult;
 #[path = "materialized_resume_tests.rs"]
 mod tests;
 
-const CHECKPOINT_DIRECTORY: &str = "materialized_resume_state_v6";
+const CHECKPOINT_DIRECTORY: &str = "materialized_resume_state_v7";
 const FENCE_SAMPLE_BYTES: usize = 64 * 1024;
 /// Absolute allocation guard for the private checkpoint artifact. Core supplies a tighter bound
 /// derived from the active model context when it publishes the state.

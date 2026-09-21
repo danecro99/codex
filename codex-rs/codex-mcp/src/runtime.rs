@@ -382,6 +382,7 @@ impl McpRuntime {
         required_plugins: &HashSet<String>,
     ) -> Option<Arc<McpBinding>> {
         let config = Arc::clone(current.config.as_ref()?);
+        current.connections.refresh_notified_tool_catalogs().await;
         let stable_catalog_revisions = current
             .connections
             .stable_catalog_revisions(required_servers, required_plugins)
@@ -436,7 +437,10 @@ impl McpRuntime {
 
     /// Returns whether the published snapshot still belongs to the current credentials.
     pub fn current_auth_matches(&self, auth: Option<&CodexAuth>) -> bool {
-        let current = self.current.load();
+        Self::published_auth_matches(&self.current.load(), auth)
+    }
+
+    fn published_auth_matches(current: &PublishedMcpRuntime, auth: Option<&CodexAuth>) -> bool {
         match (current.auth.as_ref(), auth) {
             (Some(previous), Some(latest)) => {
                 previous == latest
@@ -459,10 +463,18 @@ impl McpRuntime {
         &self,
         auth: &CodexAuth,
     ) -> anyhow::Result<CodexAppsToolSnapshot> {
-        if !self.current_auth_matches(Some(auth)) {
+        let current = self.current.load_full();
+        if !Self::published_auth_matches(&current, Some(auth)) {
             anyhow::bail!("Codex Apps MCP runtime does not match the current account");
         }
-        self.refresh_codex_apps_tools().await
+        let config = current
+            .config
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("MCP runtime is not configured"))?;
+        current
+            .connections
+            .refresh_codex_apps_client_catalog(config)
+            .await
     }
 
     /// Detects newly saved credentials for servers whose startup failed authentication.

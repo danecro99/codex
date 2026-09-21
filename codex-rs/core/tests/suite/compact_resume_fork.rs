@@ -388,7 +388,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
         .context("base rollout path has no rollout id")?;
     for derived_path in [
         home.path()
-            .join("materialized_resume_state_v6")
+            .join("materialized_resume_state_v7")
             .join(format!("{base_rollout_id}.json")),
         home.path()
             .join("rollout_append_generation_v5")

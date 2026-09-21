@@ -176,7 +176,7 @@ pub(super) async fn shutdown_thread(
     // A stopped writer still has to release its handle and its lock; it just must not write. Any
     // buffered item would land after a durable position this writer can no longer justify.
     if writer.stopped() {
-        recorder.abandon().await;
+        recorder.discard().await.map_err(thread_store_io_error)?;
         store.live_recorders.lock().await.remove(&thread_id);
         drop(_live_writer_guard);
         let _ = pending_metadata.take();
@@ -352,12 +352,6 @@ impl WriterStop {
             Self::Unresolved { reason } => ThreadStoreError::CanonicalWriteUnresolved { reason },
         }
     }
-
-    fn reason(&self) -> &str {
-        match self {
-            Self::RolledBack { reason } | Self::Unresolved { reason } => reason.as_str(),
-        }
-    }
 }
 
 /// The live rollout writer installed for a thread, plus the state a caller needs to use it.
@@ -401,16 +395,13 @@ impl LiveWriter {
         self.stop_writing(stop);
     }
 
-    /// Records why this writer stopped and makes the recorder refuse further writes.
+    /// Records why this writer stopped so every later store operation refuses further writes.
     ///
     /// The marker and the recorder have to move together. Leaving the recorder live would let a
     /// later append, a shutdown flush or a checkpoint publication act on a rollout whose durable
     /// position this writer can no longer justify.
     fn stop_writing(&self, stop: WriterStop) {
-        let reason = std::io::Error::other(stop.reason().to_string());
-        if self.writer_stop.set(stop).is_ok() {
-            self.recorder.disable_writes(&reason);
-        }
+        let _ = self.writer_stop.set(stop);
     }
 
     /// Whether this writer already stopped.

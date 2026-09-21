@@ -238,8 +238,14 @@ pub(crate) async fn run_turn(
         {
             Ok(Ok(requirements)) => requirements,
             Ok(Err(err)) => {
-                run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
-                    .await;
+                run_hooks_and_record_inputs(
+                    &sess,
+                    &turn_context,
+                    &turn_context.capture_current_model_info(),
+                    &input,
+                    PersistContext::Standard,
+                )
+                .await;
                 return Err(err);
             }
             Err(err) => {

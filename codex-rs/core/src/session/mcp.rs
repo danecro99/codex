@@ -438,7 +438,8 @@ impl Session {
             InternalContextSource::from_static("mcp_catalog_refresh"),
             message,
         ));
-        self.record_conversation_items(turn, &[item]).await;
+        self.record_conversation_items(turn, turn.model_info(), &[item])
+            .await;
         // Only mark the notice after recording it; cancellation must not suppress
         // the next notice. Do not hold the display-state lock across history I/O.
         *self.mcp_refresh.reported_catalog_errors.lock().await = current.clone();

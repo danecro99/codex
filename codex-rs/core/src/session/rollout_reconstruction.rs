@@ -38,6 +38,7 @@ pub(super) struct RolloutReconstruction {
     pub(super) last_agent_status: Option<AgentStatus>,
     pub(super) mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
     pub(super) owned_startup_cwd: Option<PathBuf>,
+    pub(super) owned_runtime_workspace_roots: Option<Vec<PathBuf>>,
     pub(super) auto_compact_window_prefill_input_tokens: Option<i64>,
     pub(super) has_prior_user_turns: bool,
 }
@@ -94,6 +95,7 @@ struct ResumeReplayReducer {
     last_agent_status: Option<AgentStatus>,
     mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
     owned_startup_cwd: Option<PathBuf>,
+    owned_runtime_workspace_roots: Option<Vec<PathBuf>>,
     thread_id: ThreadId,
     checkpoint_suffix: bool,
     legacy_compaction_count: u64,
@@ -113,6 +115,7 @@ struct SeededResumeState {
     last_agent_status: Option<AgentStatus>,
     mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
     owned_startup_cwd: Option<PathBuf>,
+    owned_runtime_workspace_roots: Option<Vec<PathBuf>>,
     auto_compact_window_prefill_input_tokens: Option<i64>,
     has_prior_user_turns: bool,
 }
@@ -129,6 +132,7 @@ impl SeededResumeState {
             last_agent_status: None,
             mcp_resource_origins: None,
             owned_startup_cwd: None,
+            owned_runtime_workspace_roots: None,
             auto_compact_window_prefill_input_tokens: None,
             has_prior_user_turns: false,
         }
@@ -160,6 +164,7 @@ impl ResumeReplayReducer {
             last_agent_status: seeded.last_agent_status,
             mcp_resource_origins: seeded.mcp_resource_origins,
             owned_startup_cwd: seeded.owned_startup_cwd,
+            owned_runtime_workspace_roots: seeded.owned_runtime_workspace_roots,
             thread_id,
             checkpoint_suffix: materialized_state.is_some(),
             legacy_compaction_count: 0,
@@ -230,6 +235,7 @@ impl ResumeReplayReducer {
             last_agent_status: state.last_agent_status.clone(),
             mcp_resource_origins: state.mcp_resource_origins.clone(),
             owned_startup_cwd: state.owned_startup_cwd.clone(),
+            owned_runtime_workspace_roots: state.owned_runtime_workspace_roots.clone(),
             auto_compact_window_prefill_input_tokens: state
                 .auto_compact_window_prefill_input_tokens,
             has_prior_user_turns: state.has_prior_user_turns,
@@ -240,6 +246,11 @@ impl ResumeReplayReducer {
         match item {
             RolloutItem::RetainedContext(_) => {}
             RolloutItem::SessionMeta(session_meta) => {
+                if !self.checkpoint_suffix && session_meta.meta.id == self.thread_id {
+                    self.owned_startup_cwd = Some(session_meta.meta.cwd.clone());
+                    self.owned_runtime_workspace_roots =
+                        session_meta.meta.runtime_workspace_roots.clone();
+                }
                 if !self.checkpoint_suffix && self.window.is_none() {
                     self.window = session_meta
                         .meta
@@ -419,6 +430,11 @@ impl ResumeReplayReducer {
             && event.thread_id == Some(self.thread_id)
         {
             self.owned_startup_cwd = Some(event.thread_settings.cwd.to_path_buf());
+            self.owned_runtime_workspace_roots = event
+                .thread_settings
+                .runtime_workspace_roots
+                .as_ref()
+                .map(|roots| roots.iter().map(|root| root.to_path_buf()).collect());
         }
         if let EventMsg::TokenCount(event) = event
             && let Some(info) = &event.info
@@ -471,6 +487,7 @@ impl ResumeReplayReducer {
             last_agent_status: self.last_agent_status,
             mcp_resource_origins: self.mcp_resource_origins,
             owned_startup_cwd: self.owned_startup_cwd,
+            owned_runtime_workspace_roots: self.owned_runtime_workspace_roots,
             auto_compact_window_prefill_input_tokens: self.auto_compact_window_prefill_input_tokens,
             has_prior_user_turns: self.has_prior_user_turns,
         }

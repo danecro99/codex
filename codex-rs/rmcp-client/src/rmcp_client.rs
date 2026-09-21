@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -399,9 +400,19 @@ pub struct RmcpClient {
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery_lock: Semaphore,
     elicitation_pause_state: ElicitationPauseState,
+    tool_list_changed: Arc<AtomicU64>,
 }
 
 impl RmcpClient {
+    /// Monotonic notification revision. Reading never consumes a concurrent change.
+    pub fn tool_list_change_revision(&self) -> u64 {
+        self.tool_list_changed.load(Ordering::Acquire)
+    }
+
+    pub fn mark_tool_list_changed(&self) {
+        self.tool_list_changed.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Returns the protocol compatibility policy captured when this client was created.
     pub fn protocol_mode(&self) -> McpProtocolMode {
         self.protocol_mode
@@ -425,6 +436,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            tool_list_changed: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -498,6 +510,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            tool_list_changed: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -600,6 +613,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            tool_list_changed: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1252,6 +1266,7 @@ impl RmcpClient {
             initialize_context.client_info.clone(),
             Box::new(move |id, request| send_elicitation(id, request)),
             self.elicitation_pause_state.clone(),
+            Arc::clone(&self.tool_list_changed),
         );
         let _initialize_deadline = match &self.transport_recipe {
             TransportRecipe::StreamableHttp {

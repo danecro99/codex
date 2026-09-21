@@ -6,6 +6,7 @@ pub(crate) use super::step_settings::tests::update_selected_settings_for_test;
 use super::turn_context::TurnEnvironment;
 use super::*;
 use crate::agents_md_manager::AgentsMdManager;
+use crate::compact;
 use crate::compact::InitialContextInjection;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
@@ -2174,7 +2175,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
         .await;
 
-    assert_eq!(reconstructed.history, replacement_history);
+    assert_eq!(reconstructed.history.as_ref(), &replacement_history);
     assert_eq!(42, reconstructed.window_number);
     assert_eq!(Some(first_window_id), reconstructed.first_window_id);
     assert_eq!(Some(previous_window_id), reconstructed.previous_window_id);
@@ -2191,8 +2192,10 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("resumed history should reconstruct");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, raw_history_items(&history));
@@ -2383,7 +2386,8 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
     let (resumed_session, _resumed_turn_context) = make_session_and_context().await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("inter-agent history should resume");
     assert_eq!(
         strip_response_item_ids(&raw_history_items(&resumed_session.clone_history().await)),
         strip_response_item_ids(std::slice::from_ref(&expected_item))
@@ -2452,7 +2456,8 @@ async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resum
         .await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("inter-agent history should resume");
     let resumed_history = resumed_session.clone_history().await;
     let resumed_items = raw_history_items(&resumed_history);
     let [resumed_item] = resumed_items.as_slice() else {
@@ -2665,8 +2670,10 @@ async fn prepares_resumed_history_before_installing_it() {
                 metadata: Some(CodexHarnessMetadata::default()),
             })]),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("resumed media history should initialize");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(
@@ -2722,6 +2729,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
+                materialized_resume: None,
             }),
             /*inherited_multi_agent_version*/ None,
         ),
@@ -2733,6 +2741,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
+                materialized_resume: None,
             }),
             Some(MultiAgentVersion::V2),
         ),
@@ -2747,6 +2756,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
                     Some(MultiAgentVersion::Disabled)
                 )]),
                 rollout_path: None,
+                materialized_resume: None,
             }),
             Some(MultiAgentVersion::V2),
         ),
@@ -2775,7 +2785,10 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
 async fn record_initial_history_new_defers_initial_context_until_first_turn() {
     let (session, _turn_context) = make_session_and_context().await;
 
-    session.record_initial_history(InitialHistory::New).await;
+    session
+        .record_initial_history(InitialHistory::New)
+        .await
+        .expect("new history should initialize");
 
     let history = session.clone_history().await;
     assert_eq!(raw_history_items(&history), Vec::<ResponseItem>::new());
@@ -2809,8 +2822,10 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("resumed history should initialize");
 
     let history_before_seed = session.state.lock().await.clone_history();
     assert_eq!(expected, raw_history_items(&history_before_seed));
@@ -2919,8 +2934,10 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            materialized_resume: None,
         }))
-        .await;
+        .await
+        .expect("resumed token history should initialize");
 
     let actual = session.state.lock().await.token_info();
     assert_eq!(actual, Some(info2));
@@ -3494,7 +3511,8 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("forked history should reconstruct");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(
@@ -3538,7 +3556,8 @@ async fn start_new_context_window_persists_checkpoint_state() {
 
     session
         .start_new_context_window(&step_context, world_state)
-        .await;
+        .await
+        .expect("context window checkpoint should persist");
 
     let live_history = session.clone_history().await;
     assert!(live_history.raw_items().next().is_some());
@@ -3615,7 +3634,8 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         .record_initial_history(InitialHistory::Forked(vec![RolloutItem::ResponseItem(
             response_item,
         )]))
-        .await;
+        .await
+        .expect("forked response history should initialize");
 
     let live_history = session.clone_history().await;
     let live_items = raw_history_items(&live_history);
@@ -3871,7 +3891,8 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("forked turn history should initialize");
 
     let history = session.clone_history().await;
     assert_eq!(
@@ -5033,6 +5054,287 @@ async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
     rollout_path
 }
 
+#[tokio::test]
+async fn fresh_long_session_materializes_resume_state_at_turn_completion() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let rollout_path = attach_thread_persistence(&mut session).await;
+    let items = (0..512)
+        .map(|index| ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: format!("{index}:{}", "x".repeat(2_048)),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        })
+        .collect::<Vec<_>>();
+    let _ = session.state.lock().await.take_next_turn_is_first();
+    session
+        .record_conversation_items(&turn_context, turn_context.model_info(), items.as_slice())
+        .await;
+    session
+        .send_event(
+            &turn_context,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn_context.sub_id.clone(),
+                last_agent_message: None,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    let config = session.get_config().await;
+    let artifact_path = config
+        .codex_home
+        .join("materialized_resume_state_v7")
+        .join(format!("{}.json", session.thread_id()));
+    let artifact: codex_history::MaterializedResume = serde_json::from_slice(
+        std::fs::read(artifact_path.as_path())
+            .expect("fresh terminal turn must publish resume state")
+            .as_slice(),
+    )
+    .expect("decode proactive materialization");
+    let materialized_state = artifact.state.expect("materialized state");
+    assert_eq!(materialized_state.history.len(), 512);
+    assert!(materialized_state.has_prior_user_turns);
+
+    let resumed = session
+        .services
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadModelContextParams {
+            thread_id: session.thread_id(),
+            include_archived: false,
+            rollout_path: Some(rollout_path),
+        })
+        .await
+        .expect("resume fresh materialized session");
+    assert_eq!(
+        resumed.diagnostics.outcome,
+        codex_thread_store::ResumeCheckpointOutcome::Hit
+    );
+    assert_eq!(resumed.diagnostics.suffix_items, 0);
+    assert!(resumed.diagnostics.source_bytes <= 512 * 1_024);
+    assert_eq!(resumed.items.len(), 1);
+}
+
+#[tokio::test]
+async fn incompatible_model_checkpoint_establishes_a_loud_clean_rebuild_boundary() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let rollout_path = attach_thread_persistence(&mut session).await;
+    session
+        .record_conversation_items(
+            &turn_context,
+            turn_context.model_info(),
+            &[user_message("persisted user turn")],
+        )
+        .await;
+    session
+        .publish_current_materialized_resume_state(AgentStatus::Completed(None))
+        .await
+        .expect("publish model-bound checkpoint");
+    let checkpoint_path = session
+        .get_config()
+        .await
+        .codex_home
+        .join("materialized_resume_state_v7")
+        .join(format!("{}.json", session.thread_id()));
+    let mut loaded = session
+        .services
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadModelContextParams {
+            thread_id: session.thread_id(),
+            include_archived: false,
+            rollout_path: Some(rollout_path.clone()),
+        })
+        .await
+        .expect("load model-bound checkpoint");
+    {
+        let state = loaded
+            .materialized_resume
+            .as_mut()
+            .and_then(|resume| resume.state.as_mut())
+            .expect("materialized state");
+        state.materialized_model = "incompatible-model".to_string();
+        state.truncation_policy = match state.truncation_policy {
+            TruncationPolicy::Tokens(tokens) => TruncationPolicy::Tokens(tokens.saturating_add(1)),
+            other => {
+                panic!("test model is expected to use a token truncation contract, got {other:?}")
+            }
+        };
+    }
+
+    let error = session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: session.thread_id(),
+            history: Arc::new(loaded.items),
+            rollout_path: Some(rollout_path.clone()),
+            materialized_resume: loaded.materialized_resume.map(Box::new),
+        }))
+        .await
+        .expect_err("incompatible model state must require an explicit retry");
+    assert!(
+        error
+            .to_string()
+            .contains("codex_resume_state_needs_rebuild"),
+        "{error:#}"
+    );
+    assert!(!checkpoint_path.exists());
+
+    let rebuild = session
+        .services
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadModelContextParams {
+            thread_id: session.thread_id(),
+            include_archived: false,
+            rollout_path: Some(rollout_path),
+        })
+        .await
+        .expect("next explicit resume can reconstruct the canonical transcript");
+    assert_eq!(
+        rebuild.diagnostics.outcome,
+        codex_thread_store::ResumeCheckpointOutcome::Miss
+    );
+    assert!(rebuild.materialized_resume.is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_compaction_preserves_live_history_and_guardian_checkpoint() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut session, _turn_context) = make_session_and_context().await;
+    let config = session.get_config().await;
+    open_thread_persistence(&mut session).await;
+    session
+        .replace_history(vec![user_message("retain original authorization")], None)
+        .await;
+    let before = session.clone_history().await;
+    let window_before = session.current_window().await;
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
+    let sessions = config.codex_home.to_path_buf().join("sessions");
+    std::fs::create_dir_all(&sessions)?;
+    let permissions = std::fs::metadata(&sessions)?.permissions();
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o555))?;
+    let result = session
+        .replace_compacted_history(
+            vec![ResponseItemEnvelope::new(user_message(
+                "replacement must not become live",
+            ))],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: "summary".to_string(),
+                window_number,
+                window_ids,
+                compaction_response_id: None,
+                compaction_model_hash: None,
+            },
+        )
+        .await;
+    std::fs::set_permissions(&sessions, permissions)?;
+    assert!(
+        result.is_err(),
+        "a rejected checkpoint must fail compaction"
+    );
+    let after = session.clone_history().await;
+    assert_eq!(after.annotated_items(), before.annotated_items());
+    assert_eq!(
+        after.guardian_history_checkpoint(),
+        before.guardian_history_checkpoint()
+    );
+    assert_eq!(session.current_window().await, window_before);
+    Ok(())
+}
+
+/// A real rollout append failure must warn the client without ending the active turn.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failing_response_item_append_warns_the_client_without_ending_the_turn()
+-> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut session, _turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let config = session.get_config().await;
+    open_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    while rx_event.try_recv().is_ok() {}
+
+    let sessions = config.codex_home.to_path_buf().join("sessions");
+    std::fs::create_dir_all(sessions.as_path())?;
+    let original = std::fs::metadata(sessions.as_path())?.permissions();
+    std::fs::set_permissions(sessions.as_path(), std::fs::Permissions::from_mode(0o555))?;
+
+    session
+        .persist_rollout_items(&[RolloutItem::ResponseItem(
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "this answer is not durable".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        )])
+        .await;
+
+    std::fs::set_permissions(sessions.as_path(), original)?;
+
+    let event = rx_event.recv().await?;
+    let EventMsg::Warning(warning) = event.msg else {
+        panic!(
+            "a persistence failure must not end the turn: {:?}",
+            event.msg
+        );
+    };
+    assert!(
+        warning.message.contains("could not be saved to disk"),
+        "{}",
+        warning.message
+    );
+    assert!(rx_event.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_history_failure_is_reported_to_the_client_once() -> anyhow::Result<()> {
+    let (session, rx_event) = make_session_with_config_and_rx(|_config| {}).await?;
+    let mut agent_status = session.agent_status.subscribe();
+    agent_status.mark_unchanged();
+    while rx_event.try_recv().is_ok() {}
+
+    let failure = anyhow::anyhow!(
+        "canonical rollout append was rolled back: {}",
+        "test reason"
+    );
+    session
+        .report_durable_history_failure("turn-1", &failure)
+        .await;
+    session
+        .report_durable_history_failure("turn-2", &failure)
+        .await;
+
+    let event = rx_event.recv().await?;
+    assert_eq!(event.id, "turn-1");
+    let EventMsg::Warning(warning) = event.msg else {
+        panic!("expected a warning event, got {:?}", event.msg);
+    };
+    assert!(
+        warning.message.contains("could not be saved to disk")
+            && warning.message.contains("test reason"),
+        "{}",
+        warning.message
+    );
+    assert!(!agent_status.has_changed()?);
+    assert!(rx_event.is_empty());
+    Ok(())
+}
+
 fn text_block(s: &str) -> serde_json::Value {
     json!({
         "type": "text",
@@ -6000,7 +6302,7 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
     assert!(futures::poll!(update.as_mut()).is_pending());
     let committed = session.thread_settings_snapshot().await;
     let history_before = session.clone_history().await;
-    let (window_number, window_ids) = session.advance_auto_compact_window().await;
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
     let mut checkpoint = Box::pin(tokio::task::unconstrained(
         session.replace_compacted_history(
             vec![ResponseItemEnvelope::new(user_message("compacted history"))],
@@ -6041,7 +6343,7 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
     assert_ne!(committed, restored);
     drop(refresh_guard);
     update.await.expect("accepted settings update");
-    checkpoint.await;
+    checkpoint.await.expect("checkpoint current settings");
     settings_checkpoint
         .await
         .expect("checkpoint current settings");
@@ -6720,6 +7022,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         fork_persistence: ForkPersistence::Copied,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
+        durable_history_failure_reported: AtomicBool::new(false),
     };
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -7059,6 +7362,7 @@ async fn resumed_root_session_uses_thread_id_as_session_id() {
             conversation_id: thread_id,
             history: Arc::new(Vec::new()),
             rollout_path: None,
+            materialized_resume: None,
         }),
         SessionSource::Exec,
         AgentControl::default(),
@@ -7102,6 +7406,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
                 git: None,
             })]),
             rollout_path: None,
+            materialized_resume: None,
         }),
         session_source,
         AgentControl::default(),
@@ -7155,6 +7460,7 @@ async fn resumed_copied_fork_ignores_source_history_base() {
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: None,
+            materialized_resume: None,
         }),
         SessionSource::Exec,
         AgentControl::default(),
@@ -8893,6 +9199,7 @@ where
         fork_persistence: ForkPersistence::Copied,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
+        durable_history_failure_reported: AtomicBool::new(false),
     });
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -9384,8 +9691,14 @@ async fn mcp_policy_changes_schedule_runtime_refresh() {
 
 #[tokio::test]
 async fn mcp_refresh_detects_shared_auth_manager_changes() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let session = Arc::new(session);
+    let auth_home = tempfile::tempdir().expect("create auth home");
+    let (session, _turn_context, _rx) = make_session_and_context_with_auth_config_home_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        auth_home.path(),
+        |_config| {},
+    )
+    .await;
 
     assert_eq!(
         session.services.plugins_manager.auth_mode(),
@@ -9844,13 +10157,18 @@ async fn record_context_updates_use_environment_permission_profile_and_workspace
 async fn record_context_updates_emits_environment_item_for_time_changes() {
     let (session, previous_context) = make_session_and_context().await;
     let previous_context = Arc::new(previous_context);
+    let changed_timezone = if previous_context.timezone.as_deref() == Some("Europe/Berlin") {
+        "America/Los_Angeles"
+    } else {
+        "Europe/Berlin"
+    };
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info().slug.clone(),
             &session.services.models_manager,
         )
         .await;
-    current_context.timezone = Some("Europe/Berlin".to_string());
+    current_context.timezone = Some(changed_timezone.to_string());
 
     let update_items =
         record_context_update_items(&session, previous_context, current_context).await;
@@ -9861,7 +10179,7 @@ async fn record_context_updates_emits_environment_item_for_time_changes() {
         .expect("environment update item should be emitted");
     let current_date = chrono::Local::now().format("%Y-%m-%d").to_string();
     assert!(environment_update.contains(&format!("<current_date>{current_date}</current_date>")));
-    assert!(environment_update.contains("<timezone>Europe/Berlin</timezone>"));
+    assert!(environment_update.contains(&format!("<timezone>{changed_timezone}</timezone>")));
 }
 
 #[tokio::test]

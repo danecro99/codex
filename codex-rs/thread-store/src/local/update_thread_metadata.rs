@@ -75,7 +75,7 @@ pub(super) async fn update_thread_metadata(
     let has_explicit_metadata = patch.name.is_some() || requires_rollout_compat;
     let history_mode = if has_explicit_metadata {
         match live_writer::live_writer_parts(store, thread_id).await {
-            Ok((_recorder, _rollout_id, history_mode)) => Some(history_mode),
+            Ok(writer) => Some(writer.history_mode),
             Err(ThreadStoreError::ThreadNotFound { .. }) => Some(
                 read_thread::read_thread(
                     store,

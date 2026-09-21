@@ -278,7 +278,7 @@ pub struct ResumedHistory {
 }
 
 /// Current private on-disk schema for [`MaterializedResumeState`] and its source fence.
-pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 6;
+pub const MATERIALIZED_RESUME_STATE_VERSION: u32 = 7;
 
 /// Exact post-reconstruction state required to hydrate a resumed session.
 ///
@@ -298,11 +298,18 @@ pub struct MaterializedResumeState {
     pub world_state_baseline: Option<WorldStateItem>,
     pub mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
     pub auto_compact_window: MaterializedAutoCompactWindow,
-    /// Startup cwd this thread explicitly claimed, from its own newest applied thread settings.
+    /// Current cwd this thread explicitly claimed, from its own session metadata or newest
+    /// applied thread settings.
     ///
     /// Copied or referenced history can carry another thread's settings, so only snapshots owned
     /// by this thread are recorded here.
     pub owned_startup_cwd: Option<PathBuf>,
+    /// Top-level runtime workspace roots paired with [`Self::owned_startup_cwd`].
+    ///
+    /// These deliberately exclude roots contributed by environments or permission profiles.
+    /// `None` means the owned snapshot did not declare runtime roots; an empty list is an
+    /// explicit selection of no roots.
+    pub owned_runtime_workspace_roots: Option<Vec<PathBuf>>,
     pub token_info: Option<codex_protocol::protocol::TokenUsageInfo>,
     pub latest_token_usage_record: Option<TokenUsageRecord>,
     pub last_agent_status: Option<codex_protocol::protocol::AgentStatus>,

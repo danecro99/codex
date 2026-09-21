@@ -85,7 +85,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
         initial
             .home
             .path()
-            .join("materialized_resume_state_v6")
+            .join("materialized_resume_state_v7")
             .join(format!("{}.json", initial.session_configured.thread_id)),
     )?;
     let resumed = builder.restart(&server, &initial).await?;

@@ -78,7 +78,7 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
     .await;
     let materialized_resume_path = home
         .path()
-        .join("materialized_resume_state_v6")
+        .join("materialized_resume_state_v7")
         .join(format!("{thread_id}.json"));
     let window_id = ThreadId::new().to_string();
     store
@@ -99,6 +99,7 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
                 world_state_baseline: None,
                 mcp_resource_origins: None,
                 owned_startup_cwd: None,
+                owned_runtime_workspace_roots: None,
                 auto_compact_window: MaterializedAutoCompactWindow {
                     window_number: 0,
                     first_window_id: window_id.clone(),

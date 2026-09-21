@@ -5677,7 +5677,9 @@ async fn thread_resume_with_overrides_preserves_recency_and_checkpoints_model() 
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id,
-            model: Some("mock-model".to_string()),
+            // Keep this override on the persisted checkpoint's truncation contract. An
+            // incompatible contract is rejected loudly and covered by the core rebuild test.
+            model: Some("gpt-5.5".to_string()),
             ..Default::default()
         })
         .await?;
@@ -5698,7 +5700,7 @@ async fn thread_resume_with_overrides_preserves_recency_and_checkpoints_model() 
         }
         _ => None,
     });
-    assert_eq!(persisted_model, Some("mock-model"));
+    assert_eq!(persisted_model, Some("gpt-5.5"));
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {

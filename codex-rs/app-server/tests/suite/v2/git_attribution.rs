@@ -377,7 +377,7 @@ fn replace_attribution_fragment_with_legacy(
     std::fs::write(rollout_path, format!("{}\n", lines.join("\n")))?;
     for private_state in [
         codex_home
-            .join("materialized_resume_state_v6")
+            .join("materialized_resume_state_v7")
             .join(format!("{thread_id}.json")),
         codex_home
             .join("rollout_append_generation_v5")

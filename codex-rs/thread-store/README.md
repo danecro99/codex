@@ -34,9 +34,9 @@ implementations may live outside this repository.
 New metadata observation semantics should live above `ThreadStore`. Stores
 persist explicit metadata fields, but raw history appends remain history-only.
 
-## Private resume state in the 0.154.0 integration
+## Private resume state in the 0.155.1 integration
 
-`MaterializedResumeState` version 6 stores the upstream `RetainedContext` alongside
+`MaterializedResumeState` version 7 stores the upstream `RetainedContext` alongside
 model history and the remaining exact resume state. The canonical source is still
 the rollout, including retained-context events and compaction snapshots. Both full
 reconstruction and checkpoint-plus-suffix reconstruction must produce the same
@@ -51,10 +51,10 @@ provider turn must not erase an earlier retained answer. Reverse-filtering those
 source items before the history fold would lose that evidence. A materialized
 checkpoint seeds the same fold, not a second transcript or an alternative reader.
 
-The current derived-state namespace is `materialized_resume_state_v6`. No previous
-namespace is read, rewritten, or treated as version 6. The existing first-use-miss
+The current derived-state namespace is `materialized_resume_state_v7`. No previous
+namespace is read, rewritten, or treated as version 7. The existing first-use-miss
 path reconstructs from the canonical transcript and publishes a newly fenced
-version 6 checkpoint. Diagnostics report `Miss` for this first reconstruction;
+version 7 checkpoint. Diagnostics report `Miss` for this first reconstruction;
 subsequent matching resumes can report `Hit`. Invalid data in the current namespace
 is an error, not permission to silently discard it and retry through another path.
 Original transcripts and append-generation journals are not migrated or truncated.

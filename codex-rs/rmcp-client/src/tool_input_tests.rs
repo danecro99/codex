@@ -16,6 +16,8 @@ use rmcp::service::serve_directly;
 use rmcp::transport::IntoTransport;
 use rmcp::transport::Transport;
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -48,6 +50,7 @@ async fn connection_closure_releases_pending_inputs_and_timeout_pause() -> anyho
                     Box::pin(async move { Ok(rx.await?) })
                 }),
                 pause_state,
+                Arc::new(AtomicU64::new(0)),
             );
             let (client_transport, server_transport) =
                 tokio::io::duplex(/*max_buf_size*/ 4096);

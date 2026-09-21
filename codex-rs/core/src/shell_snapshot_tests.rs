@@ -20,6 +20,8 @@ use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command;
@@ -379,11 +381,33 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
     assert!(!dir.path().join("startup-ran").exists());
 
     // Identical concurrent captures must not share one command's cancellation.
+    let capture_started = dir.path().join("capture-started");
+    let finish_startup = dir.path().join("finish-startup");
+    let block_capture = dir.path().join("block-capture");
+    fs::write(&block_capture, "").await?;
     fs::write(
         dir.path().join(".codex/startup.sh"),
-        "export OPENAI_API_KEY=sk-snapshot-cache-test\nprintf started > capture-started\nwhile [ ! -f finish-startup ]; do sleep 0.01; done\n",
+        "export OPENAI_API_KEY=sk-snapshot-cache-test\n",
     )
     .await?;
+    let capture_shell_path = dir.path().join("capture-bash");
+    fs::write(
+        &capture_shell_path,
+        format!(
+            "#!/bin/bash\nif [[ -f \"{}\" && \"$1\" == '-c' && \"$2\" == *'# Snapshot file'* ]]; then\n  printf started > \"{}\"\n  while [[ ! -f \"{}\" ]]; do sleep 0.01; done\nfi\nexec /bin/bash \"$@\"\n",
+            block_capture.display(),
+            capture_started.display(),
+            finish_startup.display(),
+        ),
+    )
+    .await?;
+    let mut capture_shell_permissions = std::fs::metadata(&capture_shell_path)?.permissions();
+    capture_shell_permissions.set_mode(0o755);
+    std::fs::set_permissions(&capture_shell_path, capture_shell_permissions)?;
+    let shell = Shell {
+        shell_type: ShellType::Bash,
+        shell_path: capture_shell_path,
+    };
     config.shell_environment_policy.r#set.insert(
         "BASH_ENV".into(),
         dir.path().join(".codex/startup.sh").display().to_string(),
@@ -447,7 +471,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
         let snapshot = environment
             .shell_snapshot(&cwd, &command, &shell, &tool_config, Some(first_sandbox))
             .await;
-        fs::write(dir.path().join("finish-startup"), "").await?;
+        fs::write(&finish_startup, "").await?;
         Ok::<_, anyhow::Error>(snapshot)
     };
     let second = environment.shell_snapshot(
@@ -458,7 +482,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
         Some(second_sandbox.clone()),
     );
     let cancel_after_startup = async {
-        while !dir.path().join("capture-started").exists() {
+        while !capture_started.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         started_proxy
@@ -472,6 +496,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
         tokio::join!(biased; first, second, cancel_after_startup)
     })
     .await?;
+    fs::remove_file(&block_capture).await?;
     assert!(first?.is_none(), "the cancelled capture must fail");
     let second = second.context("the unrelated capture must succeed")?;
     let reused = environment

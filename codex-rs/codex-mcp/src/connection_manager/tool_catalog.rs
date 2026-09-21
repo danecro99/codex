@@ -578,7 +578,8 @@ impl McpConnectionSet {
         let client_tools = managed_client
             .tool_catalog
             .read(|catalog| catalog.tools.clone())
-            .await;
+            .await
+            .map_err(anyhow::Error::msg)?;
         emit_duration(
             MCP_TOOLS_LIST_DURATION_METRIC,
             list_start.elapsed(),

@@ -1145,6 +1145,7 @@ impl RolloutRecorder {
             conversation_id,
             history: Arc::new(items),
             rollout_path: Some(compression::plain_rollout_path(path)),
+            materialized_resume: None,
         }))
     }
 
@@ -2008,8 +2009,8 @@ async fn open_rollout_for_append(
         if refresh_modified_time {
             file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
         }
-        ensure_rollout_is_newline_terminated(&mut file)?;
         let ordinal_state = ordinal_state_for_rollout(&mut file, path_for_open.as_path())?;
+        ensure_rollout_is_newline_terminated(&mut file)?;
         Ok::<_, std::io::Error>((file, ordinal_state))
     })
     .await
@@ -2037,12 +2038,12 @@ struct JsonlWriter {
 }
 
 #[derive(serde::Serialize)]
-struct RolloutLineRef<'a> {
-    timestamp: String,
+pub(crate) struct RolloutLineRef<'a> {
+    pub(crate) timestamp: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ordinal: Option<u64>,
+    pub(crate) ordinal: Option<u64>,
     #[serde(flatten)]
-    item: &'a RolloutItem,
+    pub(crate) item: &'a RolloutItem,
 }
 
 impl JsonlWriter {
@@ -2068,6 +2069,15 @@ impl JsonlWriter {
     async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
         let mut json = serde_json::to_string(item)?;
         json.push('\n');
+        if json.len() > crate::MAX_CANONICAL_ROLLOUT_RECORD_BYTES {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "rollout record exceeds the {}-byte canonical record limit",
+                    crate::MAX_CANONICAL_ROLLOUT_RECORD_BYTES
+                ),
+            ));
+        }
         self.file.write_all(json.as_bytes()).await?;
         self.file.flush().await?;
         Ok(())

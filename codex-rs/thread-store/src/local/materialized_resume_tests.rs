@@ -166,6 +166,7 @@ fn state() -> MaterializedResumeState {
         world_state_baseline: None,
         mcp_resource_origins: None,
         owned_startup_cwd: None,
+        owned_runtime_workspace_roots: None,
         auto_compact_window: MaterializedAutoCompactWindow {
             window_number: 0,
             first_window_id: window_id.clone(),
@@ -1472,6 +1473,7 @@ async fn an_unresolved_durable_write_stops_the_writer_without_losing_cleanup() {
             history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: "window-1".to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(home.path().to_path_buf()),
                 model_provider: "test-provider".to_string(),
