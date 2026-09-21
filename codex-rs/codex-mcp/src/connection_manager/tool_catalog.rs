@@ -447,6 +447,12 @@ impl McpConnectionSet {
         Ok(CodexAppsToolSnapshot {
             tools,
             model_visible_tool_names,
+            connector_ids: config
+                .connector_snapshot
+                .connector_ids()
+                .iter()
+                .map(|connector_id| connector_id.0.clone())
+                .collect(),
         })
     }
 

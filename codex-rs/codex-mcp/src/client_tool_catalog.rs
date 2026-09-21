@@ -16,13 +16,15 @@ use tokio::sync::RwLock;
 
 use crate::tools::ToolInfo;
 
-/// The exact Apps catalog returned by an awaited refresh of one published runtime.
+/// The exact Apps catalog and connector provenance returned by one published runtime.
 pub struct CodexAppsToolSnapshot {
     /// Raw installed tools, including tools hidden or disabled for the model.
     pub tools: Vec<ToolInfo>,
     /// Raw MCP tool names allowed by the same runtime's generic MCP policy.
     /// App-specific policy is applied by the caller.
     pub model_visible_tool_names: HashSet<String>,
+    /// Plugin connector IDs from the immutable configuration that owns `tools`.
+    pub connector_ids: Vec<String>,
 }
 
 pub(crate) struct ClientToolCatalog {

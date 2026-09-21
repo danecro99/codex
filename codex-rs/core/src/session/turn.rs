@@ -78,7 +78,6 @@ use codex_features::Feature;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_login::CodexAuth;
-use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -756,7 +755,6 @@ async fn required_mcp_servers_for_input(
         .plugins_manager
         .plugins_for_config(&turn_context.config.plugins_config_input())
         .await;
-    let current_config = sess.services.mcp_runtime.current_config();
     let mentioned_plugins =
         collect_explicit_plugin_mentions(user_input, loaded_plugins.capability_summaries());
     let mut required_servers = mentioned_plugins
@@ -781,6 +779,7 @@ async fn required_mcp_servers_for_input(
         let mention_auth = mention_auth.as_ref().ok_or_else(|| {
             std::io::Error::other("current account is unavailable for explicit app mentions")
         })?;
+        let apps_tools = sess.refresh_codex_apps_tools().await?;
         if !sess
             .services
             .mcp_runtime
@@ -791,42 +790,9 @@ async fn required_mcp_servers_for_input(
             )
             .into());
         }
-        let required_servers = [CODEX_APPS_MCP_SERVER_NAME.to_string()];
-        let binding = sess
-            .services
-            .mcp_runtime
-            .current_binding_with_requirements(&required_servers, &HashSet::new())
-            .await
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Codex Apps MCP runtime is unavailable for explicit app mentions",
-                )
-            })?;
-        if binding
-            .config()
-            .mcp_server_catalog
-            .server(CODEX_APPS_MCP_SERVER_NAME)
-            .is_none()
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Codex Apps MCP server is unavailable for explicit app mentions",
-            )
-            .into());
-        }
-        if let Some(error) = binding.catalog_errors().get(CODEX_APPS_MCP_SERVER_NAME) {
-            return Err(std::io::Error::other(format!(
-                "Codex Apps MCP catalog is unavailable for explicit app mentions: {error}"
-            ))
-            .into());
-        }
         let accessible_connectors =
-            connectors::accessible_connectors_from_mcp_tools(binding.tools());
-        let connector_ids = current_config
-            .iter()
-            .flat_map(|config| config.connector_snapshot.connector_ids())
-            .map(|connector_id| connector_id.0.clone());
+            connectors::accessible_connectors_from_mcp_tools(&apps_tools.tools);
+        let connector_ids = apps_tools.connector_ids.into_iter();
         build_connector_slug_counts(
             &codex_connectors::merge::merge_plugin_connectors_with_accessible(
                 connector_ids,

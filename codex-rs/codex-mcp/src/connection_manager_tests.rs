@@ -46,6 +46,8 @@ use codex_exec_server_test_support::environment_manager_without_environments;
 use codex_login::AuthHeaders;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_plugin::AppConnectorId;
+use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::ToolName;
 use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::mcp::ClientMcpExtensions;
@@ -2293,6 +2295,16 @@ async fn hard_refresh_keeps_client_catalog_local_when_shared_cache_loses_race() 
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         PermissionProfile::default(),
     );
+    config.connector_snapshot =
+        codex_connectors::ConnectorSnapshot::from_plugin_capability_summaries(&[
+            PluginCapabilitySummary {
+                config_name: "calendar@test".to_string(),
+                display_name: "calendar-plugin".to_string(),
+                plugin_namespace: None,
+                app_connector_ids: vec![AppConnectorId("calendar".to_string())],
+                ..PluginCapabilitySummary::default()
+            },
+        ]);
     let manager_a_for_refresh = Arc::clone(&manager_a);
     let config_for_refresh = config.clone();
     let refresh_a = tokio::spawn(async move {
@@ -2316,6 +2328,7 @@ async fn hard_refresh_keeps_client_catalog_local_when_shared_cache_loses_race() 
         snapshot_a.model_visible_tool_names,
         HashSet::from(["a_only".to_string()])
     );
+    assert_eq!(snapshot_a.connector_ids, vec!["calendar".to_string()]);
     assert_eq!(
         cache_context_a
             .current_tools()
