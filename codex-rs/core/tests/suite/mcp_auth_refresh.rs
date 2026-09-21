@@ -45,8 +45,27 @@ impl ExternalAuth for StaticExternalAuth {
     }
 }
 
+async fn call_calendar_create_event(runtime: &McpRuntime) -> Result<()> {
+    let tool_result = runtime
+        .latest_call_tool(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "calendar_create_event",
+            /*environment_id*/ None,
+            Some(json!({
+                "title": "Lunch",
+                "starts_at": "2026-06-18T12:00:00Z",
+            })),
+            /*meta*/ None,
+            /*requested_timeout*/ None,
+            /*wait_for_server*/ true,
+        )
+        .await?;
+    assert_eq!(tool_result.is_error, Some(false));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hosted_plugin_runtime_ps_mcp_tool_calls_rebuild_for_the_current_account() -> Result<()> {
+async fn hosted_plugin_runtime_ps_mcp_tool_calls_refresh_and_isolate_accounts() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -114,9 +133,18 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_rebuild_for_the_current_account
         elicitation_lifecycle: None,
     })
     .await;
-    // The model-provider test covers AuthManager reload behavior. Keep this
-    // regression focused on core MCP wiring by updating the same shared
-    // manager after the MCP client has been created.
+    // A token rotation within the same account must update the existing
+    // runtime's authenticated client.
+    let auth_a_reloaded = CodexAuth::from_external_chatgpt_tokens(
+        "header.e30.account-a-reloaded",
+        "account-a",
+        /*chatgpt_plan_type*/ None,
+    )?;
+    auth_manager
+        .set_external_auth(Arc::new(StaticExternalAuth(auth_a_reloaded.clone())))
+        .await?;
+    call_calendar_create_event(&runtime_a).await?;
+
     let auth_b = CodexAuth::from_external_chatgpt_tokens(
         "header.e30.account-b",
         "account-b",
@@ -127,21 +155,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_rebuild_for_the_current_account
         .await?;
 
     // An A-bound runtime must not borrow B from the shared AuthManager.
-    let tool_result = runtime_a
-        .latest_call_tool(
-            CODEX_APPS_MCP_SERVER_NAME,
-            "calendar_create_event",
-            /*environment_id*/ None,
-            Some(json!({
-                "title": "Lunch",
-                "starts_at": "2026-06-18T12:00:00Z",
-            })),
-            /*meta*/ None,
-            /*requested_timeout*/ None,
-            /*wait_for_server*/ true,
-        )
-        .await?;
-    assert_eq!(tool_result.is_error, Some(false));
+    call_calendar_create_event(&runtime_a).await?;
 
     // Rebuilding from the current session account must use B, without carrying
     // A's client or credentials into the replacement runtime.
@@ -165,21 +179,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_rebuild_for_the_current_account
         elicitation_lifecycle: None,
     })
     .await;
-    let tool_result = runtime_b
-        .latest_call_tool(
-            CODEX_APPS_MCP_SERVER_NAME,
-            "calendar_create_event",
-            /*environment_id*/ None,
-            Some(json!({
-                "title": "Lunch",
-                "starts_at": "2026-06-18T12:00:00Z",
-            })),
-            /*meta*/ None,
-            /*requested_timeout*/ None,
-            /*wait_for_server*/ true,
-        )
-        .await?;
-    assert_eq!(tool_result.is_error, Some(false));
+    call_calendar_create_event(&runtime_b).await?;
 
     let requests = server
         .received_requests()
@@ -196,9 +196,25 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_rebuild_for_the_current_account
                     })
         })
         .collect::<Vec<_>>();
-    assert_eq!(tool_call_requests.len(), 2);
+    assert_eq!(tool_call_requests.len(), 3);
 
-    let stale_account_request = tool_call_requests[0];
+    let reloaded_same_account_request = tool_call_requests[0];
+    assert_eq!(
+        reloaded_same_account_request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer header.e30.account-a-reloaded")
+    );
+    assert_eq!(
+        reloaded_same_account_request
+            .headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("account-a")
+    );
+
+    let stale_account_request = tool_call_requests[1];
     assert_eq!(
         stale_account_request
             .headers
@@ -214,7 +230,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_rebuild_for_the_current_account
         None
     );
 
-    let current_account_request = tool_call_requests[1];
+    let current_account_request = tool_call_requests[2];
     assert_eq!(
         current_account_request
             .headers
