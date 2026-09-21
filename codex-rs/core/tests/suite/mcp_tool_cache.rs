@@ -234,9 +234,10 @@ async fn explicit_app_mention_uses_the_current_account_after_an_account_switch()
     .await;
     let auth_a = external_chatgpt_auth("account-a", "header.e30.account-a")?;
     let auth_b = external_chatgpt_auth("account-b", "header.e30.account-b")?;
+    // The Apps endpoint must be host-owned here so its request exposes the current account.
     let test = apps_enabled_builder(apps.chatgpt_base_url)
         .with_auth(auth_a)
-        .build_with_auto_env(&server)
+        .build(&server)
         .await?;
     test.thread_manager
         .auth_manager()
