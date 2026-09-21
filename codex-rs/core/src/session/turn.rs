@@ -78,6 +78,7 @@ use codex_features::Feature;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_login::CodexAuth;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -733,6 +734,20 @@ async fn required_mcp_servers_for_input(
         return Ok((Vec::new(), Vec::new()));
     }
 
+    let messages = user_input
+        .iter()
+        .filter_map(|input| match input {
+            UserInput::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mentions = collect_tool_mentions_from_messages(&messages);
+    let mention_auth = if turn_context.apps_enabled() && !mentions.plain_names.is_empty() {
+        Some(sess.services.auth_manager.try_auth().await?)
+    } else {
+        None
+    };
+
     // Plugin capabilities depend on authentication, so project them only after
     // the runtime has aligned the plugin manager with its current account.
     sess.refresh_mcp_if_dirty().await;
@@ -749,14 +764,6 @@ async fn required_mcp_servers_for_input(
         .flat_map(|plugin| plugin.mcp_server_names.iter().cloned())
         .collect::<HashSet<_>>();
 
-    let messages = user_input
-        .iter()
-        .filter_map(|input| match input {
-            UserInput::Text { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let mentions = collect_tool_mentions_from_messages(&messages);
     let paths = user_input
         .iter()
         .filter_map(|input| match input {
@@ -771,16 +778,51 @@ async fn required_mcp_servers_for_input(
     }));
 
     let connector_slug_counts = if turn_context.apps_enabled() && !mentions.plain_names.is_empty() {
-        let cached_connectors =
-            connectors::list_cached_accessible_connectors_from_mcp_tools(&turn_context.config)
-                .await
-                .map_err(std::io::Error::other)?;
-        let accessible_connectors = cached_connectors.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "cached accessible connectors are unavailable for explicit app mentions",
-            )
+        let mention_auth = mention_auth.as_ref().ok_or_else(|| {
+            std::io::Error::other("current account is unavailable for explicit app mentions")
         })?;
+        if !sess
+            .services
+            .mcp_runtime
+            .current_auth_matches(mention_auth.as_ref())
+        {
+            return Err(std::io::Error::other(
+                "Codex Apps MCP runtime does not match the current account for explicit app mentions",
+            )
+            .into());
+        }
+        let required_servers = [CODEX_APPS_MCP_SERVER_NAME.to_string()];
+        let binding = sess
+            .services
+            .mcp_runtime
+            .current_binding_with_requirements(&required_servers, &HashSet::new())
+            .await
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Codex Apps MCP runtime is unavailable for explicit app mentions",
+                )
+            })?;
+        if binding
+            .config()
+            .mcp_server_catalog
+            .server(CODEX_APPS_MCP_SERVER_NAME)
+            .is_none()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Codex Apps MCP server is unavailable for explicit app mentions",
+            )
+            .into());
+        }
+        if let Some(error) = binding.catalog_errors().get(CODEX_APPS_MCP_SERVER_NAME) {
+            return Err(std::io::Error::other(format!(
+                "Codex Apps MCP catalog is unavailable for explicit app mentions: {error}"
+            ))
+            .into());
+        }
+        let accessible_connectors =
+            connectors::accessible_connectors_from_mcp_tools(binding.tools());
         let connector_ids = current_config
             .iter()
             .flat_map(|config| config.connector_snapshot.connector_ids())

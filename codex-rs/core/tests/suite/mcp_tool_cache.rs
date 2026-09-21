@@ -18,6 +18,7 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
 use codex_extension_api::McpServerContributor;
+use codex_features::Feature;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::mcp::McpServerConnectionStatus;
 use codex_protocol::models::PermissionProfile;
@@ -41,6 +42,8 @@ use core_test_support::responses::ResponseMock;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_wine_exec;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::test_env;
 use core_test_support::wait_for_event;
@@ -49,12 +52,157 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use test_case::test_case;
+use tokio::sync::oneshot;
 
 use super::rmcp_client::remote_aware_environment_id;
 use super::rmcp_client::remote_aware_stdio_server_bin;
 
 const SERVER_NAME: &str = "cached_rmcp";
 const NAMESPACE: &str = "mcp__cached_rmcp";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_app_mention_samples_with_a_cold_accessible_connectors_cache() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let apps = AppsTestServer::mount(&server).await?;
+    let response = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("cold-app-mention"),
+            responses::ev_completed("cold-app-mention"),
+        ]),
+    )
+    .await;
+    let test = apps_enabled_builder(apps.chatgpt_base_url)
+        .build_with_auto_env(&server)
+        .await?;
+
+    // This thread has not made an Apps tool call, so its process-local accessible
+    // connector cache has no entry for this server's account/base-URL key.
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Use $calendar.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    if let EventMsg::Error(error) = event {
+        anyhow::bail!(
+            "explicit app mention should reach sampling with a cold connector cache: {}",
+            error.message
+        );
+    }
+
+    assert!(
+        response
+            .single_request()
+            .body_contains_text("Use $calendar."),
+        "the first sampling request should include the app mention"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_explicit_app_mention_samples_with_a_cold_accessible_connectors_cache()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (release_first_response, first_response_gate) = oneshot::channel();
+    let (model_server, _) = start_streaming_sse_server(vec![
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: responses::sse(vec![
+                    responses::ev_response_created("first"),
+                    responses::ev_message_item_added("first-message", ""),
+                    responses::ev_output_text_delta("first"),
+                ]),
+            },
+            StreamingSseChunk {
+                gate: Some(first_response_gate),
+                body: responses::sse(vec![
+                    responses::ev_assistant_message("first-message", "first"),
+                    responses::ev_completed("first"),
+                ]),
+            },
+        ],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_response_created("pending"),
+                responses::ev_completed("pending"),
+            ]),
+        }],
+    ])
+    .await;
+    let config_server = responses::start_mock_server().await;
+    let apps = AppsTestServer::mount(&config_server).await?;
+    let model_base_url = format!("{}/v1", model_server.uri());
+    let test = apps_enabled_builder(apps.chatgpt_base_url)
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(model_base_url);
+            config
+                .features
+                .disable(Feature::EnableRequestCompression)
+                .expect("test config should disable request compression");
+        })
+        .build_with_auto_env(&config_server)
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Start without an app mention.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::AgentMessageContentDelta(_))
+    })
+    .await;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Use $calendar.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    release_first_response.send(())?;
+
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    if let EventMsg::Error(error) = event {
+        anyhow::bail!(
+            "pending app mention should reach sampling with a cold connector cache: {}",
+            error.message
+        );
+    }
+
+    let requests = model_server.requests().await;
+    assert_eq!(requests.len(), 2);
+    let pending_request: Value = serde_json::from_slice(&requests[1])?;
+    assert!(
+        pending_request["input"]
+            .as_array()
+            .expect("pending sampling request input")
+            .iter()
+            .any(|item| {
+                item["type"] == "message"
+                    && item["role"] == "user"
+                    && item["content"].as_array().is_some_and(|content| {
+                        content.iter().any(|span| {
+                            span["type"] == "input_text" && span["text"] == "Use $calendar."
+                        })
+                    })
+            }),
+        "the pending app mention should reach the next sampling request"
+    );
+    model_server.shutdown().await;
+    Ok(())
+}
 
 #[test_case(1; "changed_names_and_schema")]
 #[test_case(2; "failed_relist_is_visible")]
