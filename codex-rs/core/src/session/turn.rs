@@ -779,17 +779,10 @@ async fn required_mcp_servers_for_input(
         let mention_auth = mention_auth.as_ref().ok_or_else(|| {
             std::io::Error::other("current account is unavailable for explicit app mentions")
         })?;
-        let apps_tools = sess.refresh_codex_apps_tools().await?;
-        if !sess
-            .services
-            .mcp_runtime
-            .current_auth_matches(mention_auth.as_ref())
-        {
-            return Err(std::io::Error::other(
-                "Codex Apps MCP runtime does not match the current account for explicit app mentions",
-            )
-            .into());
-        }
+        let apps_tools = sess
+            .refresh_codex_apps_tools_for_auth(mention_auth)
+            .await
+            .map_err(|error| CodexErr::Fatal(format!("{error:#}")))?;
         let accessible_connectors =
             connectors::accessible_connectors_from_mcp_tools(&apps_tools.tools);
         let connector_ids = apps_tools.connector_ids.into_iter();

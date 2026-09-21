@@ -19,6 +19,9 @@ use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
 use codex_extension_api::McpServerContributor;
 use codex_features::Feature;
+use codex_login::CodexAuth;
+use codex_login::ExternalAuth;
+use codex_login::ExternalAuthFuture;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::mcp::McpServerConnectionStatus;
 use codex_protocol::models::PermissionProfile;
@@ -59,6 +62,29 @@ use super::rmcp_client::remote_aware_stdio_server_bin;
 
 const SERVER_NAME: &str = "cached_rmcp";
 const NAMESPACE: &str = "mcp__cached_rmcp";
+
+struct StaticExternalAuth(CodexAuth);
+
+impl ExternalAuth for StaticExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        let auth = self.0.clone();
+        Box::pin(async move { Ok(auth) })
+    }
+
+    fn refresh(
+        &self,
+        _context: codex_login::ExternalAuthRefreshContext,
+    ) -> ExternalAuthFuture<'_, CodexAuth> {
+        let auth = self.0.clone();
+        Box::pin(async move { Ok(auth) })
+    }
+}
+
+fn external_chatgpt_auth(account_id: &str, token: &str) -> anyhow::Result<CodexAuth> {
+    Ok(CodexAuth::from_external_chatgpt_tokens(
+        token, account_id, /*chatgpt_plan_type*/ None,
+    )?)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_app_mention_samples_with_a_cold_accessible_connectors_cache() -> anyhow::Result<()>
@@ -102,6 +128,141 @@ async fn explicit_app_mention_samples_with_a_cold_accessible_connectors_cache() 
             .single_request()
             .body_contains_text("Use $calendar."),
         "the first sampling request should include the app mention"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_app_mention_propagates_apps_startup_failure_before_sampling() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let (apps, startup_control) = AppsTestServer::mount_with_startup_control(&server).await?;
+    startup_control.fail_next_initialize_attempts(usize::MAX);
+    let response = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("unexpected"),
+            responses::ev_completed("unexpected"),
+        ]),
+    )
+    .await;
+    let test = apps_enabled_builder(apps.chatgpt_base_url)
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Use $calendar.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let EventMsg::Error(error) =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!()
+    };
+
+    assert!(
+        error
+            .message
+            .contains("simulated non-retryable Apps MCP startup failure"),
+        "the Apps startup failure must remain visible: {}",
+        error.message
+    );
+    assert!(
+        response.requests().is_empty(),
+        "failed Apps startup must stop the turn before sampling"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_app_mention_samples_with_a_valid_empty_apps_catalog() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let apps = AppsTestServer::mount_without_tools(&server).await?;
+    let response = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("empty-app-catalog"),
+            responses::ev_completed("empty-app-catalog"),
+        ]),
+    )
+    .await;
+    let test = apps_enabled_builder(apps.chatgpt_base_url)
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Use $calendar.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    if let EventMsg::Error(error) = event {
+        anyhow::bail!(
+            "a valid empty Apps catalog should reach sampling: {}",
+            error.message
+        );
+    }
+    assert!(
+        response
+            .single_request()
+            .body_contains_text("Use $calendar.")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_app_mention_uses_the_current_account_after_an_account_switch()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let apps = AppsTestServer::mount(&server).await?;
+    let response = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("account-b"),
+            responses::ev_completed("account-b"),
+        ]),
+    )
+    .await;
+    let auth_a = external_chatgpt_auth("account-a", "header.e30.account-a")?;
+    let auth_b = external_chatgpt_auth("account-b", "header.e30.account-b")?;
+    let test = apps_enabled_builder(apps.chatgpt_base_url)
+        .with_auth(auth_a)
+        .build_with_auto_env(&server)
+        .await?;
+    test.thread_manager
+        .auth_manager()
+        .set_external_auth(Arc::new(StaticExternalAuth(auth_b)))
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Use $calendar.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    if let EventMsg::Error(error) = event {
+        anyhow::bail!(
+            "the current account must replace foreign Apps facts: {}",
+            error.message
+        );
+    }
+    assert!(
+        response
+            .single_request()
+            .body_contains_text("Use $calendar.")
     );
     Ok(())
 }

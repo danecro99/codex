@@ -415,7 +415,32 @@ impl McpRuntime {
 
     /// Returns whether the published snapshot still belongs to the current credentials.
     pub fn current_auth_matches(&self, auth: Option<&CodexAuth>) -> bool {
-        let current = self.current.load();
+        Self::published_auth_matches(&self.current.load(), auth)
+    }
+
+    /// Refreshes Apps tools from the one published runtime bound to `auth`.
+    ///
+    /// The captured runtime remains alive across the refresh, so connector facts and
+    /// Apps tools cannot come from different accounts or runtime publications.
+    pub async fn refresh_codex_apps_tools_for_auth(
+        &self,
+        auth: &CodexAuth,
+    ) -> anyhow::Result<CodexAppsToolSnapshot> {
+        let current = self.current.load_full();
+        if !Self::published_auth_matches(&current, Some(auth)) {
+            anyhow::bail!("Codex Apps MCP runtime does not match the current account");
+        }
+        let config = current
+            .config
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("MCP runtime is not configured"))?;
+        current
+            .connections
+            .refresh_codex_apps_client_catalog(config)
+            .await
+    }
+
+    fn published_auth_matches(current: &PublishedMcpRuntime, auth: Option<&CodexAuth>) -> bool {
         match (current.auth.as_ref(), auth) {
             (Some(previous), Some(latest)) => {
                 previous == latest
