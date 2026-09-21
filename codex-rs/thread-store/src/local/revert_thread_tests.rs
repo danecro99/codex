@@ -14,6 +14,7 @@ use codex_rollout::MATERIALIZED_RESUME_STATE_VERSION;
 use codex_rollout::MaterializedAutoCompactWindow;
 use codex_rollout::MaterializedResumeState;
 use codex_rollout::RolloutItem;
+use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -143,6 +144,10 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         .meta;
     assert_eq!(replacement_meta.id, thread_id);
     assert_eq!(replacement_meta.memory_mode, None);
+    assert_eq!(
+        replacement_meta.runtime_workspace_roots,
+        Some(vec![home.path().join("workspace")])
+    );
     assert_eq!(turn_ids(&store, thread_id).await, vec!["turn-1"]);
 
     store
@@ -291,6 +296,7 @@ async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) 
             history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: "window-1".to_string(),
+            runtime_workspace_roots: Some(vec![store.config.codex_home.join("workspace").abs()]),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(std::env::current_dir().expect("cwd")),
                 model_provider: "test-provider".to_string(),

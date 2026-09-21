@@ -5,11 +5,14 @@ use chrono::Utc;
 use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutItem;
-use codex_rollout::append_rollout_item_to_path;
+use codex_rollout::RolloutRecorder;
+use codex_rollout::RolloutRecorderParams;
 use codex_rollout::append_thread_name;
 use codex_rollout::read_session_meta_line;
 use codex_state::ThreadMetadataBuilder;
@@ -72,7 +75,7 @@ pub(super) async fn update_thread_metadata(
     let has_explicit_metadata = patch.name.is_some() || requires_rollout_compat;
     let history_mode = if has_explicit_metadata {
         match live_writer::live_writer_parts(store, thread_id).await {
-            Ok(writer) => Some(writer.history_mode),
+            Ok((_recorder, _rollout_id, history_mode)) => Some(history_mode),
             Err(ThreadStoreError::ThreadNotFound { .. }) => Some(
                 read_thread::read_thread(
                     store,
@@ -91,6 +94,25 @@ pub(super) async fn update_thread_metadata(
         None
     };
     let paginated = matches!(history_mode, Some(ThreadHistoryMode::Paginated));
+    let needs_rollout_compat = requires_rollout_compat || patch.name.is_some();
+    // Reject competing writers before committing any part of a legacy rollout patch to SQLite.
+    let writer_lock = if !paginated
+        && needs_rollout_compat
+        && (patch.memory_mode.is_some() || patch.git_info.is_some())
+    {
+        let live = store
+            .live_recorders
+            .lock()
+            .await
+            .get(&thread_id)
+            .map(|entry| entry.writer_lock.clone());
+        Some(match live {
+            Some(guard) => guard,
+            None => store.acquire_writer_lock(thread_id)?,
+        })
+    } else {
+        None
+    };
     let require_sqlite_write =
         pending_patch.is_some() || sqlite_write_failure_should_block(&patch) || paginated;
     let mut updated = apply_metadata_update(
@@ -142,7 +164,6 @@ pub(super) async fn update_thread_metadata(
         }
         return Ok(updated);
     }
-    let needs_rollout_compat = requires_rollout_compat || patch.name.is_some();
     if !needs_rollout_compat {
         if pending_patch.is_some() {
             remove_pending_thread_metadata(store, thread_id, &mut pending_metadata).await;
@@ -163,13 +184,19 @@ pub(super) async fn update_thread_metadata(
     })?;
     let name = patch.name;
     let git_info = patch.git_info;
-    if let Some(memory_mode) = patch.memory_mode {
-        apply_thread_memory_mode(
+    if let Some(memory_mode) = patch.memory_mode
+        && let Some(writer_lock) = writer_lock.as_ref()
+    {
+        update_rollout_metadata(
             store,
-            resolved_rollout.rollout_id,
-            resolved_rollout.path.as_path(),
             thread_id,
-            memory_mode,
+            &resolved_rollout.path,
+            writer_lock,
+            |meta| {
+                // Replay retains prior git metadata when this marker omits it.
+                meta.git = None;
+                meta.meta.memory_mode = Some(memory_mode_as_str(memory_mode).to_string());
+            },
         )
         .await?;
         refresh_resolved_rollout_path(&mut resolved_rollout).await;
@@ -239,15 +266,22 @@ pub(super) async fn update_thread_metadata(
         }
         None => None,
     };
-    if let Some(((sha, branch, origin_url), memory_mode)) = resolved_git_info.as_ref() {
-        apply_thread_git_info_to_rollout(
+    if let Some(((sha, branch, origin_url), memory_mode)) = resolved_git_info.as_ref()
+        && let Some(writer_lock) = writer_lock.as_ref()
+    {
+        update_rollout_metadata(
             store,
-            &resolved_rollout,
             thread_id,
-            sha,
-            branch,
-            origin_url,
-            memory_mode.as_deref(),
+            &resolved_rollout.path,
+            writer_lock,
+            |meta| {
+                meta.git = Some(GitInfo {
+                    commit_hash: sha.as_deref().map(codex_git_utils::GitSha::new),
+                    branch: branch.clone(),
+                    repository_url: origin_url.clone(),
+                });
+                meta.meta.memory_mode = memory_mode.clone();
+            },
         )
         .await?;
         refresh_resolved_rollout_path(&mut resolved_rollout).await;
@@ -805,113 +839,61 @@ fn resolve_git_info_patch(
     (sha, branch, origin_url)
 }
 
-async fn apply_thread_git_info_to_rollout(
-    store: &LocalThreadStore,
-    resolved_rollout: &ResolvedThreadRollout,
-    thread_id: ThreadId,
-    sha: &Option<String>,
-    branch: &Option<String>,
-    origin_url: &Option<SanitizedGitUrl>,
-    memory_mode: Option<&str>,
-) -> ThreadStoreResult<()> {
-    let rollout_path = resolved_rollout.path.as_path();
-    let mut session_meta =
-        read_session_meta_line(rollout_path)
-            .await
-            .map_err(|err| ThreadStoreError::Internal {
-                message: format!("failed to set thread git metadata: {err}"),
-            })?;
-    if session_meta.meta.id != thread_id {
-        return Err(ThreadStoreError::Internal {
-            message: format!(
-                "failed to set thread git metadata: rollout session metadata id mismatch: expected {thread_id}, found {}",
-                session_meta.meta.id
-            ),
-        });
-    }
-
-    session_meta.git = Some(GitInfo {
-        commit_hash: sha.as_deref().map(codex_git_utils::GitSha::new),
-        branch: branch.clone(),
-        repository_url: origin_url.clone(),
-    });
-    session_meta.meta.memory_mode = memory_mode.map(str::to_string);
-    let history_mode = session_meta.meta.history_mode;
-    append_item_with_generation(
-        store,
-        thread_id,
-        resolved_rollout.rollout_id,
-        rollout_path,
-        history_mode,
-        RolloutItem::SessionMeta(session_meta),
-    )
-    .await
-}
-
-async fn apply_thread_memory_mode(
-    store: &LocalThreadStore,
-    rollout_id: ThreadId,
-    rollout_path: &Path,
-    thread_id: ThreadId,
-    memory_mode: ThreadMemoryMode,
-) -> ThreadStoreResult<()> {
-    let mut session_meta =
-        read_session_meta_line(rollout_path)
-            .await
-            .map_err(|err| ThreadStoreError::Internal {
-                message: format!("failed to set thread memory mode: {err}"),
-            })?;
-    if session_meta.meta.id != thread_id {
-        return Err(ThreadStoreError::Internal {
-            message: format!(
-                "failed to set thread memory mode: rollout session metadata id mismatch: expected {thread_id}, found {}",
-                session_meta.meta.id
-            ),
-        });
-    }
-
-    // Memory-mode updates should not modify git metadata. The rollout replay
-    // code will preserve the latest prior git marker when this field is absent.
-    session_meta.git = None;
-    session_meta.meta.memory_mode = Some(memory_mode_as_str(memory_mode).to_string());
-    let history_mode = session_meta.meta.history_mode;
-    append_item_with_generation(
-        store,
-        thread_id,
-        rollout_id,
-        rollout_path,
-        history_mode,
-        RolloutItem::SessionMeta(session_meta),
-    )
-    .await
-}
-
-async fn append_item_with_generation(
+// Both metadata patches use the same owned recorder; temporary writers also survive cancellation.
+async fn update_rollout_metadata(
     store: &LocalThreadStore,
     thread_id: ThreadId,
-    rollout_id: ThreadId,
-    rollout_path: &Path,
-    history_mode: ThreadHistoryMode,
-    item: RolloutItem,
+    path: &Path,
+    writer_lock: &super::WriterLockGuard,
+    patch: impl FnOnce(&mut SessionMetaLine),
 ) -> ThreadStoreResult<()> {
+    // Keep shutdown from closing the selected recorder before its metadata append is flushed.
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    // The fence is history-mode specific: a paginated source is fenced on its terminal ordinal,
-    // so inspecting it as Legacy would report a position the journal can never match.
-    let generation_start = super::append_generation::begin_append(
-        store,
-        thread_id,
-        rollout_id,
-        rollout_path,
-        history_mode,
-        std::slice::from_ref(&item),
-    )?;
-    append_rollout_item_to_path(rollout_path, &item)
+    let io_error = |err| ThreadStoreError::Internal {
+        message: format!("failed to update rollout metadata: {err}"),
+    };
+    let recorder = store
+        .live_recorders
+        .lock()
         .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to append thread metadata: {err}"),
-        })?;
-    if generation_start.started {
-        super::append_generation::finish_append(store, rollout_id)?;
+        .get(&thread_id)
+        .map(|entry| entry.recorder.clone());
+    let mut metadata = codex_rollout::read_session_meta_line(path)
+        .await
+        .map_err(io_error)?;
+    if metadata.meta.id != thread_id {
+        return Err(ThreadStoreError::Internal {
+            message: format!(
+                "rollout session metadata id mismatch: expected {thread_id}, found {}",
+                metadata.meta.id
+            ),
+        });
+    }
+    let temporary = recorder.is_none();
+    let recorder = match recorder {
+        Some(recorder) => recorder,
+        None => RolloutRecorder::new_with_writer_lock(
+            &RolloutConfig {
+                codex_home: store.config.codex_home.clone(),
+                sqlite: store.config.sqlite.clone(),
+                cwd: metadata.meta.cwd.clone(),
+                model_provider_id: store.config.default_model_provider_id.clone(),
+                generate_memories: metadata.meta.memory_mode.as_deref() != Some("disabled"),
+            },
+            RolloutRecorderParams::resume(path.to_path_buf()),
+            writer_lock.clone(),
+        )
+        .await
+        .map_err(io_error)?,
+    };
+    patch(&mut metadata);
+    recorder
+        .record_canonical_items(&[RolloutItem::SessionMeta(metadata)])
+        .await
+        .map_err(io_error)?;
+    recorder.flush().await.map_err(io_error)?;
+    if temporary {
+        recorder.shutdown().await.map_err(io_error)?;
     }
     Ok(())
 }
@@ -933,6 +915,7 @@ mod tests {
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::ThreadHistoryMode;
     use codex_utils_absolute_path::test_support::PathExt;
+    use futures::FutureExt;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
     use serde_json::json;
@@ -1272,6 +1255,49 @@ mod tests {
             .await
             .expect("thread memory mode should be readable");
         assert_eq!(memory_mode.as_deref(), Some("disabled"));
+    }
+
+    #[tokio::test]
+    async fn metadata_patch_completes_before_concurrent_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let home = TempDir::new()?;
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = Uuid::new_v4();
+        let thread_id = ThreadId::from_string(&uuid.to_string())?;
+        let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+        store
+            .resume_thread(ResumeThreadParams {
+                thread_id,
+                rollout_path: Some(path.clone()),
+                history: None,
+                include_archived: true,
+                metadata: test_thread_metadata(),
+            })
+            .await?;
+        let writer_lock = store.live_recorders.lock().await[&thread_id]
+            .writer_lock
+            .clone();
+        let (mut expected, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
+        let mut metadata = read_session_meta_line(&path).await?;
+        metadata.meta.memory_mode = Some("disabled".into());
+        expected.push(RolloutItem::SessionMeta(metadata));
+
+        let mut shutdown = Box::pin(store.shutdown_thread(thread_id));
+        update_rollout_metadata(&store, thread_id, &path, &writer_lock, |meta| {
+            meta.meta.memory_mode = Some("disabled".into());
+            // Poll shutdown in the read/append gap; the writer mutex must keep it pending.
+            assert!(
+                tokio::task::unconstrained(shutdown.as_mut())
+                    .now_or_never()
+                    .is_none()
+            );
+        })
+        .await?;
+        shutdown.await?;
+
+        let (actual, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
+        assert_eq!(json!(actual), json!(expected));
+        Ok(())
     }
 
     #[tokio::test]

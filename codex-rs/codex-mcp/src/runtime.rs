@@ -46,8 +46,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::McpConfig;
 use crate::binding::McpBinding;
-use crate::client_tool_catalog::ClientToolCatalogRevision;
 use crate::client_tool_catalog::CodexAppsToolSnapshot;
+use crate::connection_manager::BindingCatalogRevision;
 use crate::connection_manager::McpConnectionSet;
 use crate::elicitation::ElicitationLifecycle;
 use crate::elicitation::ElicitationRequestRouter;
@@ -118,8 +118,27 @@ struct PublishedMcpRuntime {
     cached_binding: Mutex<Option<CachedMcpBinding>>,
 }
 
+fn ensure_host_owned_apps_registration(
+    current: &PublishedMcpRuntime,
+    server: &str,
+) -> anyhow::Result<()> {
+    if !current
+        .config
+        .as_ref()
+        .and_then(|config| config.mcp_server_catalog.server(server))
+        .is_some_and(|registration| {
+            registration
+                .source()
+                .is_host_owned_apps(server, registration.config())
+        })
+    {
+        anyhow::bail!("MCP server '{server}' is not registered by the hosted runtime");
+    }
+    Ok(())
+}
+
 struct CachedMcpBinding {
-    catalog_revisions: HashMap<String, ClientToolCatalogRevision>,
+    catalog_revisions: HashMap<String, BindingCatalogRevision>,
     binding: Arc<McpBinding>,
 }
 
@@ -363,8 +382,10 @@ impl McpRuntime {
         required_plugins: &HashSet<String>,
     ) -> Option<Arc<McpBinding>> {
         let config = Arc::clone(current.config.as_ref()?);
-        current.connections.refresh_notified_tool_catalogs().await;
-        let stable_catalog_revisions = current.connections.stable_catalog_revisions().await;
+        let stable_catalog_revisions = current
+            .connections
+            .stable_catalog_revisions(required_servers, required_plugins)
+            .await;
         if let Some(catalog_revisions) = &stable_catalog_revisions {
             let cached = current
                 .cached_binding
@@ -391,7 +412,7 @@ impl McpRuntime {
         if let Some(catalog_revisions) = stable_catalog_revisions
             && current
                 .connections
-                .stable_catalog_revisions()
+                .stable_catalog_revisions(required_servers, required_plugins)
                 .await
                 .as_ref()
                 == Some(&catalog_revisions)
@@ -415,32 +436,7 @@ impl McpRuntime {
 
     /// Returns whether the published snapshot still belongs to the current credentials.
     pub fn current_auth_matches(&self, auth: Option<&CodexAuth>) -> bool {
-        Self::published_auth_matches(&self.current.load(), auth)
-    }
-
-    /// Refreshes Apps tools from the one published runtime bound to `auth`.
-    ///
-    /// The captured runtime remains alive across the refresh, so connector facts and
-    /// Apps tools cannot come from different accounts or runtime publications.
-    pub async fn refresh_codex_apps_tools_for_auth(
-        &self,
-        auth: &CodexAuth,
-    ) -> anyhow::Result<CodexAppsToolSnapshot> {
-        let current = self.current.load_full();
-        if !Self::published_auth_matches(&current, Some(auth)) {
-            anyhow::bail!("Codex Apps MCP runtime does not match the current account");
-        }
-        let config = current
-            .config
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("MCP runtime is not configured"))?;
-        current
-            .connections
-            .refresh_codex_apps_client_catalog(config)
-            .await
-    }
-
-    fn published_auth_matches(current: &PublishedMcpRuntime, auth: Option<&CodexAuth>) -> bool {
+        let current = self.current.load();
         match (current.auth.as_ref(), auth) {
             (Some(previous), Some(latest)) => {
                 previous == latest
@@ -452,6 +448,21 @@ impl McpRuntime {
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
         }
+    }
+
+    /// Refreshes the Apps catalog from the published runtime for this exact account.
+    ///
+    /// The caller must publish a runtime for the account before calling this method;
+    /// accepting a catalog from another published account would make an explicit App
+    /// mention resolve against stale credentials.
+    pub async fn refresh_codex_apps_tools_for_auth(
+        &self,
+        auth: &CodexAuth,
+    ) -> anyhow::Result<CodexAppsToolSnapshot> {
+        if !self.current_auth_matches(Some(auth)) {
+            anyhow::bail!("Codex Apps MCP runtime does not match the current account");
+        }
+        self.refresh_codex_apps_tools().await
     }
 
     /// Detects newly saved credentials for servers whose startup failed authentication.
@@ -649,6 +660,14 @@ impl McpRuntime {
         Arc::clone(&self.current.load().connections)
     }
 
+    pub(crate) fn latest_host_owned_codex_apps_connections(
+        &self,
+    ) -> anyhow::Result<Arc<McpConnectionSet>> {
+        let current = self.current.load();
+        ensure_host_owned_apps_registration(&current, CODEX_APPS_MCP_SERVER_NAME)?;
+        Ok(Arc::clone(&current.connections))
+    }
+
     pub(crate) fn latest_connections_for_event_server(
         &self,
         server: &str,
@@ -661,18 +680,8 @@ impl McpRuntime {
             .cancel_event_streams_on_server_removal
             .subscribe();
         let current = self.current.load();
-        if server == CODEX_APPS_MCP_SERVER_NAME
-            && !current
-                .config
-                .as_ref()
-                .and_then(|config| config.mcp_server_catalog.server(server))
-                .is_some_and(|registration| {
-                    registration
-                        .source()
-                        .is_host_owned_apps(server, registration.config())
-                })
-        {
-            anyhow::bail!("MCP server '{server}' is not registered by the hosted runtime");
+        if server == CODEX_APPS_MCP_SERVER_NAME {
+            ensure_host_owned_apps_registration(&current, server)?;
         }
         Ok((
             Arc::clone(&current.connections),

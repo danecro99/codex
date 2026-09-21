@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -17,7 +16,6 @@ use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
-#[cfg(test)]
 use crate::compact;
 use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
@@ -48,6 +46,7 @@ use crate::session::step_settings::ResolvedStepSettings;
 use crate::session::step_settings::StepSettings;
 use crate::session::turn_context::TurnEnvironment;
 use crate::session_prefix::format_inter_agent_completion_message;
+use crate::shell_snapshot::SnapshotCredentialBrokerState;
 use crate::skills_load_input_from_config;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::turn_metadata::TurnMetadataState;
@@ -75,11 +74,6 @@ use codex_extension_api::TurnContextContributionInput;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_features::unstable_features_warning_event;
-use codex_history::MATERIALIZED_RESUME_STATE_VERSION;
-use codex_history::MaterializedAutoCompactWindow;
-use codex_history::MaterializedPreviousTurnSettings;
-use codex_history::MaterializedResume;
-use codex_history::MaterializedResumeState;
 use codex_history::RolloutItem;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
@@ -146,7 +140,6 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::ThreadSource;
-use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnContextNetworkItem;
@@ -172,15 +165,14 @@ use codex_thread_store::CreateThreadParams;
 use codex_thread_store::LiveThread;
 use codex_thread_store::LiveThreadInitGuard;
 use codex_thread_store::LocalThreadStore;
-use codex_thread_store::MaterializedResumePublicationFence;
 use codex_thread_store::PersistContext;
-use codex_thread_store::PublishMaterializedResumeParams;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
 use codex_utils_audio::prepare_response_items as prepare_audio_response_items;
 use codex_utils_git_discovery::GitRootDiscovery;
+use codex_utils_output_truncation::with_serialization_allowance;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use futures::future::Shared;
@@ -234,6 +226,8 @@ mod environment;
 pub(crate) mod extension_metrics;
 mod handlers;
 mod inject;
+mod reasoning_effort;
+pub(crate) use reasoning_effort::RequestEffortUsage;
 mod input_queue;
 mod mcp;
 mod mcp_prewarm;
@@ -241,7 +235,6 @@ mod mcp_refresh;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
 mod realtime_history;
-mod reasoning_effort;
 mod retained_context;
 mod review;
 mod rollout_budget;
@@ -296,11 +289,6 @@ pub(crate) struct PreviousTurnSettings {
     pub(crate) realtime_active: Option<bool>,
 }
 
-struct AppliedRolloutReconstruction {
-    previous_turn_settings: Option<PreviousTurnSettings>,
-    materialized_state: MaterializedResumeState,
-}
-
 use crate::exec_policy::ExecPolicyUpdateError;
 use crate::guardian::GuardianReviewSessionManager;
 use crate::mcp::McpEnvironmentScope;
@@ -314,6 +302,7 @@ use crate::state::AcceptedUserInputResponse;
 use crate::state::AutoCompactWindowIds;
 use crate::state::AutoCompactWindowSnapshot;
 use crate::state::PendingRequestPermissions;
+use crate::state::ReasoningEffortPin;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 #[cfg(test)]
@@ -447,6 +436,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
     pub(crate) extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
     pub(crate) conversation_history: InitialHistory,
+    pub(crate) disabled_plugin_ids: Option<Vec<String>>,
     pub(crate) requested_history_mode: Option<ThreadHistoryMode>,
     pub(crate) fork_persistence: ForkPersistence,
     pub(crate) session_source: SessionSource,
@@ -503,14 +493,6 @@ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
-/// Shared tail for every warning about a transcript that could not be written.
-///
-/// A persistence failure stops this thread's writer, so promising that Codex will keep retrying is
-/// false. It also does not promise that restarting heals anything: whatever was not written is
-/// simply not there.
-pub(crate) const TRANSCRIPT_NOT_SAVED_HINT: &str =
-    "Anything not already saved would be missing if this thread is resumed.";
-
 impl Session {
     /// Spawn and initialize a new session.
     /// Hide the concrete startup future from callers while keeping initialization lazy.
@@ -559,6 +541,7 @@ impl Session {
             code_mode_session_provider,
             extensions,
             conversation_history,
+            disabled_plugin_ids,
             requested_history_mode,
             fork_persistence,
             session_source,
@@ -597,7 +580,11 @@ impl Session {
         config
             .startup_warnings
             .extend(user_instruction_provider_warnings);
-        let exec_policy = if crate::guardian::is_basic_session_source(&session_source) {
+        let isolation = thread_extension_init
+            .get::<codex_extension_api::SessionIsolation>()
+            .map(|policy| *policy)
+            .unwrap_or_default();
+        let exec_policy = if isolation == codex_extension_api::SessionIsolation::Isolated {
             let managed_policy = config
                 .config_layer_stack
                 .requirements()
@@ -746,6 +733,22 @@ impl Session {
         } else {
             dynamic_tools
         };
+        let disabled_plugin_ids = disabled_plugin_ids.unwrap_or_else(|| {
+            let settings_owner = match &conversation_history {
+                InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
+                InitialHistory::Forked(_) => forked_from_thread_id,
+                InitialHistory::New | InitialHistory::Cleared => None,
+            };
+            settings_owner
+                .and_then(|thread_id| {
+                    codex_history::latest_disabled_plugin_ids(
+                        conversation_history.get_rollout_items(),
+                        thread_id,
+                    )
+                })
+                .map(<[String]>::to_vec)
+                .unwrap_or_default()
+        });
         // TODO (aibrahim): Consolidate config.model and config.model_reasoning_effort into config.collaboration_mode
         // to avoid extracting these fields separately and constructing CollaborationMode here.
         let collaboration_mode = CollaborationMode {
@@ -787,8 +790,10 @@ impl Session {
             windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
             use_legacy_landlock: config.features.use_legacy_landlock(),
             legacy_fallback_cwd: config.cwd.clone(),
+            runtime_workspace_roots: config.workspace_roots.clone(),
             codex_home: config.codex_home.clone(),
             thread_name: None,
+            disabled_plugin_ids,
             original_config_do_not_use: Arc::clone(&config),
             metrics_service_name,
             app_server_client_name: None,
@@ -1106,28 +1111,20 @@ impl Session {
     ///
     /// `ModelClient` is session-scoped and intentionally does not depend on the full `Config`, so
     /// we precompute the comma-separated list of enabled experimental feature keys at session
-    /// creation time and thread it into the client.
+    /// creation time and thread it into the client. Remote compaction stays advertised unconditionally.
     fn build_model_client_beta_features_header(config: &Config) -> Option<String> {
-        let beta_features_header = FEATURES
-            .iter()
-            .filter_map(|spec| {
-                let advertise_in_model_client_header =
-                    spec.stage.experimental_menu_description().is_some()
-                        || spec.id == Feature::RemoteCompactionV2;
-                if advertise_in_model_client_header && config.features.enabled(spec.id) {
-                    Some(spec.key)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        if beta_features_header.is_empty() {
-            None
-        } else {
-            Some(beta_features_header)
-        }
+        Some(
+            FEATURES
+                .iter()
+                .filter(|spec| {
+                    spec.id == Feature::RemoteCompactionV2
+                        || (spec.stage.experimental_menu_description().is_some()
+                            && config.features.enabled(spec.id))
+                })
+                .map(|spec| spec.key)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
     }
 
     async fn start_managed_network_proxy(
@@ -1185,6 +1182,9 @@ impl Session {
             .cloned()
         else {
             self.services.network_proxy.store(None);
+            self.services
+                .turn_environments
+                .set_snapshot_credential_broker(SnapshotCredentialBrokerState::Inactive);
             return;
         };
 
@@ -1211,11 +1211,22 @@ impl Session {
         // listeners and must not be exposed as active managed proxy runtimes.
         if !spec.enabled() {
             self.services.network_proxy.store(None);
+            self.services
+                .turn_environments
+                .set_snapshot_credential_broker(SnapshotCredentialBrokerState::Inactive);
             return;
         }
         if let Some(started_proxy) = self.services.network_proxy.load_full() {
             if let Err(err) = spec.apply_to_started_proxy(started_proxy.as_ref()).await {
                 warn!("failed to refresh managed network proxy for sandbox change: {err}");
+            } else {
+                self.services
+                    .turn_environments
+                    .set_snapshot_credential_broker(if spec.credential_broker_enabled() {
+                        SnapshotCredentialBrokerState::Ready(started_proxy.proxy())
+                    } else {
+                        SnapshotCredentialBrokerState::Inactive
+                    });
             }
             return;
         }
@@ -1234,11 +1245,25 @@ impl Session {
         .await
         {
             Ok((started_proxy, _session_network_proxy)) => {
+                if spec.credential_broker_enabled() {
+                    self.services
+                        .turn_environments
+                        .set_snapshot_credential_broker(SnapshotCredentialBrokerState::Ready(
+                            started_proxy.proxy(),
+                        ));
+                }
                 self.services
                     .network_proxy
                     .store(Some(Arc::new(started_proxy)));
             }
             Err(err) => {
+                self.services
+                    .turn_environments
+                    .set_snapshot_credential_broker(if spec.credential_broker_enabled() {
+                        SnapshotCredentialBrokerState::Unavailable
+                    } else {
+                        SnapshotCredentialBrokerState::Inactive
+                    });
                 warn!("failed to start managed network proxy for sandbox change: {err}");
             }
         }
@@ -1420,10 +1445,7 @@ impl Session {
         state.clear_connector_selection();
     }
 
-    async fn record_initial_history(
-        &self,
-        conversation_history: InitialHistory,
-    ) -> anyhow::Result<()> {
+    async fn record_initial_history(&self, conversation_history: InitialHistory) {
         let (is_subagent, is_paginated_subagent) = {
             let state = self.state.lock().await;
             let session_configuration = &state.session_configuration;
@@ -1454,81 +1476,18 @@ impl Session {
             InitialHistory::Resumed(resumed_history) => {
                 let turn_context = self.new_default_turn().await;
                 let rollout_items = resumed_history.history;
-                let materialized_resume = resumed_history.materialized_resume;
-                if let Some(materialized_state) = materialized_resume
-                    .as_ref()
-                    .and_then(|resume| resume.state.as_ref())
-                {
-                    let active_model = turn_context.model_info();
-                    let active_truncation_policy: TruncationPolicy =
-                        active_model.truncation_policy.into();
-                    // The stored state's semantics depend on the truncation contract it was
-                    // built under, not on the model slug: a session that switched models keeps a
-                    // usable checkpoint as long as the contract is identical.
-                    if materialized_state.truncation_policy != active_truncation_policy {
-                        let live_thread = self.services.live_thread.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "codex_resume_state_needs_rebuild: incompatible materialized state has no live persistence handle"
-                            )
-                        })?;
-                        live_thread
-                            .prepare_materialized_resume_state_rebuild()
-                            .await
-                            .map_err(|err| {
-                                anyhow::anyhow!(
-                                    "codex_resume_state_needs_rebuild: failed to establish the clean rebuild boundary: {err}"
-                                )
-                            })?;
-                        anyhow::bail!(
-                            "codex_resume_state_needs_rebuild: materialized state was built for model {} with a different truncation contract; retry Resume to rebuild it from the canonical transcript for {}",
-                            materialized_state.materialized_model,
-                            active_model.slug
-                        );
-                    }
-                }
-                let reducer_started = std::time::Instant::now();
-                let applied = self
-                    .apply_rollout_reconstruction(
-                        &turn_context,
-                        &rollout_items,
-                        materialized_resume
-                            .as_ref()
-                            .and_then(|resume| resume.state.as_ref()),
-                    )
-                    .await?;
-                let reducer_elapsed_millis =
-                    u64::try_from(reducer_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                tracing::info!(
-                    reducer_elapsed_millis,
-                    replay_input_items = rollout_items.len(),
-                    checkpoint_hit = materialized_resume
-                        .as_ref()
-                        .is_some_and(|resume| resume.state.is_some()),
-                    "reconstructed materialized resume state"
-                );
-                self.state
-                    .lock()
-                    .await
-                    .set_next_turn_is_first(!applied.materialized_state.has_prior_user_turns);
-                let previous_turn_settings = applied.previous_turn_settings;
                 if matches!(
-                    applied.materialized_state.last_agent_status.as_ref(),
+                    rollout_items.iter().rev().find_map(|item| match item {
+                        RolloutItem::EventMsg(event) => agent_status_from_event(event),
+                        _ => None,
+                    }),
                     Some(AgentStatus::Interrupted)
                 ) {
                     self.agent_status.send_replace(AgentStatus::Interrupted);
                 }
-
-                if let Some(materialized_resume) = materialized_resume
-                    && (materialized_resume.state.is_none() || rollout_items.len() > 1)
-                {
-                    self.publish_materialized_resume_state(
-                        &turn_context,
-                        *materialized_resume,
-                        applied.materialized_state,
-                        reducer_elapsed_millis,
-                    )
-                    .await?;
-                }
+                let previous_turn_settings = self
+                    .apply_rollout_reconstruction(&turn_context, &rollout_items)
+                    .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info().slug.as_str();
@@ -1550,10 +1509,23 @@ impl Session {
                     .await;
                 }
 
-                // Token counts are seeded by the replay reducer, which also owns the
-                // checkpoint-suffix path where `rollout_items` is not the full transcript.
+                // Seed usage info from the recorded rollout so UIs can show token counts
+                // immediately on resume/fork.
+                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
+                    let mut state = self.state.lock().await;
+                    state.set_token_info(Some(info));
+                }
+                self.state.lock().await.latest_token_usage_record =
+                    Self::last_token_usage_record_from_rollout(&rollout_items);
+
+                // Checkpoint effective settings even when no turn follows the resume.
+                self.persist_rollout_items(&[RolloutItem::EventMsg(
+                    thread_settings::applied_event(self).await,
+                )])
+                .await;
+
                 // Defer seeding the session's initial context until the first turn starts so
-                // turn/start overrides can be merged before we write to the rollout.
+                // turn/start overrides can be merged before we write model-visible context.
                 if !is_subagent {
                     let _ = self.flush_rollout().await;
                 }
@@ -1562,12 +1534,8 @@ impl Session {
             InitialHistory::Forked(mut rollout_items) => {
                 let turn_context = self.new_default_turn().await;
                 Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
-                self.apply_rollout_reconstruction(
-                    &turn_context,
-                    &rollout_items,
-                    /*materialized_state*/ None,
-                )
-                .await?;
+                self.apply_rollout_reconstruction(&turn_context, &rollout_items)
+                    .await;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -1627,7 +1595,6 @@ impl Session {
                     .await;
             }
         }
-        Ok(())
     }
 
     #[instrument(
@@ -1642,10 +1609,9 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-        materialized_state: Option<&MaterializedResumeState>,
-    ) -> anyhow::Result<AppliedRolloutReconstruction> {
+    ) -> Option<PreviousTurnSettings> {
         let rollout_reconstruction::RolloutReconstruction {
-            history,
+            mut history,
             retained_context,
             guardian_history,
             previous_turn_settings,
@@ -1655,24 +1621,16 @@ impl Session {
             first_window_id,
             previous_window_id,
             window_id,
-            token_info,
-            latest_token_usage_record,
-            last_agent_status,
-            mcp_resource_origins,
-            owned_startup_cwd,
-            auto_compact_window_prefill_input_tokens,
-            has_prior_user_turns,
         } = self
-            .reconstruct_resume_state(turn_context, rollout_items, materialized_state)
-            .await?;
+            .reconstruct_history_from_rollout(turn_context, rollout_items)
+            .await;
         // Keep the recorded rollout unchanged. Prepare its reconstructed history before
         // installing it, so legacy media is processed once for this resume or fork and
         // will be processed again if the rollout is reconstructed in a future session.
         // Replay disables image-resize notices, so media preparation remains one-to-one. Keep
         // the prior batch behavior and carry history-only metadata in a positional sidecar.
         let (mut prepared_history, metadata): (Vec<_>, Vec<_>) = history
-            .iter()
-            .cloned()
+            .into_iter()
             .map(|envelope| (envelope.item, envelope.metadata))
             .unzip();
         let _ = prepare_image_response_items(
@@ -1686,245 +1644,51 @@ impl Session {
             metadata.len(),
             "replay media preparation must remain one-to-one when resize notices are disabled"
         );
-        let prepared_history = prepared_history
+        history = prepared_history
             .into_iter()
             .zip(metadata)
             .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
             .collect();
-        let (window_number, window_ids) = {
+        {
             let mut state = self.state.lock().await;
             state.replace_annotated_history(
-                prepared_history,
-                reference_context_item.clone(),
+                history,
+                reference_context_item,
                 HistoryReplacement::Reset,
             );
             state
                 .history
                 .restore_review_context(Some(&retained_context), guardian_history.as_ref());
-            if let Some(world_state) = world_state_baseline.clone() {
+            if let Some(world_state) = world_state_baseline {
                 state.history.set_world_state_baseline(world_state);
             }
             let fallback_ids = state.auto_compact_window_ids();
             let window_id = window_id.unwrap_or(fallback_ids.window_id);
-            let window_ids = AutoCompactWindowIds {
-                first_window_id: first_window_id.unwrap_or(window_id),
-                previous_window_id,
-                window_id,
-            };
-            state.restore_auto_compact_window(window_number, window_ids);
+            state.restore_auto_compact_window(
+                window_number,
+                AutoCompactWindowIds {
+                    first_window_id: first_window_id.unwrap_or(window_id),
+                    previous_window_id,
+                    window_id,
+                },
+            );
             state.set_previous_turn_settings(previous_turn_settings.clone());
-            state.set_token_info(token_info.clone());
-            state.latest_token_usage_record = latest_token_usage_record.clone();
-            state.set_owned_startup_cwd(owned_startup_cwd.clone());
-            (window_number, window_ids)
-        };
-        let tracks_prefill = matches!(
+        }
+        let prefix_tokens = if matches!(
             turn_context.config.model_auto_compact_token_limit_scope,
             AutoCompactTokenLimitScope::BodyAfterPrefix
-        );
-        let recomputed_prefix_tokens = if tracks_prefill {
+        ) {
             let history = self.clone_history().await;
             let base_instructions = self.get_base_instructions().await;
             history.estimate_token_count_with_base_instructions(&base_instructions)
         } else {
             None
         };
-        let prefix_tokens = tracks_prefill
-            .then(|| auto_compact_window_prefill_input_tokens.or(recomputed_prefix_tokens))
-            .flatten();
         if let Some(prefix_tokens) = prefix_tokens {
             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
                 .await;
         }
-        let truncation_policy = turn_context.model_info().truncation_policy.into();
-        Ok(AppliedRolloutReconstruction {
-            previous_turn_settings: previous_turn_settings.clone(),
-            materialized_state: MaterializedResumeState {
-                version: MATERIALIZED_RESUME_STATE_VERSION,
-                materialized_model: turn_context.model_info().slug.clone(),
-                history,
-                retained_context,
-                guardian_history,
-                previous_turn_settings: previous_turn_settings.map(|settings| {
-                    MaterializedPreviousTurnSettings {
-                        model: settings.model,
-                        comp_hash: settings.comp_hash,
-                        realtime_active: settings.realtime_active,
-                    }
-                }),
-                reference_context_item,
-                world_state_baseline: world_state_baseline
-                    .map(|snapshot| WorldStateItem::full(snapshot.into_object())),
-                mcp_resource_origins,
-                auto_compact_window: MaterializedAutoCompactWindow {
-                    window_number,
-                    first_window_id: window_ids.first_window_id.to_string(),
-                    previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
-                    window_id: window_ids.window_id.to_string(),
-                },
-                owned_startup_cwd,
-                token_info,
-                latest_token_usage_record,
-                last_agent_status,
-                truncation_policy,
-                auto_compact_window_prefill_input_tokens: prefix_tokens,
-                has_prior_user_turns,
-            },
-        })
-    }
-
-    async fn publish_materialized_resume_state(
-        &self,
-        turn_context: &TurnContext,
-        materialized_resume: MaterializedResume,
-        materialized_state: MaterializedResumeState,
-        reducer_elapsed_millis: u64,
-    ) -> anyhow::Result<()> {
-        let max_state_bytes =
-            materialized_resume_state_max_bytes(turn_context.model_info().as_ref())?;
-        let live_thread = self.services.live_thread.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "codex_resume_state_needs_compaction: resumed source has no live persistence handle"
-            )
-        })?;
-        let persist_started = std::time::Instant::now();
-        live_thread
-            .publish_materialized_resume_state(PublishMaterializedResumeParams {
-                thread_id: self.thread_id(),
-                fence: MaterializedResumePublicationFence::Loaded(Box::new(
-                    materialized_resume.source,
-                )),
-                state: materialized_state,
-                max_state_bytes,
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to publish materialized resume state: {err}"))?;
-        let persist_elapsed_millis =
-            u64::try_from(persist_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let bootstrap_elapsed_millis =
-            reducer_elapsed_millis.saturating_add(persist_elapsed_millis);
-        tracing::info!(
-            reducer_elapsed_millis,
-            persist_elapsed_millis,
-            bootstrap_elapsed_millis,
-            max_state_bytes,
-            "published materialized resume state"
-        );
-        if let Some(metrics) = codex_otel::global() {
-            let tags = &[];
-            for (name, value) in [
-                (
-                    "codex.resume.reducer_elapsed_millis",
-                    reducer_elapsed_millis,
-                ),
-                (
-                    "codex.resume.persist_elapsed_millis",
-                    persist_elapsed_millis,
-                ),
-                (
-                    "codex.resume.bootstrap_elapsed_millis",
-                    bootstrap_elapsed_millis,
-                ),
-            ] {
-                let _ = metrics.histogram(name, i64::try_from(value).unwrap_or(i64::MAX), tags);
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolves the model contract a fresh resume would use, without building a turn context.
-    ///
-    /// This runs on the event path, where constructing a turn context would wait on turn
-    /// environments that the pending event itself is expected to settle.
-    async fn default_turn_model_info(&self) -> Arc<ModelInfo> {
-        let session_configuration = {
-            let state = self.state.lock().await;
-            state.session_configuration.clone()
-        };
-        Arc::new(
-            session_configuration
-                .step_settings
-                .resolve_model_info(
-                    self.services.models_manager.as_ref(),
-                    &session_configuration.model_info_overrides,
-                    self.features.enabled(Feature::Personality),
-                )
-                .await,
-        )
-    }
-
-    async fn publish_current_materialized_resume_state(
-        &self,
-        last_agent_status: AgentStatus,
-    ) -> anyhow::Result<()> {
-        let Some(rollout_path) = self.current_rollout_path().await? else {
-            return Ok(());
-        };
-        self.flush_rollout().await?;
-        let model_info = self.default_turn_model_info().await;
-        let (state, history_mode) = {
-            let state = self.state.lock().await;
-            let history = state.history.annotated_items_arc();
-            if history.is_empty() {
-                return Ok(());
-            }
-            let window_ids = state.auto_compact_window_ids();
-            let window = state.auto_compact_window_snapshot();
-            let materialized_state = MaterializedResumeState {
-                version: MATERIALIZED_RESUME_STATE_VERSION,
-                materialized_model: model_info.slug.clone(),
-                history,
-                retained_context: state.history.retained_context().clone(),
-                guardian_history: state.history.guardian_history_checkpoint(),
-                previous_turn_settings: state.previous_turn_settings().map(|settings| {
-                    MaterializedPreviousTurnSettings {
-                        model: settings.model,
-                        comp_hash: settings.comp_hash,
-                        realtime_active: settings.realtime_active,
-                    }
-                }),
-                reference_context_item: state.reference_context_item(),
-                world_state_baseline: state
-                    .history
-                    .world_state_baseline()
-                    .map(|snapshot| WorldStateItem::full(snapshot.into_object())),
-                mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
-                owned_startup_cwd: state.owned_startup_cwd(),
-                auto_compact_window: MaterializedAutoCompactWindow {
-                    window_number: state.auto_compact_window_number(),
-                    first_window_id: window_ids.first_window_id.to_string(),
-                    previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
-                    window_id: window_ids.window_id.to_string(),
-                },
-                token_info: state.token_info(),
-                latest_token_usage_record: state.latest_token_usage_record.clone(),
-                last_agent_status: Some(last_agent_status),
-                truncation_policy: model_info.truncation_policy.into(),
-                auto_compact_window_prefill_input_tokens: window.prefill_input_tokens,
-                has_prior_user_turns: !state.next_turn_is_first(),
-            };
-            (materialized_state, state.session_configuration.history_mode)
-        };
-        let max_state_bytes = materialized_resume_state_max_bytes(model_info.as_ref())?;
-        let live_thread = self.services.live_thread.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "codex_resume_state_needs_compaction: active source has no live persistence handle"
-            )
-        })?;
-        live_thread
-            .publish_materialized_resume_state(PublishMaterializedResumeParams {
-                thread_id: self.thread_id(),
-                fence: MaterializedResumePublicationFence::Current {
-                    rollout_path,
-                    history_mode,
-                },
-                state,
-                max_state_bytes,
-            })
-            .await
-            .map_err(|err| {
-                anyhow::anyhow!("failed to proactively publish materialized resume state: {err}")
-            })
+        previous_turn_settings
     }
 
     async fn set_auto_compact_window_estimated_prefill_for_scope(
@@ -2172,6 +1936,11 @@ impl Session {
     }
 
     pub(crate) async fn refresh_runtime_config(&self, next_config: Config) {
+        self.refresh_runtime_config_inner(next_config, /*refresh_recording*/ true)
+            .await;
+    }
+
+    async fn refresh_runtime_config_inner(&self, next_config: Config, refresh_recording: bool) {
         // Refresh only the user layer from the incoming snapshot. Preserve thread-local
         // layers such as request/session overrides that were present when this session
         // was created.
@@ -2190,6 +1959,25 @@ impl Session {
             config.mcp_servers = next_config.mcp_servers.clone();
             config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;
             config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;
+            // Recording can follow rollout changes without changing the session's
+            // execution features (including Code Mode's dispatch gate).
+            if refresh_recording {
+                self.services
+                    .executed_tool_calls
+                    .refresh(&next_config.features);
+            }
+            if let Err(err) = config.features.set_enabled(
+                Feature::Mcp20260728,
+                next_config.features.enabled(Feature::Mcp20260728),
+            ) {
+                warn!("failed to refresh MCP protocol config: {err}");
+            }
+            if let Err(err) = config.features.set_enabled(
+                Feature::CodexAppsMcp20260728,
+                next_config.features.enabled(Feature::CodexAppsMcp20260728),
+            ) {
+                warn!("failed to refresh Codex Apps MCP protocol config: {err}");
+            }
             if let Err(err) = config.features.set_enabled(
                 Feature::SecretAuthStorage,
                 next_config.features.enabled(Feature::SecretAuthStorage),
@@ -2246,6 +2034,18 @@ impl Session {
         config.mcp_servers = next_config.mcp_servers;
         config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;
         config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;
+        if let Err(err) = config.features.set_enabled(
+            Feature::Mcp20260728,
+            next_config.features.enabled(Feature::Mcp20260728),
+        ) {
+            warn!("failed to refresh MCP protocol config: {err}");
+        }
+        if let Err(err) = config.features.set_enabled(
+            Feature::CodexAppsMcp20260728,
+            next_config.features.enabled(Feature::CodexAppsMcp20260728),
+        ) {
+            warn!("failed to refresh Codex Apps MCP protocol config: {err}");
+        }
         if let Err(err) = config.features.set_enabled(
             Feature::SecretAuthStorage,
             next_config.features.enabled(Feature::SecretAuthStorage),
@@ -2360,7 +2160,10 @@ impl Session {
         };
         self.services.skills_service.clear_cache();
         self.services.plugins_manager.clear_cache();
-        self.refresh_runtime_config(next_config).await;
+        // This legacy snapshot still has the original execution features, not
+        // the host's latest rollout settings. Leave the live recorder alone.
+        self.refresh_runtime_config_inner(next_config, /*refresh_recording*/ false)
+            .await;
     }
 
     /// Record a terminal CodexErr before the app-server completion notification is reduced.
@@ -2372,6 +2175,13 @@ impl Session {
                 turn_context.sub_id.clone(),
                 error,
             ));
+    }
+
+    /// Uses the extension-owned reviewer, or the same manager for standalone hosts.
+    pub(crate) fn guardian_review_session(&self) -> Arc<GuardianReviewSessionManager> {
+        self.services
+            .thread_extension_data
+            .get_or_init(GuardianReviewSessionManager::default)
     }
 
     /// Persist the event to rollout and send it to clients.
@@ -2674,12 +2484,6 @@ impl Session {
     }
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
-        let terminal_status = match &event.msg {
-            EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) => {
-                agent_status_from_event(&event.msg)
-            }
-            _ => None,
-        };
         // Keep realtime reduction, canonical append, and delivery in the same order.
         // This lock must not acquire SessionState or ActiveTurn: event producers can
         // already hold those locks. Host presentation policies are synchronous.
@@ -2707,20 +2511,10 @@ impl Session {
             warn!("failed to persist realtime history: {error}");
         }
         // Persist the event into rollout storage; the store applies its persistence policy.
-        let persisted = if persist {
+        if persist {
             let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
-            match self.try_persist_rollout_items(&rollout_items).await {
-                Ok(()) => true,
-                Err(err) => {
-                    error!("failed to record rollout items: {err:#}");
-                    self.report_durable_history_failure(event.id.as_str(), &err)
-                        .await;
-                    false
-                }
-            }
-        } else {
-            false
-        };
+            self.persist_rollout_items(&rollout_items).await;
+        }
         self.services
             .rollout_thread_trace
             .record_protocol_event(&event.msg);
@@ -2729,51 +2523,7 @@ impl Session {
         {
             warn!("failed to persist realtime history: {error}");
         }
-        // Publishing reads SessionState, so it must not run while the realtime-history lock is
-        // held: event producers can already hold SessionState and wait for that lock.
-        drop(realtime_history);
-        if persisted
-            && let Some(status) = terminal_status
-            && let Err(err) = self.publish_current_materialized_resume_state(status).await
-        {
-            error!("codex_resume_state_needs_compaction: {err:#}");
-        }
         self.deliver_event_raw(event).await;
-    }
-
-    /// Tells the client once that this thread stopped producing durable history.
-    ///
-    /// Rollout persistence is otherwise fire-and-forget: without this the conversation keeps
-    /// rendering while nothing after the last durable record survives a resume.
-    ///
-    /// This is a warning rather than an error on purpose. `EventMsg::Error` is a turn-terminating
-    /// contract for its consumers: the app server clears the running turn and its pending input
-    /// before it ever inspects `codex_error_info`, and the TUI finalizes the turn and releases the
-    /// next queued input. Reporting a storage failure that way would end the turn for the client
-    /// while it keeps running here, which is a worse desynchronization than the silence it
-    /// replaces.
-    ///
-    /// The report is delivered but deliberately not persisted, so it cannot itself depend on the
-    /// storage that just failed and cannot enter replayed history. It also leaves the agent status
-    /// alone: the turn is still running, only persistence is broken.
-    async fn report_durable_history_failure(&self, turn_id: &str, err: &anyhow::Error) {
-        if self
-            .durable_history_failure_reported
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return;
-        }
-        let event = Event {
-            id: turn_id.to_string(),
-            msg: EventMsg::Warning(WarningEvent {
-                message: format!(
-                    "This thread's history could not be saved to disk: {err:#}. {TRANSCRIPT_NOT_SAVED_HINT}"
-                ),
-            }),
-        };
-        if let Err(err) = self.tx_event.send(event).await {
-            debug!("dropping durable-history failure report because channel is closed: {err}");
-        }
     }
 
     async fn deliver_event_raw(&self, event: Event) {
@@ -2809,6 +2559,15 @@ impl Session {
         item: TurnItem,
     ) {
         record_turn_ttfm_metric(turn_context, &item).await;
+        for contributor in self.services.extensions.turn_lifecycle_contributors() {
+            contributor
+                .on_item_completed(
+                    &self.services.thread_extension_data,
+                    turn_context.extension_data.as_ref(),
+                    &item,
+                )
+                .await;
+        }
         let completed_at_ms = now_unix_timestamp_ms();
         let item_id = item.id();
         let started_at_ms = turn_context
@@ -3596,22 +3355,20 @@ impl Session {
         item.set_create_time_if_missing(Self::response_item_create_time());
     }
 
-    /// Records conversation items: append to history, persist to rollout, and
-    /// notify clients observing raw response items.
+    /// Prepares media using the originating model and preserves existing item identity.
     pub(crate) fn prepare_conversation_items_for_history<'a>(
         &self,
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
         items: &'a [ResponseItem],
     ) -> (Cow<'a, [ResponseItem]>, Vec<ImagePreparationMetadata>) {
         let mut items = items.to_vec();
-        let image_preparation_mode = if unified_image_budget_enabled(
-            &turn_context.config.features,
-            turn_context.model_info(),
-        ) {
-            ImagePreparationMode::UnifiedBudget
-        } else {
-            ImagePreparationMode::DetailBased
-        };
+        let image_preparation_mode =
+            if unified_image_budget_enabled(&turn_context.config.features, model_info) {
+                ImagePreparationMode::UnifiedBudget
+            } else {
+                ImagePreparationMode::DetailBased
+            };
         let image_resize_notice_mode = if turn_context
             .config
             .features
@@ -3705,29 +3462,54 @@ impl Session {
         item
     }
 
+    /// Appends to history, persists the prepared items, then notifies raw-item observers.
+    /// Execution callers supply their captured model; standalone callers need no tool runtime.
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     pub(crate) async fn record_conversation_items(
         &self,
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
         items: &[ResponseItem],
     ) {
         let (items, image_preparations) =
-            self.prepare_conversation_items_for_history(turn_context, items);
+            self.prepare_conversation_items_for_history(turn_context, model_info, items);
         let items = items
             .into_owned()
             .into_iter()
             .map(ResponseItemEnvelope::new)
             .collect();
-        self.record_prepared_conversation_items(turn_context, items, image_preparations)
-            .await;
+        self.record_prepared_conversation_items(
+            turn_context,
+            model_info,
+            items,
+            image_preparations,
+        )
+        .await;
     }
 
     async fn record_prepared_conversation_items(
         &self,
         turn_context: &TurnContext,
-        items: Vec<ResponseItemEnvelope>,
+        model_info: &ModelInfo,
+        mut items: Vec<ResponseItemEnvelope>,
         image_preparations: Vec<ImagePreparationMetadata>,
     ) {
+        // Save the originating history budget for replay.
+        // Preserve any existing tool-specific override.
+        let policy: codex_utils_output_truncation::TruncationPolicy =
+            model_info.truncation_policy.into();
+        for envelope in &mut items {
+            if matches!(
+                envelope.item,
+                ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+            ) {
+                envelope
+                    .metadata
+                    .get_or_insert_default()
+                    .history_truncation_token_limit
+                    .get_or_insert_with(|| with_serialization_allowance(policy).token_budget());
+            }
+        }
         let response_items = items
             .iter()
             .map(|envelope| envelope.item.clone())
@@ -3739,7 +3521,7 @@ impl Session {
                 .note_recorded_items(&response_items);
             state
                 .history
-                .record_annotated_items(&items, turn_context.model_info().truncation_policy.into());
+                .record_annotated_items(&items, model_info.truncation_policy.into());
         }
         for image in image_preparations {
             self.services
@@ -3781,7 +3563,8 @@ impl Session {
             world_state.render_diff(&previous_snapshot),
         );
         if !items.is_empty() {
-            self.record_conversation_items(turn_context, &items).await;
+            self.record_conversation_items(turn_context, &step_context.settings.model_info, &items)
+                .await;
         }
 
         // ContextManager remembers this for later turns; run_turn owns the live value.
@@ -3960,9 +3743,6 @@ impl Session {
         }
         .or_cancel(cancellation_token)
         .await?;
-        let prepared_recommendations = prepared_recommendations
-            .map_err(std::io::Error::from)
-            .map_err(CodexErr::from)?;
         let mut selected_plugins = self
             .services
             .thread_extension_data
@@ -3976,13 +3756,10 @@ impl Session {
         });
         extension_data.insert(selected_plugins.clone());
         turn_context.extension_data.insert(selected_plugins);
-        // Tool availability still follows the admitted turn; the async message
-        // description comes from the captured step model.
         let tool_router = turn::built_tools(
             self.as_ref(),
             turn_context.as_ref(),
-            // TODO(CDXENT-441): use the step scoped model
-            turn_context.model_info(),
+            &settings.model_info,
             settings.model_info.model_messages.as_ref(),
             &environments,
             &mcp,
@@ -3991,8 +3768,7 @@ impl Session {
         )
         .or_cancel(cancellation_token)
         .await??;
-        // Publish inventory after planning rather than during finalization, so constructing
-        // additional candidate plans cannot overwrite turn-wide metadata.
+        // Publish inventory only after the step's tool plan has been finalized.
         if turn_context
             .config
             .tool_registry
@@ -4023,11 +3799,13 @@ impl Session {
     pub(crate) async fn record_inter_agent_communication(
         &self,
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
         communication: InterAgentCommunication,
     ) {
         let response_item = communication.to_model_input_item();
         let (items, _) = self.prepare_conversation_items_for_history(
             turn_context,
+            model_info,
             std::slice::from_ref(&response_item),
         );
         let items = items.as_ref();
@@ -4035,10 +3813,7 @@ impl Session {
         {
             let mut state = self.state.lock().await;
             state.current_time_reminder.note_recorded_items(items);
-            state.record_items(
-                items.iter(),
-                turn_context.model_info().truncation_policy.into(),
-            );
+            state.record_items(items.iter(), model_info.truncation_policy.into());
         }
         self.persist_rollout_items(&[
             RolloutItem::InterAgentCommunicationMetadata {
@@ -4121,17 +3896,13 @@ impl Session {
         state.replace_history(items, reference_context_item);
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "the checkpoint and its live history must commit atomically; ThreadStore append never acquires SessionState"
-    )]
     pub(crate) async fn replace_compacted_history(
         &self,
         mut items: Vec<ResponseItemEnvelope>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
         metadata: CompactedHistoryMetadata,
-    ) -> CodexResult<u64> {
+    ) {
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
@@ -4148,66 +3919,61 @@ impl Session {
                 .get_or_insert_default()
                 .compaction_model_hash = metadata.compaction_model_hash;
         }
-        // Freeze settings and history until the durable replacement has committed. The store
-        // append does not acquire SessionState; reporting errors while holding it would.
-        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
-        let settings_event = thread_settings::applied_event(self).await;
-        let mut state = self.state.lock().await;
-        let window_number = metadata.window_number;
-        let window_ids = metadata.window_ids;
-        let current_ids = state.auto_compact_window_ids();
-        if window_number != state.auto_compact_window_number().saturating_add(1)
-            || window_ids.previous_window_id != Some(current_ids.window_id)
-            || window_ids.first_window_id != current_ids.first_window_id
-        {
-            return Err(CodexErr::Fatal(
-                "compaction checkpoint targets a stale context window".to_string(),
-            ));
-        }
-        let mut candidate_history = state.clone_history();
-        candidate_history.replace_compacted(items.clone());
-        let compacted_item = CompactedItem {
+        let mut compacted_item = CompactedItem {
             message: metadata.message,
             replacement_history: Some(items.clone()),
-            guardian_history: candidate_history.guardian_history_checkpoint(),
-            retained_context: Some(candidate_history.retained_context().clone()),
+            retained_context: None,
+            guardian_history: None,
             mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
-            window_number: Some(window_number),
-            first_window_id: Some(window_ids.first_window_id.to_string()),
-            previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
-            window_id: Some(window_ids.window_id.to_string()),
+            window_number: Some(metadata.window_number),
+            first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
+            previous_window_id: metadata
+                .window_ids
+                .previous_window_id
+                .map(|id| id.to_string()),
+            window_id: Some(metadata.window_ids.window_id.to_string()),
             compaction_response_id: metadata.compaction_response_id,
-            latest_token_usage_record: state.latest_token_usage_record.clone(),
+            latest_token_usage_record: self.state.lock().await.latest_token_usage_record.clone(),
         };
-        let world_state_snapshot = world_state_baseline.map(|world_state| world_state.snapshot());
+        // Wait for accepted updates to finish persisting, then keep later updates from
+        // overtaking the current settings snapshot while its checkpoint is written.
+        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
+        // Compaction starts a new history window, so its WorldState baseline must be full.
+        let mut world_state_item = None;
+        {
+            let mut state = self.state.lock().await;
+            state.replace_annotated_history(
+                items,
+                reference_context_item.clone(),
+                HistoryReplacement::Compaction,
+            );
+            compacted_item.guardian_history = state.history.guardian_history_checkpoint();
+            compacted_item.retained_context = Some(state.history.retained_context().clone());
+            state.reasoning_effort_pin = ReasoningEffortPin::Compacted;
+            if let Some(world_state) = world_state_baseline {
+                let snapshot = world_state.snapshot();
+                world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
+                state.history.set_world_state_baseline(snapshot);
+            }
+        }
+
         let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
         // Persist the baseline after the replacement history that established it.
-        if let Some(snapshot) = &world_state_snapshot {
-            rollout_items.push(RolloutItem::WorldState(WorldStateItem::full(
-                snapshot.clone().into_object(),
-            )));
+        if let Some(world_state_item) = world_state_item {
+            rollout_items.push(RolloutItem::WorldState(world_state_item));
         }
-        if let Some(turn_context_item) = &reference_context_item {
-            rollout_items.push(RolloutItem::TurnContext(turn_context_item.clone()));
+        if let Some(turn_context_item) = reference_context_item {
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item));
         }
         // The frozen turn context must not override current settings in persisted metadata.
-        rollout_items.push(RolloutItem::EventMsg(settings_event));
-        self.try_persist_rollout_items(&rollout_items)
-            .await
-            .map_err(|err| {
-                CodexErr::Fatal(format!("failed to persist compaction checkpoint: {err:#}"))
-            })?;
-        state.replace_annotated_history(
-            items,
-            reference_context_item,
-            HistoryReplacement::Compaction,
-        );
-        if let Some(snapshot) = world_state_snapshot {
-            state.history.set_world_state_baseline(snapshot);
+        rollout_items.push(RolloutItem::EventMsg(
+            thread_settings::applied_event(self).await,
+        ));
+        self.persist_rollout_items(&rollout_items).await;
+        {
+            let mut state = self.state.lock().await;
+            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
         }
-        state.commit_auto_compact_window(window_number, window_ids);
-        state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
-        Ok(window_number)
     }
 
     pub fn enabled(&self, feature: Feature) -> bool {
@@ -4279,7 +4045,7 @@ impl Session {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
-                    model_context_window: turn_context.model_context_window(),
+                    model_context_window: step_context.settings.model_info.usable_context_window(),
                 })
                 .await
             {
@@ -4292,29 +4058,25 @@ impl Session {
             .collect()
     }
 
+    /// `step_context` and `world_state` must come from the same captured step.
+    /// If more callers need this pair, bundle them into a captured-context struct
+    /// so callers cannot mix settings and WorldState from different steps.
     pub(crate) async fn build_initial_context_with_world_state(
         &self,
-        turn_context: &TurnContext,
+        step_context: &StepContext,
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
-        let window_ids = self.state.lock().await.auto_compact_window_ids();
-        self.build_initial_context_for_window(turn_context, world_state, window_ids)
-            .await
-    }
-
-    pub(crate) async fn build_initial_context_for_window(
-        &self,
-        turn_context: &TurnContext,
-        world_state: &WorldState,
-        auto_compact_window_ids: AutoCompactWindowIds,
-    ) -> Vec<ResponseItem> {
+        let turn_context = step_context.turn.as_ref();
         let mut developer_sections = Vec::<RenderedFragment>::with_capacity(8);
         let mut contextual_user_sections = Vec::<RenderedFragment>::with_capacity(2);
         let mut separate_developer_sections = Vec::<RenderedFragment>::new();
         let mut context_window_hints = Vec::new();
-        let session_source = {
+        let (session_source, auto_compact_window_ids) = {
             let state = self.state.lock().await;
-            state.session_configuration.session_source.clone()
+            (
+                state.session_configuration.session_source.clone(),
+                state.auto_compact_window_ids(),
+            )
         };
         let separate_guardian_developer_message =
             crate::guardian::is_basic_session_source(&session_source);
@@ -4385,7 +4147,7 @@ impl Session {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
-                    model_context_window: turn_context.model_context_window(),
+                    model_context_window: step_context.settings.model_info.usable_context_window(),
                 })
                 .await
             {
@@ -4394,7 +4156,11 @@ impl Session {
         }
         // This is full-context metadata. Steady-state context diffs should not re-emit it.
         if turn_context.config.features.enabled(Feature::TokenBudget)
-            && turn_context.model_context_window().is_some()
+            && step_context
+                .settings
+                .model_info
+                .resolved_context_window()
+                .is_some()
         {
             // Keep the legacy bridge hint when native Notes is disabled. A failed
             // native request must not fall back to the bridge.
@@ -4535,32 +4301,11 @@ impl Session {
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
-        if let Err(err) = self.try_persist_rollout_items(items).await {
-            error!("failed to record rollout items: {err:#}");
-            // Report from wherever the failure is first observed. Conversation items travel this
-            // path, so waiting for a later event append to fail would leave the first lost turn
-            // silent for as long as that append happens to succeed.
-            let turn_id = self.active_turn_id().await.unwrap_or_default();
-            self.report_durable_history_failure(turn_id.as_str(), &err)
-                .await;
+        if let Some(live_thread) = self.live_thread()
+            && let Err(e) = live_thread.append_items(items).await
+        {
+            error!("failed to record rollout items: {e:#}");
         }
-    }
-
-    /// The turn a fire-and-forget persistence failure belongs to, when one is running.
-    async fn active_turn_id(&self) -> Option<String> {
-        self.active_turn
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|active| active.task.as_ref())
-            .map(|task| task.turn_context.sub_id.clone())
-    }
-
-    async fn try_persist_rollout_items(&self, items: &[RolloutItem]) -> anyhow::Result<()> {
-        if let Some(live_thread) = self.live_thread() {
-            live_thread.append_items(items).await?;
-        }
-        Ok(())
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
@@ -4591,14 +4336,9 @@ impl Session {
         )
     }
 
-    #[cfg(test)]
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
         let mut state = self.state.lock().await;
         state.advance_auto_compact_window()
-    }
-
-    pub(crate) async fn prepare_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
-        self.state.lock().await.prepare_auto_compact_window()
     }
 
     pub(crate) async fn request_new_context_window(&self) {
@@ -4615,7 +4355,7 @@ impl Session {
         &self,
         step_context: &StepContext,
         world_state: Arc<WorldState>,
-    ) -> CodexResult<u64> {
+    ) -> u64 {
         let turn_context = step_context.turn.as_ref();
         let retained_client_developer_messages =
             if self.enabled(Feature::RetainClientDeveloperMessages) {
@@ -4634,31 +4374,34 @@ impl Session {
             } else {
                 Vec::new()
             };
-        let (window_number, window_ids) = self.prepare_auto_compact_window().await;
+        let window = {
+            let mut state = self.state.lock().await;
+            state.start_new_context_window()
+        };
+        let (window_number, window_ids) = window;
         let context_items = self
-            .build_initial_context_for_window(turn_context, world_state.as_ref(), window_ids)
+            .build_initial_context_with_world_state(step_context, world_state.as_ref())
             .await
             .into_iter()
             .map(ResponseItemEnvelope::new)
             .chain(retained_client_developer_messages)
             .collect();
-        let turn_context_item = turn_context.to_turn_context_item();
-        let window_number = self
-            .replace_compacted_history(
-                context_items,
-                Some(turn_context_item),
-                Some(world_state),
-                CompactedHistoryMetadata {
-                    message: String::new(),
-                    window_number,
-                    window_ids,
-                    compaction_response_id: None,
-                    compaction_model_hash: None,
-                },
-            )
-            .await?;
+        let turn_context_item = step_context.to_turn_context_item();
+        self.replace_compacted_history(
+            context_items,
+            Some(turn_context_item),
+            Some(world_state),
+            CompactedHistoryMetadata {
+                message: String::new(),
+                window_number,
+                window_ids,
+                compaction_response_id: None,
+                compaction_model_hash: None,
+            },
+        )
+        .await;
         self.recompute_token_usage(turn_context).await;
-        Ok(window_number)
+        window_number
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -4689,14 +4432,14 @@ impl Session {
             let state = self.state.lock().await;
             state.reference_context_item()
         };
-        let turn_context_item = turn_context.to_turn_context_item();
+        let turn_context_item = step_context.to_turn_context_item();
         let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
         let should_inject_full_context = reference_context_item.is_none();
         let world_state = Arc::new(self.build_world_state_for_step(step_context).await?);
         // Full initial context resets the baseline; later turns persist only its changes.
         let (mut context_items, world_state_item) = if should_inject_full_context {
             let context_items = self
-                .build_initial_context_with_world_state(turn_context, world_state.as_ref())
+                .build_initial_context_with_world_state(step_context, world_state.as_ref())
                 .await;
             let snapshot = world_state.snapshot();
             self.state
@@ -4732,8 +4475,12 @@ impl Session {
             return Ok(world_state);
         }
         if !context_items.is_empty() {
-            self.record_conversation_items(turn_context, &context_items)
-                .await;
+            self.record_conversation_items(
+                turn_context,
+                &step_context.settings.model_info,
+                &context_items,
+            )
+            .await;
         }
         // Persist state only after any model-visible context generated from it.
         if let Some(world_state_item) = world_state_item {
@@ -4932,11 +4679,16 @@ impl Session {
     pub(crate) async fn record_response_item_and_emit_turn_item(
         &self,
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
         response_item: ResponseItem,
     ) {
         // Add to conversation history and persist response item to rollout.
-        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-            .await;
+        self.record_conversation_items(
+            turn_context,
+            model_info,
+            std::slice::from_ref(&response_item),
+        )
+        .await;
 
         // Derive a turn item and emit lifecycle events if applicable.
         if let Some(item) = parse_turn_item(&response_item) {
@@ -4948,6 +4700,7 @@ impl Session {
     pub(crate) async fn record_user_prompt_and_emit_turn_item(
         &self,
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
         input: &[UserInput],
         client_id: Option<String>,
         acceptance_order: Option<u64>,
@@ -4959,6 +4712,7 @@ impl Session {
         let response_item = self.response_item_from_user_input(input.to_vec());
         self.record_annotated_conversation_items(
             turn_context,
+            model_info,
             vec![ResponseItemEnvelope {
                 item: response_item,
                 metadata: acceptance_order.map(|order| CodexHarnessMetadata {
@@ -5050,38 +4804,9 @@ impl Session {
         state.take_pending_session_start_source()
     }
 
-    /// Records the startup cwd this thread claimed through its own applied settings.
-    pub(crate) async fn set_owned_startup_cwd(&self, cwd: PathBuf) {
-        let mut state = self.state.lock().await;
-        state.set_owned_startup_cwd(Some(cwd));
-    }
-
     fn show_raw_agent_reasoning(&self) -> bool {
         self.services.show_raw_agent_reasoning
     }
-}
-
-/// Envelope and non-text structural headroom for a serialized materialized resume state, sized to
-/// one maximum persisted rollout record.
-const MATERIALIZED_RESUME_STATE_STRUCTURAL_HEADROOM_BYTES: usize = 16 * 1024 * 1024;
-
-fn materialized_resume_state_max_bytes(model_info: &ModelInfo) -> anyhow::Result<u64> {
-    let model_context_window = model_info.usable_context_window().ok_or_else(|| {
-        anyhow::anyhow!(
-            "codex_resume_state_needs_compaction: active model has no context-window bound"
-        )
-    })?;
-    let context_tokens = usize::try_from(model_context_window).map_err(|_| {
-        anyhow::anyhow!(
-            "codex_resume_state_needs_compaction: active model context-window bound is invalid"
-        )
-    })?;
-    // Six bytes per model-context byte is JSON's worst-case character escaping expansion.
-    // One maximum rollout record covers envelope and non-text structural state.
-    let max_state_bytes = codex_utils_string::approx_bytes_for_tokens(context_tokens)
-        .saturating_mul(6)
-        .saturating_add(MATERIALIZED_RESUME_STATE_STRUCTURAL_HEADROOM_BYTES);
-    Ok(u64::try_from(max_state_bytes).unwrap_or(u64::MAX))
 }
 
 pub(crate) fn emit_subagent_session_started(

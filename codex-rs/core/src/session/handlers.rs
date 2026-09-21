@@ -20,6 +20,7 @@ use crate::context::GuardianApprovedAction;
 use crate::context::NodeReplReviewEvidence;
 use crate::review_prompts::resolve_review_request;
 use crate::session::spawn_review_thread;
+use crate::state::ReasoningEffortPin;
 use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
@@ -325,23 +326,6 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             return;
         }
     };
-    if let Err(err) = live_thread
-        .prepare_materialized_resume_state_rebuild()
-        .await
-    {
-        sess.send_event_raw(Event {
-            id: turn_context.sub_id.clone(),
-            msg: EventMsg::Error(ErrorEvent {
-                misalignment: None,
-                message: format!(
-                    "failed to invalidate derived resume state before rollback: {err}"
-                ),
-                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-            }),
-        })
-        .await;
-        return;
-    }
 
     let rollback_event = ThreadRolledBackEvent { num_turns };
     let rollback_msg = EventMsg::ThreadRolledBack(rollback_event.clone());
@@ -350,29 +334,20 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
-    if let Err(err) = sess
-        .apply_rollout_reconstruction(
-            turn_context.as_ref(),
-            replay_items.as_slice(),
-            /*materialized_state*/ None,
-        )
-        .await
-    {
-        sess.send_event_raw(Event {
-            id: turn_context.sub_id.clone(),
-            msg: EventMsg::Error(ErrorEvent {
-                misalignment: None,
-                message: format!("failed to reconstruct history after rollback: {err}"),
-                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-            }),
-        })
+    sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
         .await;
-        return;
+    {
+        let mut state = sess.state.lock().await;
+        // Keep the baseline while startup prewarm is retained for the first turn,
+        // including when its task has not established the pin yet.
+        if state.startup_prewarm.is_none() {
+            state.reasoning_effort_pin = ReasoningEffortPin::Unset;
+        }
     }
     sess.services
         .thread_extension_data
         .remove::<NodeReplReviewEvidence>();
-    sess.guardian_review_session.invalidate().await;
+    sess.guardian_review_session().invalidate().await;
     sess.services
         .agent_control
         .rollout_budget()
@@ -386,8 +361,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             turn_context.as_ref(),
             EventMsg::Warning(WarningEvent {
                 message: format!(
-                    "Rolled the thread back, but failed to save the rollback marker. {} Error: {err}",
-                    super::TRANSCRIPT_NOT_SAVED_HINT
+                    "Rolled the thread back, but failed to save the rollback marker. Codex will continue retrying. Error: {err}"
                 ),
             }),
         )
@@ -461,7 +435,7 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
         sess.mcp_refresh.close();
         sess.services.mcp_runtime.shutdown().await;
     }
-    sess.guardian_review_session.shutdown().await;
+    sess.guardian_review_session().shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
 }

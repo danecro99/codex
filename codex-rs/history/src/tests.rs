@@ -1,11 +1,135 @@
 use anyhow::Result;
 use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::TruncationPolicy;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use super::*;
+
+fn thread_settings_snapshot(disabled_plugin_ids: Vec<String>) -> Result<ThreadSettingsSnapshot> {
+    Ok(serde_json::from_value(json!({
+        "model": "gpt-5",
+        "model_provider_id": "openai",
+        "approval_policy": "never",
+        "approvals_reviewer": "user",
+        "permission_profile": codex_protocol::models::PermissionProfile::read_only(),
+        "cwd": std::env::current_dir()?,
+        "collaboration_mode": {
+            "mode": "default",
+            "settings": {
+                "model": "gpt-5",
+                "reasoning_effort": null,
+                "developer_instructions": null
+            }
+        },
+        "disabled_plugin_ids": disabled_plugin_ids
+    }))?)
+}
+
+#[test]
+fn latest_disabled_plugin_ids_preserves_owned_updates_and_clears() -> Result<()> {
+    let thread_id = ThreadId::new();
+    let ancestor_id = ThreadId::new();
+    let selected = thread_settings_snapshot(vec!["example@marketplace".to_string()])?;
+    let cleared = thread_settings_snapshot(Vec::new())?;
+    let item = |thread_id, thread_settings| {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+            codex_protocol::protocol::ThreadSettingsAppliedEvent {
+                thread_id,
+                thread_settings,
+            },
+        ))
+    };
+    let foreign_items = vec![
+        item(Some(ancestor_id), selected.clone()),
+        item(/*thread_id*/ None, selected.clone()),
+    ];
+    assert_eq!(latest_disabled_plugin_ids(&foreign_items, thread_id), None);
+
+    let mut history = vec![item(Some(thread_id), selected.clone())];
+    history.extend(foreign_items.clone());
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(selected.disabled_plugin_ids.as_slice())
+    );
+
+    history.push(item(Some(thread_id), cleared.clone()));
+    history.extend(foreign_items);
+    history.push(turn_context_with_disabled_plugins(Some(
+        selected.disabled_plugin_ids,
+    ))?);
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(cleared.disabled_plugin_ids.as_slice())
+    );
+    Ok(())
+}
+
+fn turn_context_with_disabled_plugins(
+    disabled_plugin_ids: Option<Vec<String>>,
+) -> Result<RolloutItem> {
+    let mut context: TurnContextItem = serde_json::from_value(json!({
+        "cwd": std::env::current_dir()?,
+        "approval_policy": "never",
+        "sandbox_policy": { "type": "danger-full-access" },
+        "model": "gpt-5",
+        "summary": "auto"
+    }))?;
+    context.disabled_plugin_ids = disabled_plugin_ids;
+    Ok(RolloutItem::TurnContext(context))
+}
+
+#[test]
+fn latest_disabled_plugin_ids_falls_back_only_to_latest_turn_context() -> Result<()> {
+    let thread_id = ThreadId::new();
+    let selected = vec!["example@marketplace".to_string()];
+    let mut history = vec![turn_context_with_disabled_plugins(Some(selected.clone()))?];
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(selected.as_slice())
+    );
+
+    history.push(RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+        codex_protocol::protocol::ThreadSettingsAppliedEvent {
+            thread_id: Some(ThreadId::new()),
+            thread_settings: thread_settings_snapshot(Vec::new())?,
+        },
+    )));
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(selected.as_slice())
+    );
+
+    let cleared = Vec::new();
+    history.push(turn_context_with_disabled_plugins(Some(cleared.clone()))?);
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(cleared.as_slice())
+    );
+
+    history.push(turn_context_with_disabled_plugins(
+        /*disabled_plugin_ids*/ None,
+    )?);
+    assert_eq!(latest_disabled_plugin_ids(&history, thread_id), None);
+    Ok(())
+}
+
+#[test]
+fn older_thread_settings_snapshot_defaults_disabled_plugins_to_empty() -> Result<()> {
+    let expected = thread_settings_snapshot(Vec::new())?;
+    let mut legacy = serde_json::to_value(&expected)?;
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("disabled_plugin_ids");
+
+    assert_eq!(
+        serde_json::from_value::<ThreadSettingsSnapshot>(legacy)?,
+        expected
+    );
+    Ok(())
+}
 
 #[test]
 fn response_item_envelope_accessors_preserve_item() {
@@ -35,59 +159,6 @@ fn response_item_envelope_accessors_preserve_item() {
     *envelope = replacement_item.clone();
 
     assert_eq!(envelope.into_item(), replacement_item);
-}
-
-#[test]
-fn checkpoint_suffix_does_not_advertise_complete_initial_messages() {
-    let thread_id = ThreadId::new();
-    let window_id = ThreadId::new().to_string();
-    let history = InitialHistory::Resumed(ResumedHistory {
-        conversation_id: thread_id,
-        history: Arc::new(Vec::new()),
-        rollout_path: Some(PathBuf::from("rollout.jsonl")),
-        materialized_resume: Some(Box::new(MaterializedResume {
-            source: MaterializedResumeSource {
-                thread_id,
-                rollout_id: thread_id,
-                canonical_rollout_path: PathBuf::from("rollout.jsonl"),
-                history_mode: ThreadHistoryMode::Legacy,
-                end_byte_offset: 0,
-                end_ordinal_exclusive: None,
-                modified_unix_nanos: 0,
-                prefix_head_sha256: String::new(),
-                prefix_tail_sha256: String::new(),
-                append_generation: None,
-                lineage: Vec::new(),
-            },
-            state: Some(MaterializedResumeState {
-                version: MATERIALIZED_RESUME_STATE_VERSION,
-                materialized_model: "test-model".to_string(),
-                history: Arc::new(Vec::new()),
-                retained_context: RetainedContext::default(),
-                guardian_history: None,
-                previous_turn_settings: None,
-                reference_context_item: None,
-                world_state_baseline: None,
-                mcp_resource_origins: None,
-                owned_startup_cwd: None,
-                auto_compact_window: MaterializedAutoCompactWindow {
-                    window_number: 0,
-                    first_window_id: window_id.clone(),
-                    previous_window_id: None,
-                    window_id,
-                },
-                token_info: None,
-                latest_token_usage_record: None,
-                last_agent_status: None,
-                truncation_policy: TruncationPolicy::Tokens(128_000),
-                auto_compact_window_prefill_input_tokens: None,
-                has_prior_user_turns: false,
-            }),
-            max_state_bytes: Some(1),
-        })),
-    });
-
-    assert!(history.get_event_msgs().is_none());
 }
 
 #[test]
@@ -132,7 +203,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             item: response_item.clone(),
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
-                fallback_token_limit_override: Some(20_000),
+                history_truncation_token_limit: Some(20_000),
                 inherited_user_message: true,
                 ..Default::default()
             }),
@@ -164,7 +235,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
         envelope.metadata,
         Some(CodexHarnessMetadata {
             client_authored: true,
-            fallback_token_limit_override: Some(20_000),
+            history_truncation_token_limit: Some(20_000),
             inherited_user_message: true,
             ..Default::default()
         })
@@ -696,7 +767,6 @@ fn copied_history_uses_persisted_history_mode() -> Result<()> {
         conversation_id: thread_id,
         history: Arc::new(vec![session_meta.clone()]),
         rollout_path: None,
-        materialized_resume: None,
     });
 
     assert_eq!(
@@ -716,7 +786,6 @@ fn copied_history_uses_persisted_history_mode() -> Result<()> {
             conversation_id: thread_id,
             history: Arc::new(Vec::new()),
             rollout_path: None,
-            materialized_resume: None,
         })
         .get_history_mode(ThreadHistoryMode::Paginated),
         ThreadHistoryMode::Paginated
