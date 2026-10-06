@@ -1,6 +1,7 @@
 mod auth_status;
 mod elicitation_client_service;
 mod executor_process_transport;
+mod foreground_tasks;
 mod http_client_adapter;
 mod in_process_transport;
 mod incoming_jsonrpc;

@@ -187,7 +187,7 @@ impl ElicitationPauseState {
         }
     }
 
-    fn subscribe(&self) -> watch::Receiver<bool> {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<bool> {
         self.paused.subscribe()
     }
 }
@@ -204,7 +204,7 @@ impl Drop for ElicitationPauseGuard {
     }
 }
 
-async fn active_time_timeout<T, Fut>(
+pub(crate) async fn active_time_timeout<T, Fut>(
     duration: Duration,
     mut pause_state: watch::Receiver<bool>,
     operation: Fut,
@@ -559,10 +559,20 @@ impl RmcpClient {
     #[instrument(level = "trace", skip_all)]
     pub async fn initialize(
         &self,
-        params: InitializeRequestParams,
+        mut params: InitializeRequestParams,
         timeout: Option<Duration>,
         send_elicitation: SendElicitation,
     ) -> Result<ServerPeerInfo> {
+        if self.protocol_mode == McpProtocolMode::V20260728 {
+            params
+                .capabilities
+                .extensions
+                .get_or_insert_default()
+                .insert(
+                    rmcp::model::TASKS_EXTENSION_ID.to_owned(),
+                    serde_json::Map::new(),
+                );
+        }
         let client_service = ElicitationClientService::new(
             params.clone(),
             send_elicitation,
@@ -773,18 +783,43 @@ impl RmcpClient {
         let mut rmcp_params = CallToolRequestParams::new(name);
         rmcp_params.arguments = arguments;
         let requested_modern = self.protocol_mode == McpProtocolMode::V20260728;
+        let service = self.service().await?;
+        if requested_modern
+            && service
+                .peer()
+                .peer_info()
+                .is_some_and(|info| info.protocol_version == ProtocolVersion::V_2026_07_28)
+        {
+            rmcp_params.meta = meta;
+            let result = crate::foreground_tasks::call_tool(
+                service,
+                rmcp_params,
+                timeout,
+                self.elicitation_pause_state.clone(),
+            )
+            .await?;
+            self.persist_oauth_tokens().await;
+            return Ok(result);
+        }
+        let call_params = rmcp_params.clone();
+        let call_meta = meta.clone();
         let result = self
             .run_service_operation("tools/call", timeout, move |service| {
-                let mut rmcp_params = rmcp_params.clone();
-                let meta = meta.clone();
+                let rmcp_params = call_params.clone();
+                let meta = call_meta.clone();
                 async move {
-                    let modern_session = requested_modern
+                    // Session recovery can negotiate modern MCP after a legacy
+                    // connection expires. Bound only this initial request; the
+                    // returned task must be driven outside the outer deadline.
+                    if requested_modern
                         && service.peer().peer_info().is_some_and(|info| {
                             info.protocol_version == ProtocolVersion::V_2026_07_28
-                        });
-                    if modern_session {
-                        rmcp_params.meta = meta;
-                        return service.call_tool(rmcp_params).await;
+                        })
+                    {
+                        let mut params = rmcp_params;
+                        params.meta = meta;
+                        let response = service.call_tool_once(params).await?;
+                        return Ok((service, response));
                     }
                     let mut options = rmcp::service::PeerRequestOptions::no_options();
                     options.meta = meta;
@@ -800,13 +835,25 @@ impl RmcpClient {
                         .await_response()
                         .await?;
                     match result {
-                        ServerResult::CallToolResult(result) => Ok(result),
+                        ServerResult::CallToolResult(result) => {
+                            Ok((service, rmcp::model::CallToolResponse::Complete(result)))
+                        }
                         _ => Err(rmcp::service::ServiceError::UnexpectedResponse),
                     }
                 }
                 .boxed()
             })
             .await?;
+        let (service, response) = result;
+        rmcp_params.meta = meta;
+        let result = crate::foreground_tasks::continue_tool_call(
+            service,
+            rmcp_params,
+            response,
+            timeout,
+            self.elicitation_pause_state.clone(),
+        )
+        .await?;
         self.persist_oauth_tokens().await;
         Ok(result)
     }
