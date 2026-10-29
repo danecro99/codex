@@ -459,6 +459,20 @@ support for new `thread/rollback` requests.
 
 # MCP configuration reload
 
+`config/mcpServer/reload` reloads configuration and queues an explicit MCP
+reconnect for every successfully refreshed loaded thread after the complete
+configuration/policy pass, including connected servers whose configuration is
+unchanged. Rejected or still-stale publications do not queue a reconnect.
+The `{}` response acknowledges the queued operation; it does not prove that new
+tool catalogs have been loaded.
+Already running calls retain their original immutable client and catalog binding.
+Once the refreshed runtime is published, subsequent model steps capture its
+descriptors and clients together.
+To observe a particular thread's bound catalog, use `mcpServerStatus/list` with
+both `threadId` and `serverName`; an unfiltered discovery inventory is not a
+binding proof. Automatic best-effort configuration updates still reuse unchanged
+connections.
+
 `config/mcpServer/reload` returns an error when a loaded thread rejects the
 refreshed enterprise policy. The rejected thread retains its previous configuration
 layers with enterprise MCP disabled. Other planned thread refreshes are processed

@@ -3,6 +3,7 @@ use codex_core::CodexThread;
 use codex_core::ConfigRefreshOutcome;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_protocol::protocol::Op;
 use std::io;
 use std::sync::Arc;
 use tracing::warn;
@@ -50,6 +51,7 @@ async fn reload_mcp_config_with_policy(
     let mut rejected = false;
     let mut load_error = None;
     let mut completed: Vec<Arc<CodexThread>> = Vec::new();
+    let mut reconnects = Vec::new();
     // Bound both discovery and stale-owner retries so concurrent churn cannot
     // keep the reload request alive indefinitely. Completed publications remain valid.
     for pass in 0..3 {
@@ -98,7 +100,11 @@ async fn reload_mcp_config_with_policy(
                     disabled_enterprise_config(&current_config)
                 };
                 match target.refresh_mcp_config(current_config, next_config).await {
-                    ConfigRefreshOutcome::Published => {}
+                    ConfigRefreshOutcome::Published => {
+                        if matches!(policy, ReloadPolicy::Strict) {
+                            reconnects.push((thread_id, Arc::clone(&target)));
+                        }
+                    }
                     ConfigRefreshOutcome::Rejected => rejected = true,
                     ConfigRefreshOutcome::Stale => {
                         if attempt == 2 {
@@ -126,6 +132,17 @@ async fn reload_mcp_config_with_policy(
                     rejected = true;
                 }
             }
+        }
+    }
+    // Finish the configuration/policy pass before queuing any explicit reconnect.
+    // Existing bindings retain their clients while these operations rediscover tools.
+    for (thread_id, target) in reconnects {
+        if let Err(err) = target.submit(Op::RefreshMcpServers).await {
+            load_error.get_or_insert_with(|| {
+                io::Error::other(format!(
+                    "failed to queue MCP reconnect for thread {thread_id}: {err}"
+                ))
+            });
         }
     }
     // Finish publishing every session's fail-closed configuration before reporting failure.

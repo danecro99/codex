@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
@@ -30,16 +31,22 @@ use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::UserInput;
 use codex_core::config::set_project_trust_level;
 use codex_http_client::HttpClientBuilder;
 use codex_protocol::config_types::TrustLevel;
 use codex_rmcp_client::McpOAuthCallbackMode;
 use codex_rmcp_client::resolve_mcp_oauth_callback_url;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::responses;
 use core_test_support::skip_if_remote;
 use core_test_support::stdio_server_bin;
 use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
+use rmcp::model::CallToolRequestParams;
+use rmcp::model::CallToolResult;
 use rmcp::model::Implementation;
 use rmcp::model::JsonObject;
 use rmcp::model::ListResourceTemplatesResult;
@@ -51,6 +58,7 @@ use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
 use rmcp::service::RequestContext;
+use rmcp::service::RoleServer;
 use rmcp::transport::StreamableHttpServerConfig;
 use rmcp::transport::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -71,6 +79,353 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Explicit reload must replace catalogs and clients together, including when config is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_unchanged_config_rebinds_threads_without_replaying_active_calls() -> Result<()> {
+    struct Catalog {
+        revision: AtomicUsize,
+        next_client: AtomicUsize,
+        listed: mpsc::UnboundedSender<(usize, usize)>,
+        started: mpsc::UnboundedSender<serde_json::Value>,
+        completed: mpsc::UnboundedSender<serde_json::Value>,
+        release: tokio::sync::Notify,
+    }
+    struct CatalogServer {
+        catalog: Arc<Catalog>,
+        client: usize,
+        listed_revision: AtomicUsize,
+    }
+    impl ServerHandler for CatalogServer {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, rmcp::ErrorData> {
+            let revision = self.catalog.revision.load(Ordering::SeqCst);
+            self.listed_revision.store(revision, Ordering::SeqCst);
+            self.catalog.listed.send((self.client, revision)).unwrap();
+            let schema: JsonObject = serde_json::from_value(json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string", "enum": [format!("schema-{revision}")]},
+                    "hold": {"type": "boolean"}
+                },
+                "required": ["value", "hold"],
+                "additionalProperties": false
+            }))
+            .unwrap();
+            let mut tool = Tool::new(
+                "write_probe",
+                format!("catalog-{revision}-client-{}", self.client),
+                Arc::new(schema),
+            );
+            tool.annotations = Some(ToolAnnotations::new().read_only(false));
+            Ok(ListToolsResult::with_all_items(vec![tool]))
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            let revision = self.listed_revision.load(Ordering::SeqCst);
+            let arguments = request.arguments.unwrap();
+            // The fixture keeps the descriptor fence: a new schema on an old client is an error.
+            if arguments["value"] != format!("schema-{revision}") {
+                return Err(rmcp::ErrorData::invalid_params(
+                    "schema/client mismatch",
+                    None,
+                ));
+            }
+            let call = json!({"client": self.client, "revision": revision, "arguments": arguments});
+            self.catalog.started.send(call.clone()).unwrap();
+            if call["arguments"]["hold"] == true {
+                self.catalog.release.notified().await;
+            }
+            self.catalog.completed.send(call.clone()).unwrap();
+            Ok(CallToolResult::structured(call).into())
+        }
+    }
+
+    async fn bound_tool(app: &mut TestAppServer, thread: &str) -> Result<serde_json::Value> {
+        let response: ListMcpServerStatusResponse = app
+            .request(|request_id| ClientRequest::McpServerStatusList {
+                request_id,
+                params: ListMcpServerStatusParams {
+                    thread_id: Some(thread.to_string()),
+                    server_name: Some("reload_probe".to_string()),
+                    detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                    cursor: None,
+                    limit: None,
+                },
+            })
+            .await?;
+        assert_eq!(response.next_cursor, None);
+        assert_eq!(response.data.len(), 1);
+        Ok(serde_json::to_value(
+            &response.data[0].tools["write_probe"],
+        )?)
+    }
+
+    let (listed, mut lists) = mpsc::unbounded_channel();
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let (completed, mut completions) = mpsc::unbounded_channel();
+    let catalog = Arc::new(Catalog {
+        revision: AtomicUsize::new(0),
+        next_client: AtomicUsize::new(0),
+        listed,
+        started,
+        completed,
+        release: tokio::sync::Notify::new(),
+    });
+    let service_catalog = Arc::clone(&catalog);
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(CatalogServer {
+                client: service_catalog.next_client.fetch_add(1, Ordering::SeqCst),
+                catalog: Arc::clone(&service_catalog),
+                listed_revision: AtomicUsize::new(usize::MAX),
+            })
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let http_server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().nest_service("/mcp", service))
+            .await
+            .unwrap();
+    });
+    let model = responses::start_mock_server().await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&model.uri())
+        .with_extra_config(&format!(
+            "[mcp_servers.reload_probe]\nurl = \"http://{address}/mcp\"\nrequired = true\n\
+             [mcp_servers.reload_probe.tools.write_probe]\napproval_mode = \"approve\"\n"
+        ))
+        .write(home.path())?;
+    let original_config = std::fs::read(home.path().join("config.toml"))?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .build_initialized()
+        .await?;
+    let first = app
+        .start_thread(ThreadStartParams::default())
+        .await?
+        .thread
+        .id;
+    let second = app
+        .start_thread(ThreadStartParams::default())
+        .await?
+        .thread
+        .id;
+    let old_tools = [
+        bound_tool(&mut app, &first).await?,
+        bound_tool(&mut app, &second).await?,
+    ];
+    let mut old_clients = Vec::new();
+    for _ in 0..2 {
+        let (client, revision) = timeout(DEFAULT_READ_TIMEOUT, lists.recv())
+            .await?
+            .context("initial tools/list")?;
+        assert_eq!(revision, 0);
+        old_clients.push(client);
+    }
+
+    let namespace = "mcp__reload_probe";
+    let mock = responses::mount_sse_sequence(
+        &model,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("held"),
+                responses::ev_function_call_with_namespace(
+                    "held-call",
+                    namespace,
+                    "write_probe",
+                    &json!({"value": "schema-0", "hold": true}).to_string(),
+                ),
+                responses::ev_completed("held"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("fresh-first"),
+                responses::ev_function_call_with_namespace(
+                    "fresh-first-call",
+                    namespace,
+                    "write_probe",
+                    &json!({"value": "schema-1", "hold": false}).to_string(),
+                ),
+                responses::ev_completed("fresh-first"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("done-first"),
+                responses::ev_assistant_message("first-done", "done"),
+                responses::ev_completed("done-first"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("fresh-second"),
+                responses::ev_function_call_with_namespace(
+                    "fresh-second-call",
+                    namespace,
+                    "write_probe",
+                    &json!({"value": "schema-1", "hold": false}).to_string(),
+                ),
+                responses::ev_completed("fresh-second"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("done-second"),
+                responses::ev_assistant_message("second-done", "done"),
+                responses::ev_completed("done-second"),
+            ]),
+        ],
+    )
+    .await;
+    let request = app
+        .send_turn_start_request(TurnStartParams {
+            thread_id: first.clone(),
+            input: vec![UserInput::Text {
+                text: "Call the write probe".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = timeout(DEFAULT_READ_TIMEOUT, app.read_response(request)).await??;
+    let held = timeout(DEFAULT_READ_TIMEOUT, starts.recv())
+        .await?
+        .context("held call started")?;
+    assert_eq!(held["revision"], 0);
+    assert_eq!(
+        held["arguments"],
+        json!({"value": "schema-0", "hold": true})
+    );
+
+    catalog.revision.store(1, Ordering::SeqCst);
+    let reload = app
+        .send_raw_request("config/mcpServer/reload", None)
+        .await?;
+    let ack: serde_json::Value = timeout(DEFAULT_READ_TIMEOUT, app.read_response(reload)).await??;
+    assert_eq!(ack, json!({}));
+    let mut new_clients = Vec::new();
+    for _ in 0..2 {
+        let (client, revision) = timeout(DEFAULT_READ_TIMEOUT, lists.recv())
+            .await
+            .expect(
+                "explicit reload must perform fresh tools/list for both unchanged thread configs",
+            )
+            .context("fresh tools/list")?;
+        assert_eq!(revision, 1);
+        assert!(!old_clients.contains(&client));
+        new_clients.push(client);
+    }
+    assert_ne!(new_clients[0], new_clients[1]);
+    let fresh_tools = [
+        bound_tool(&mut app, &first).await?,
+        bound_tool(&mut app, &second).await?,
+    ];
+    assert!(
+        completions.try_recv().is_err(),
+        "reload must not terminate the held write"
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("config.toml"))?,
+        original_config
+    );
+    catalog.release.notify_one();
+    let held_completed = timeout(DEFAULT_READ_TIMEOUT, completions.recv())
+        .await?
+        .context("held call completed")?;
+    assert_eq!(held_completed, held);
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let request = app
+        .send_turn_start_request(TurnStartParams {
+            thread_id: second.clone(),
+            input: vec![UserInput::Text {
+                text: "Use the refreshed write probe".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = timeout(DEFAULT_READ_TIMEOUT, app.read_response(request)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 5);
+    let held_output = requests[1]
+        .function_call_output_text("held-call")
+        .context("original held structured result must reach the model")?;
+    let (_, held_body) = held_output
+        .split_once("\nOutput:\n")
+        .context("MCP output includes its wall-time header")?;
+    let original_result: serde_json::Value = serde_json::from_str(held_body)?;
+    assert_eq!(original_result, held);
+    for (request, expected) in requests.iter().zip([
+        &old_tools[0],
+        &fresh_tools[0],
+        &fresh_tools[0],
+        &fresh_tools[1],
+        &fresh_tools[1],
+    ]) {
+        let tool = request
+            .tool_by_name(namespace, "write_probe")
+            .context("model-visible write probe")?;
+        assert_eq!(
+            json!({"description": tool["description"], "schema": tool["parameters"]}),
+            json!({"description": expected["description"], "schema": expected["inputSchema"]})
+        );
+    }
+    for expected in &fresh_tools {
+        let call = timeout(DEFAULT_READ_TIMEOUT, starts.recv())
+            .await?
+            .context("fresh model call")?;
+        assert_eq!(call["revision"], 1);
+        assert_eq!(
+            call["arguments"],
+            json!({"value": "schema-1", "hold": false})
+        );
+        assert_eq!(
+            expected["description"],
+            format!("catalog-1-client-{}", call["client"])
+        );
+        let completed = timeout(DEFAULT_READ_TIMEOUT, completions.recv())
+            .await?
+            .context("fresh call completion")?;
+        assert_eq!(completed, call);
+    }
+    assert!(starts.try_recv().is_err(), "no call replay");
+    assert!(
+        completions.try_recv().is_err(),
+        "exactly one completion per call"
+    );
+    assert!(
+        lists.try_recv().is_err(),
+        "one tools/list per new thread client"
+    );
+    for thread in [&first, &second] {
+        let read = app
+            .send_raw_request("thread/read", Some(json!({"threadId": thread})))
+            .await?;
+        let response: serde_json::Value =
+            timeout(DEFAULT_READ_TIMEOUT, app.read_response(read)).await??;
+        assert_eq!(response["thread"]["id"], *thread);
+    }
+    http_server.abort();
+    Ok(())
+}
 
 /// Selected status reads return the thread's tools without repeating MCP discovery.
 #[tokio::test]
